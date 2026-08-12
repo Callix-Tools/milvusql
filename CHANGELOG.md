@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-08-12
+### Miscellaneous
+
+- fix ci
+
+
+
+
+**Full Changelog**: https://github.com/Callix-Tools/milvusql/compare/v0.1.0...v0.1.1
 ## [0.1.0] - 2026-08-12
 ### Miscellaneous
 
@@ -14,6 +23,7 @@ All notable changes to this project will be documented in this file.
 
 ### New Contributors
 
+- @github-actions[bot] made their first contribution
 - @ made their first contribution
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "milvusql"
-version = "0.1.0"
+version = "0.1.1"
 description = "PEP 249 DBAPI (sync + async) for Milvus, backed by sqlglot-milvus"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"

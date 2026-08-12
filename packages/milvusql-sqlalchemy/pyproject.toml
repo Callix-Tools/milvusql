@@ -1,6 +1,6 @@
 [project]
 name = "milvusql-sqlalchemy"
-version = "0.1.0"
+version = "0.1.1"
 description = "SQLAlchemy dialect for Milvus, built on the milvusql DBAPI"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"
