@@ -1,113 +1,89 @@
 version: "3"
 
+includes:
+  sqlalchemy:
+    taskfile: packages/milvusql-sqlalchemy/Taskfile.yaml
+  django:
+    taskfile: packages/milvusql-django/Taskfile.yaml
+
 tasks:
   install:
     desc: Install all workspace dependencies including sub-package groups
     cmds:
       - uv sync --all-groups --all-packages
 
-  lint:
-    desc: Run linters for the whole workspace (core + packages/*)
-    vars:
-      LINT_PATHS: src tests packages/milvusql-sqlalchemy/src packages/milvusql-sqlalchemy/tests packages/milvusql-django/src packages/milvusql-django/tests
+  # ---------------------------------------------------------------------------
+  # Core (src/ + tests/)
+  # ---------------------------------------------------------------------------
+
+  core:lint:
+    desc: Run linters for the core milvusql package (use CI=true for reports)
     cmds:
       - |
-        # NOTE: `if: ... / cmd: ...` list-item pairs are not a real Task
-        # conditional (Task silently ignores an unrecognized `if:` key and
-        # always runs `cmd:`) -- branching lives in plain shell instead,
-        # driven by the real `$CI` env var GitHub Actions itself sets.
-        if [[ -n "$CI" ]]; then
+        if [[ "{{.CI}}" == "true" ]]; then
+          echo "Running core linters with CI reports..."
           mkdir -p reports
+          uv run ruff check --output-format json --output-file reports/ruff.json src tests
+          uv run bandit -r src -o reports/bandit.json --format json
+          uv run ty check --output-format gitlab > reports/gl-code-quality-report.json
         else
-          uv run ruff format {{.LINT_PATHS}}
+          echo "Running core linters for development..."
+          uv run ruff format src tests
+          uv run ruff check --fix src tests
+          uv run bandit -r src
+          uv run ty check
         fi
+
+  core:test:
+    desc: Run core tests (use CI=true for reports)
+    env:
+      # Each package gets its own coverage DB; `task tests` runs them all
+      # in parallel via `deps:` and they'd otherwise collide on one
+      # `.coverage` file in the repo root.
+      COVERAGE_FILE: "{{.ROOT_DIR}}/.coverage"
+    cmds:
       - |
-        uv run ruff check \
-          {{ if eq (env "CI") "true" -}}
-          --output-format json --output-file reports/ruff.json \
-          {{ else -}}
-          --fix \
-          {{ end -}}
-          {{.LINT_PATHS}}
-      - |
-        uv run bandit -r src packages/milvusql-sqlalchemy/src packages/milvusql-django/src{{ if eq (env "CI") "true" }} \
-          -o reports/bandit.json --format json{{ end }}
-      - |
-        uv run ty check{{ if eq (env "CI") "true" }} \
-          --output-format gitlab > reports/gl-code-quality-report.json{{ end }}
+        if [[ "{{.CI}}" == "true" ]]; then
+          echo "Running core tests with CI reports..."
+          mkdir -p reports
+          uv run pytest tests \
+            -n {{.CONCURRENCY | default "auto"}} \
+            -m "not validation" \
+            {{ if .SEED -}}
+            --randomly-seed={{.SEED}} \
+            {{ end -}}
+            {{ if eq .FAILFAST "true" -}}
+            -x \
+            {{ end -}}
+            --junitxml=reports/junit.xml \
+            --cov=src \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term-missing
+        else
+          echo "Running core tests for development..."
+          uv run pytest tests \
+            -n {{.CONCURRENCY | default "auto"}} \
+            -m "not validation" \
+            {{ if .SEED -}}
+            --randomly-seed={{.SEED}} \
+            {{ end -}}
+            {{ if eq .FAILFAST "true" -}}
+            -x \
+            {{ end -}}
+            --cov=src --cov-report=term-missing:skip-covered
+        fi
+
+  # ---------------------------------------------------------------------------
+  # All packages
+  # ---------------------------------------------------------------------------
+
+  lint:
+    desc: Run linters for core + all packages (parallel)
+    deps: [core:lint, sqlalchemy:lint, django:lint]
 
   tests:
-    desc: >-
-      Run tests for the whole workspace (use COVERAGE=true for reports).
-      Pass args after `--` to target a specific path/pattern directly, e.g.
-      `task tests -- tests/unit/errors -k grpc` -- that bypasses the
-      per-package split below and runs one plain pytest invocation instead.
-    vars:
-      # Each package gets its OWN pytest invocation (own rootdir), not one
-      # combined `pytest tests packages/*/tests` call: the entity/action
-      # test layout needs `__init__.py` all the way down for pytest to tell
-      # same-named act.py/error.py files apart, and three same-named `tests`
-      # packages collected in one process collide
-      # (`ImportPathMismatchError` -- confirmed directly). Coverage from the
-      # three separate runs is merged back into one report afterward.
-      PACKAGE_ROOTS: "milvusql:tests milvusql-sqlalchemy:packages/milvusql-sqlalchemy/tests milvusql-django:packages/milvusql-django/tests"
-    cmds:
-      - |
-        set -uo pipefail
-        if [[ -n "${CI:-}" ]]; then
-          mkdir -p reports
-        fi
-
-        # One consolidated script, not several `cmds:` steps: Task runs every
-        # `cmds:` entry regardless of what an earlier one's shell process
-        # `exit`-ed with (confirmed directly) -- only a *non-zero* exit stops
-        # the task early, so branching between "direct mode" and "the
-        # per-package loop + combine" has to live inside one script.
-        if [[ -n "{{.CLI_ARGS}}" ]]; then
-          exec uv run pytest \
-            -n {{.CONCURRENCY | default "auto"}} \
-            -m "not validation" \
-            {{ if .SEED -}}
-            --randomly-seed={{.SEED}} \
-            {{ end -}}
-            {{ if eq .FAILFAST "true" -}}
-            -x \
-            {{ end -}}
-            {{.CLI_ARGS}}
-        fi
-
-        # Every package runs even if an earlier one fails -- one bad package
-        # shouldn't hide the other two's results in the same CI log -- but
-        # the task still exits non-zero overall if any of them did.
-        failed=0
-        for pkg_root in {{.PACKAGE_ROOTS}}; do
-          pkg="${pkg_root%%:*}"
-          path="${pkg_root#*:}"
-          COVERAGE_FILE="reports/.coverage.${pkg}" \
-          uv run pytest \
-            -n {{.CONCURRENCY | default "auto"}} \
-            -m "not validation" \
-            {{ if eq .COVERAGE "true" -}}
-            --cov=src --cov=packages/milvusql-sqlalchemy/src --cov=packages/milvusql-django/src \
-            --cov-report= \
-            --junitxml="reports/junit-${pkg}.xml" \
-            {{ end -}}
-            {{ if .SEED -}}
-            --randomly-seed={{.SEED}} \
-            {{ end -}}
-            {{ if eq .FAILFAST "true" -}}
-            -x \
-            {{ end -}}
-            "$path" || failed=1
-        done
-
-        {{ if eq .COVERAGE "true" -}}
-        uv run coverage combine reports/.coverage.milvusql reports/.coverage.milvusql-sqlalchemy reports/.coverage.milvusql-django
-        uv run coverage xml -o reports/coverage.xml
-        uv run coverage report --skip-covered
-        {{ end -}}
-
-        exit "$failed"
+    desc: Run tests for core + all packages (parallel; use CI=true for reports)
+    deps: [core:test, sqlalchemy:test, django:test]
 
   # ---------------------------------------------------------------------------
   # Release
@@ -135,6 +111,8 @@ tasks:
       vars: [VERSION]
     cmds:
       - uv version {{.VERSION}} --frozen
+      - uv version {{.VERSION}} --package milvusql-sqlalchemy --frozen
+      - uv version {{.VERSION}} --package milvusql-django --frozen
       - uv lock
 
   release:changelog:
@@ -151,6 +129,8 @@ tasks:
     cmds:
       - |
         git add pyproject.toml \
+                packages/milvusql-sqlalchemy/pyproject.toml \
+                packages/milvusql-django/pyproject.toml \
                 uv.lock \
                 CHANGELOG.md
         git commit -m "chore(release): {{.TAG}}"
