@@ -13,7 +13,7 @@ import typing as t
 from pymilvus import DataType
 from sqlalchemy import types as sa_types
 
-from milvusql_sqlalchemy.types import VECTOR
+from milvusql_sqlalchemy.types import SPARSEVEC, VECTOR
 
 if t.TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import (
@@ -44,6 +44,8 @@ _TYPE_MAP: dict[int, t.Callable[[dict[str, t.Any]], sa_types.TypeEngine]] = {
 def _column_type(field: dict[str, t.Any]) -> sa_types.TypeEngine:
     if int(field["type"]) == int(DataType.FLOAT_VECTOR):
         return VECTOR(dim=field.get("params", {}).get("dim"))
+    if int(field["type"]) == int(DataType.SPARSE_FLOAT_VECTOR):
+        return SPARSEVEC()
     factory = _TYPE_MAP.get(int(field["type"]))
     return factory(field.get("params", {})) if factory else sa_types.NullType()
 

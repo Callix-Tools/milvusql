@@ -250,9 +250,9 @@ def _map_datatype(dtype: exp.DataType) -> tuple[DataType, dict[str, t.Any]]:
     """A parsed ``ColumnDef.kind`` -> ``(pymilvus DataType, extra
     add_field kwargs)``. Only the types the phase-1 DDL surface actually
     needs (README's ``CREATE TABLE`` example set) are mapped; anything
-    else -- ``TEXT``, ``ARRAY``, sparse/binary vector spellings -- is a
-    real gap, not a silent guess, so it raises rather than picks an
-    arbitrary Milvus type for a spelling this layer has never seen used.
+    else -- ``TEXT``, ``ARRAY``, a binary-vector spelling -- is a real
+    gap, not a silent guess, so it raises rather than picks an arbitrary
+    Milvus type for a spelling this layer has never seen used.
     """
     if dtype.this is exp.DataType.Type.VARCHAR:
         param = dtype.expressions[0] if dtype.expressions else None
@@ -261,6 +261,16 @@ def _map_datatype(dtype: exp.DataType) -> tuple[DataType, dict[str, t.Any]]:
     if dtype.this is exp.DataType.Type.VECTOR:
         dim = int(dtype.expressions[0].this.this)
         return DataType.FLOAT_VECTOR, {"dim": dim}
+    if dtype.this is exp.DataType.Type.USERDEFINED:
+        # ``SPARSEVEC`` has no dedicated sqlglot ``DataType.Type`` of
+        # its own (unlike ``VECTOR``, recycled from a real one) -- it
+        # parses as a generic user-defined type carrying its own
+        # spelling as free text in ``kind`` (confirmed directly against
+        # sqlglot's own parser output), case-preserved from whatever the
+        # caller wrote, hence the case-insensitive match.
+        kind = dtype.args.get("kind")
+        if isinstance(kind, str) and kind.upper() == "SPARSEVEC":
+            return DataType.SPARSE_FLOAT_VECTOR, {}
     mapped = _SCALAR_TYPES.get(dtype.this)
     if mapped is None:
         msg = f"unsupported column type: {dtype.sql(dialect='milvus')}"
@@ -384,6 +394,12 @@ def _build_load_table(ast: LoadTable, parameters: dict[str, t.Any]) -> Call:
 def _build_release_table(ast: ReleaseTable) -> Call:
     return Call(
         "release_collection", {"collection_name": ast.this.name}, _no_rows
+    )
+
+
+def _build_drop_table(ast: exp.Drop) -> Call:
+    return Call(
+        "drop_collection", {"collection_name": ast.this.name}, _no_rows
     )
 
 
@@ -586,6 +602,11 @@ def build_call(
         raise errors.NotSupportedError(msg)
     if isinstance(ast, exp.Alter):
         msg = "ALTER TABLE is not implemented yet (out of phase-1 scope)"
+        raise errors.NotSupportedError(msg)
+    if isinstance(ast, exp.Drop):
+        if ast.args.get("kind") == "TABLE":
+            return _build_drop_table(ast)
+        msg = f"unsupported DROP kind: {ast.args.get('kind')}"
         raise errors.NotSupportedError(msg)
     builder = _BUILDERS.get(type(ast))
     if builder is None:

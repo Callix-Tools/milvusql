@@ -30,6 +30,26 @@ def test_maps_scalar_and_vector_columns(build_call_helper):
     assert fields["category"].params["max_length"] == 64
 
 
+def test_sparsevec_column_maps_to_sparse_float_vector(build_call_helper):
+    """``SPARSEVEC`` has no dedicated sqlglot ``DataType.Type`` (unlike
+    ``VECTOR``) -- it parses as a generic user-defined type carrying its
+    own spelling as free text, matched case-insensitively in
+    ``_map_datatype``."""
+    call = build_call_helper(
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, sparse SPARSEVEC)"
+    )
+    fields = {f.name: f for f in call.kwargs["schema"].fields}
+    assert fields["sparse"].dtype == DataType.SPARSE_FLOAT_VECTOR
+
+
+def test_sparsevec_column_type_name_is_case_insensitive(build_call_helper):
+    call = build_call_helper(
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, sparse sparsevec)"
+    )
+    fields = {f.name: f for f in call.kwargs["schema"].fields}
+    assert fields["sparse"].dtype == DataType.SPARSE_FLOAT_VECTOR
+
+
 def test_standalone_primary_key_constraint_is_recognized(build_call_helper):
     """SQLAlchemy's own ``DDLCompiler`` emits a standalone
     ``PRIMARY KEY (col)`` rather than an inline keyword by default

@@ -19,7 +19,7 @@ from __future__ import annotations
 import inspect
 import typing as t
 
-from sqlalchemy import pool
+from sqlalchemy import exc, pool
 from sqlalchemy.engine import default
 from sqlalchemy.sql import schema
 from sqlalchemy.util import await_only
@@ -98,9 +98,30 @@ class MilvusDialect(default.DefaultDialect):
     supports_alter = False
     supports_sane_rowcount = False
     supports_sane_multi_rowcount = False
-    postfetch_lastrowid = False
+    #: The DBAPI cursor's ``.lastrowid`` (``milvusql.dbapi.Cursor.execute``)
+    #: is correctly populated from Milvus's server-assigned ``auto_id``
+    #: after every INSERT -- ``True`` here is what makes SQLAlchemy
+    #: actually read it back, both for Core's ``Result.inserted_primary_key``
+    #: and (what the ORM's unit-of-work needs) a new object's identity key
+    #: after ``Session.add()``/``commit()``.
+    postfetch_lastrowid = True
     supports_default_values = False
     supports_empty_insert = False
+
+    #: D6's Milvus consistency levels, exactly as ``pymilvus``'s
+    #: ``ConsistencyLevel`` protobuf enum spells them (confirmed
+    #: directly: a case-sensitive ``Enum.Value(...)`` lookup) --
+    #: title-case, not the ``"READ COMMITTED"``-style
+    #: all-``UPPERCASE`` names ``_assert_and_set_isolation_level``
+    #: below exists specifically to stop SQLAlchemy from forcing this
+    #: dialect's own values into.
+    _CONSISTENCY_LEVELS = (
+        "Strong",
+        "Bounded",
+        "Eventually",
+        "Session",
+        "Customized",
+    )
 
     #: ``Table(..., milvusql_shards=2,
     #: milvusql_consistency_level="Bounded",
@@ -181,6 +202,36 @@ class MilvusDialect(default.DefaultDialect):
         over this connection-level default -- that's enforced in
         ``milvusql.dbapi.Cursor.execute``, not here."""
         _unwrap(dbapi_connection).consistency_level = level
+
+    def _assert_and_set_isolation_level(
+        self, dbapi_conn: t.Any, level: IsolationLevel
+    ) -> None:
+        """Overridden, not just relied on via inheritance: the base
+        ``DefaultDialect`` implementation unconditionally does
+        ``level.replace("_", " ").upper()`` before validating/forwarding
+        the value -- correct for the standard SQL isolation levels this
+        hook was designed for ("READ COMMITTED", ...), but confirmed
+        directly to corrupt every Milvus consistency level this dialect
+        actually deals in (D6): ``"Strong"``/``"Bounded"`` become
+        ``"STRONG"``/``"BOUNDED"``, and ``pymilvus``'s own
+        ``get_consistency_level()`` does a case-sensitive lookup that
+        then always raises ``InvalidConsistencyLevel`` -- for *every*
+        later query too, since SQLAlchemy's connection-pool checkin
+        reset (``reset_isolation_level``) round-trips through this same
+        method using ``default_isolation_level``. This both replaces
+        the base's case-mangling and does its own validation instead of
+        ``_gen_allowed_isolation_levels``'s (which requires
+        ``get_isolation_level_values()`` to return UPPERCASE names --
+        the wrong convention for Milvus's, so this dialect does not
+        implement that hook at all)."""
+        if level not in self._CONSISTENCY_LEVELS:
+            msg = (
+                f"Invalid value {level!r} for isolation_level. Valid "
+                f"consistency levels for {self.name!r} are "
+                f"{', '.join(self._CONSISTENCY_LEVELS)}"
+            )
+            raise exc.ArgumentError(msg)
+        self.set_isolation_level(dbapi_conn, level)
 
     def get_schema_names(
         self, connection: SAConnection, **kw: t.Any
