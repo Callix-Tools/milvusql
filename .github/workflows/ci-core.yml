@@ -1,16 +1,16 @@
-name: "CI"
+name: "CI: Core"
 
 on:
   pull_request:
     branches: ["*"]
     paths:
       - "src/**"
-      - "packages/**"
       - "tests/**"
       - "pyproject.toml"
       - "ruff.toml"
       - "ty.toml"
-      - ".github/workflows/ci.yml"
+      - "taskfile.dist.yaml"
+      - ".github/workflows/ci-core.yml"
   push:
     branches: [main]
 
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-core-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -42,9 +42,9 @@ jobs:
         run: task install
 
       - name: Lint
-        run: task lint CI=true
+        run: task core:lint CI=true
 
-  tests:
+  test:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -64,20 +64,12 @@ jobs:
         run: task install
 
       - name: Test
-        run: task tests CONCURRENCY=4 COVERAGE=true
+        run: task core:test CI=true CONCURRENCY=4
 
-      - name: Upload coverage
+      - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: reports/coverage.xml
-          retention-days: 30
-
-      - name: Upload junit
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit
-          path: reports/junit.xml
+          name: core-test-results
+          path: reports/
           retention-days: 30

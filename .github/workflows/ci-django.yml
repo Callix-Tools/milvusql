@@ -1,0 +1,74 @@
+name: "CI: Django"
+
+on:
+  pull_request:
+    branches: ["*"]
+    paths:
+      - "packages/milvusql-django/**"
+      - "pyproject.toml"
+      - "ruff.toml"
+      - "ty.toml"
+      - "taskfile.dist.yaml"
+      - ".github/workflows/ci-django.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-django-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: task install
+
+      - name: Lint
+        run: task django:lint CI=true
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: task install
+
+      - name: Test
+        run: task django:test CI=true CONCURRENCY=4
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: django-test-results
+          path: packages/milvusql-django/reports/
+          retention-days: 30

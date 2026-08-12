@@ -1,0 +1,59 @@
+version: "3"
+
+tasks:
+  lint:
+    desc: Run linters for milvusql-sqlalchemy (use CI=true for reports)
+    cmds:
+      - |
+        if [[ "{{.CI}}" == "true" ]]; then
+          echo "Running milvusql-sqlalchemy linters with CI reports..."
+          mkdir -p {{.TASKFILE_DIR}}/reports
+          uv run ruff check --output-format json --output-file {{.TASKFILE_DIR}}/reports/ruff.json {{.TASKFILE_DIR}}/src {{.TASKFILE_DIR}}/tests
+          uv run bandit -r {{.TASKFILE_DIR}}/src -o {{.TASKFILE_DIR}}/reports/bandit.json --format json
+          uv run ty check --output-format gitlab > {{.TASKFILE_DIR}}/reports/gl-code-quality-report.json
+        else
+          echo "Running milvusql-sqlalchemy linters for development..."
+          uv run ruff format {{.TASKFILE_DIR}}/src {{.TASKFILE_DIR}}/tests
+          uv run ruff check --fix {{.TASKFILE_DIR}}/src {{.TASKFILE_DIR}}/tests
+          uv run bandit -r {{.TASKFILE_DIR}}/src
+          uv run ty check
+        fi
+
+  test:
+    desc: Run milvusql-sqlalchemy tests (use CI=true for reports)
+    env:
+      # Each package gets its own coverage DB; `task tests` runs them all
+      # in parallel via `deps:` and they'd otherwise collide on one
+      # `.coverage` file in the repo root.
+      COVERAGE_FILE: "{{.TASKFILE_DIR}}/.coverage"
+    cmds:
+      - |
+        if [[ "{{.CI}}" == "true" ]]; then
+          echo "Running milvusql-sqlalchemy tests with CI reports..."
+          mkdir -p {{.TASKFILE_DIR}}/reports
+          uv run pytest {{.TASKFILE_DIR}}/tests \
+            -n {{.CONCURRENCY | default "auto"}} \
+            -m "not validation" \
+            {{ if .SEED -}}
+            --randomly-seed={{.SEED}} \
+            {{ end -}}
+            {{ if eq .FAILFAST "true" -}}
+            -x \
+            {{ end -}}
+            --junitxml={{.TASKFILE_DIR}}/reports/junit.xml \
+            --cov={{.TASKFILE_DIR}}/src \
+            --cov-report=xml:{{.TASKFILE_DIR}}/reports/coverage.xml \
+            --cov-report=term-missing
+        else
+          echo "Running milvusql-sqlalchemy tests for development..."
+          uv run pytest {{.TASKFILE_DIR}}/tests \
+            -n {{.CONCURRENCY | default "auto"}} \
+            -m "not validation" \
+            {{ if .SEED -}}
+            --randomly-seed={{.SEED}} \
+            {{ end -}}
+            {{ if eq .FAILFAST "true" -}}
+            -x \
+            {{ end -}}
+            --cov={{.TASKFILE_DIR}}/src --cov-report=term-missing:skip-covered
+        fi

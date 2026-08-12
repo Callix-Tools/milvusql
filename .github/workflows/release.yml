@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install git-cliff
+        uses: kenji-miyake/setup-git-cliff@v2
+
+      - name: Install dependencies
+        run: task install
+
+      # -----------------------------------------------------------------
+      # 1. Determine next version via conventional commits
+      # -----------------------------------------------------------------
+      - name: Determine next version
+        id: version
+        run: task release:version
+
+      # -----------------------------------------------------------------
+      # 2. Bump version in all packages
+      # -----------------------------------------------------------------
+      - name: Bump versions
+        run: task release:bump VERSION=${{ steps.version.outputs.version }}
+
+      # -----------------------------------------------------------------
+      # 3. Generate changelog
+      # -----------------------------------------------------------------
+      - name: Generate changelog
+        run: task release:changelog TAG=${{ steps.version.outputs.tag }}
+
+      # -----------------------------------------------------------------
+      # 4. Commit version bump + changelog, tag
+      # -----------------------------------------------------------------
+      - name: Commit and tag
+        run: task release:commit TAG=${{ steps.version.outputs.tag }}
+
+      - name: Push
+        run: task release:push TAG=${{ steps.version.outputs.tag }}
+
+      # -----------------------------------------------------------------
+      # 5. Build and publish all workspace packages to PyPI
+      # -----------------------------------------------------------------
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: task release:publish
+
+      # -----------------------------------------------------------------
+      # 6. Create GitHub Release
+      # -----------------------------------------------------------------
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: task release:github TAG=${{ steps.version.outputs.tag }}
