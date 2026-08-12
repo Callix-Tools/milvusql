@@ -7,12 +7,14 @@ tasks:
       - uv sync --all-groups --all-packages
 
   lint:
-    desc: Run linters for core package
+    desc: Run linters for the whole workspace (core + packages/*)
+    vars:
+      LINT_PATHS: src tests packages/milvusql-sqlalchemy/src packages/milvusql-sqlalchemy/tests packages/milvusql-django/src packages/milvusql-django/tests
     cmds:
       - if: "[[ -n $CI ]]"
         cmd: mkdir -p reports
       - if: "[[ -z $CI ]]"
-        cmd: uv run ruff format src tests
+        cmd: uv run ruff format {{.LINT_PATHS}}
       - |
         uv run ruff check \
           {{ if eq (env "CI") "true" -}}
@@ -20,16 +22,18 @@ tasks:
           {{ else -}}
           --fix \
           {{ end -}}
-          src tests
+          {{.LINT_PATHS}}
       - |
-        uv run bandit -r src{{ if eq (env "CI") "true" }} \
+        uv run bandit -r src packages/milvusql-sqlalchemy/src packages/milvusql-django/src{{ if eq (env "CI") "true" }} \
           -o reports/bandit.json --format json{{ end }}
       - |
         uv run ty check{{ if eq (env "CI") "true" }} \
           --output-format gitlab > reports/gl-code-quality-report.json{{ end }}
 
   tests:
-    desc: Run core tests (use COVERAGE=true for reports)
+    desc: Run tests for the whole workspace (use COVERAGE=true for reports)
+    vars:
+      TEST_PATHS: tests packages/milvusql-sqlalchemy/tests packages/milvusql-django/tests
     cmds:
       - |
         uv run pytest \
@@ -47,7 +51,7 @@ tasks:
           {{ if eq .FAILFAST "true" -}}
           -x \
           {{ end -}}
-          {{.CLI_ARGS | default "tests"}}
+          {{.CLI_ARGS | default .TEST_PATHS}}
 
   # ---------------------------------------------------------------------------
   # Release

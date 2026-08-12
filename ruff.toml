@@ -31,7 +31,7 @@ select = [
 ]
 
 [lint.per-file-ignores]
-"tests/**" = [
+"**/tests/**" = [
     "ANN",
     "D",
     "PLR2004",
@@ -49,3 +49,11 @@ select = [
     "PT011",
     "S603",
 ]
+# Every method here overrides a SQLAlchemy Dialect/UserDefinedType or
+# Django BaseDatabase* hook -- the signature (including unused
+# `connection`/`schema`/`**kw` parameters and `-> t.Any` Comparator
+# returns) is dictated by the base class, not a quality issue in this
+# code, the same reason sqlglot-milvus's own dialect.py needed exact
+# upstream-matching signatures.
+"packages/milvusql-sqlalchemy/src/**" = ["ARG002", "ANN401"]
+"packages/milvusql-django/src/**" = ["ARG002", "ANN401"]

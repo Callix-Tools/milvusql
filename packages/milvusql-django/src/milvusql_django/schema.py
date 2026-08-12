@@ -1,0 +1,126 @@
+"""``DatabaseSchemaEditor`` -- D11's flagged spike, and the honest
+scope boundary of this first cut.
+
+Deliberately does **not** inherit Django's base ``table_sql``/
+``column_sql``/``_alter_field`` machinery: that machinery is built for
+databases with full ``ALTER TABLE`` and deferred FK constraint SQL,
+neither of which Milvus has. Milvus's real DDL surface (Track A's own
+grammar) is much smaller -- ``CREATE TABLE``, ``ADD FIELD``, nothing
+else -- so this hand-writes the small column-list builder it actually
+needs instead of fighting the generic one.
+
+**What works**: ``CreateModel`` (a model with scalar fields + one or
+more ``VectorField``s), ``AddField``. **What deliberately raises**:
+``RemoveField``, ``AlterField`` -- Milvus cannot do either (same
+reasoning as ``sqlglot-milvus``'s own ``ALTER TABLE`` rejection), so
+this fails loudly at migration time rather than silently producing a
+migration that doesn't match reality.
+
+**What this does NOT do**: automatically create a vector index or
+``LOAD`` the collection after ``CreateModel`` -- Milvus requires an
+index before a collection is searchable, but index method/metric are a
+query-shape decision (HNSW vs. IVF, COSINE vs. L2), not something a
+generic schema migration should guess. Call
+``milvusql_django.schema.create_index_and_load`` explicitly (in a data
+migration, or app startup) once the model is defined. This is the
+single biggest open item this package leaves for later, flagged here
+rather than papered over with a guessed default.
+"""
+
+from __future__ import annotations
+
+import typing as t
+
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+if t.TYPE_CHECKING:
+    from django.db.models import Field
+
+
+class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+    sql_create_table = "CREATE TABLE %(table)s (%(definition)s)"
+    sql_delete_table = "DROP TABLE %(table)s"
+
+    def _column_definition(self, model: type[t.Any], field: Field) -> str:
+        db_type = field.db_type(self.connection)
+        parts = [self.quote_name(field.column), db_type]
+        if field.primary_key:
+            parts.append("PRIMARY KEY")
+            if field is model._meta.auto_field:
+                parts.append("AUTO_INCREMENT")
+        return " ".join(parts)
+
+    def create_model(self, model: type[t.Any]) -> None:
+        columns = [
+            self._column_definition(model, field)
+            for field in model._meta.local_fields
+        ]
+        sql = self.sql_create_table % {
+            "table": self.quote_name(model._meta.db_table),
+            "definition": ", ".join(columns),
+        }
+        self.execute(sql)
+
+    def delete_model(self, model: type[t.Any]) -> None:
+        self.execute(
+            self.sql_delete_table
+            % {"table": self.quote_name(model._meta.db_table)}
+        )
+
+    def add_field(self, model: type[t.Any], field: Field) -> None:
+        table = self.quote_name(model._meta.db_table)
+        column = self._column_definition(model, field)
+        self.execute(f"ALTER TABLE {table} ADD FIELD {column}")
+
+    def remove_field(self, model: type[t.Any], field: Field) -> None:
+        msg = (
+            "Milvus cannot drop a field from an existing collection -- "
+            "the collection needs recreating. Same restriction "
+            "sqlglot-milvus enforces at the SQL level; see its "
+            "ALTER TABLE rejection."
+        )
+        raise NotImplementedError(msg)
+
+    def alter_field(
+        self,
+        model: type[t.Any],
+        old_field: Field,
+        new_field: Field,
+        strict: bool = False,
+    ) -> None:
+        msg = (
+            "Milvus cannot change a field's type or a vector's "
+            "dimension in place -- the collection needs recreating."
+        )
+        raise NotImplementedError(msg)
+
+
+def _with_value(value: t.Any) -> str:
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return str(value)
+
+
+def create_index_and_load(
+    connection: t.Any,
+    table: str,
+    field_name: str,
+    *,
+    using: str = "HNSW",
+    metric_type: str = "COSINE",
+    **index_params: t.Any,
+) -> None:
+    """The explicit follow-up step ``create_model`` deliberately
+    doesn't do automatically (see the module docstring). Call once,
+    after defining the model, before querying it."""
+    options = {"metric_type": metric_type, **index_params}
+    knobs = ", ".join(f"{k}={_with_value(v)}" for k, v in options.items())
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'CREATE INDEX idx_{field_name} ON "{table}" ("{field_name}") '
+            f"USING {using} WITH ({knobs})"
+        )
+        cursor.execute(f'LOAD TABLE "{table}"')
+
+
+__all__ = ["DatabaseSchemaEditor", "create_index_and_load"]

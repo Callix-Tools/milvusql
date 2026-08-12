@@ -39,6 +39,7 @@ class AsyncCursor:
         self.rowcount = -1
         self.arraysize = 1
         self.closed = False
+        self.lastrowid: t.Any = None
         self._rows: list[tuple[t.Any, ...]] = []
         self._index = 0
 
@@ -68,11 +69,12 @@ class AsyncCursor:
             raw = await getattr(self.connection._client, call.method)(
                 **call.kwargs
             )
-            rows, description, rowcount = call.postprocess(raw)
+            rows, description, rowcount, lastrowid = call.postprocess(raw)
         except (SqlglotError, MilvusException, grpc.RpcError) as exc:
             raise errors.translate(exc) from exc
         self.description = description
         self.rowcount = rowcount
+        self.lastrowid = lastrowid
         self._rows = rows
         self._index = 0
         return self

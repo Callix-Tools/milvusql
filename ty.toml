@@ -1,5 +1,17 @@
 [environment]
-root = ["./src", "./"]
+root = [
+    "./src",
+    "./packages/milvusql-sqlalchemy/src",
+    "./packages/milvusql-django/src",
+    "./",
+]
 
 [src]
-include = ["src", "tests"]
+include = [
+    "src",
+    "tests",
+    "packages/milvusql-sqlalchemy/src",
+    "packages/milvusql-sqlalchemy/tests",
+    "packages/milvusql-django/src",
+    "packages/milvusql-django/tests",
+]

@@ -30,6 +30,10 @@ class Cursor:
         self.rowcount = -1
         self.arraysize = 1
         self.closed = False
+        #: PEP 249 convention (sqlite3, MySQLdb): the primary key
+        #: ``INSERT`` just assigned, ``None`` otherwise. Milvus assigns
+        #: these server-side only for ``auto_id`` collections.
+        self.lastrowid: t.Any = None
         self._rows: list[tuple[t.Any, ...]] = []
         self._index = 0
 
@@ -57,11 +61,12 @@ class Cursor:
             ):
                 call.kwargs["consistency_level"] = default_level
             raw = getattr(self.connection._client, call.method)(**call.kwargs)
-            rows, description, rowcount = call.postprocess(raw)
+            rows, description, rowcount, lastrowid = call.postprocess(raw)
         except (SqlglotError, MilvusException, grpc.RpcError) as exc:
             raise errors.translate(exc) from exc
         self.description = description
         self.rowcount = rowcount
+        self.lastrowid = lastrowid
         self._rows = rows
         self._index = 0
         return self

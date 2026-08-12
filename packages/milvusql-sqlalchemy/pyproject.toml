@@ -1,0 +1,47 @@
+[project]
+name = "milvusql-sqlalchemy"
+version = "0.1.0"
+description = "SQLAlchemy dialect for Milvus, built on the milvusql DBAPI"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Neko1313", email = "nikita.ribalchencko@yandex.ru" }
+]
+requires-python = ">=3.12"
+keywords = ["milvus", "sqlalchemy", "dialect", "vector-search"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: SQLAlchemy",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "milvusql>=0.1.0,<0.2",
+    "sqlalchemy>=2,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/Callix-Tools/milvusql"
+Repository = "https://github.com/Callix-Tools/milvusql"
+Issues = "https://github.com/Callix-Tools/milvusql/issues"
+
+[project.entry-points."sqlalchemy.dialects"]
+"milvusql" = "milvusql_sqlalchemy.dialect:MilvusDialect"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+milvusql = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

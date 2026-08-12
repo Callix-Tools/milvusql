@@ -46,11 +46,15 @@ if t.TYPE_CHECKING:
 #: descriptions ``Cursor.description`` exposes (name-only; the rest of
 #: the 7-tuple is unknown and left ``None``, same simplification
 #: ``elasticsearch-dbapi`` makes for the same reason -- Milvus's client
-#: gives us values, not a typed wire schema, at this layer) and the
+#: gives us values, not a typed wire schema, at this layer), the
 #: ``rowcount`` PEP 249 wants set after ``execute()`` (-1 for DDL/DDL-like
 #: statements where the concept does not apply, same as every other
-#: DBAPI does for ``CREATE``/``LOAD``).
-RowsAndDescription = tuple[list[tuple[t.Any, ...]], list[tuple] | None, int]
+#: DBAPI does for ``CREATE``/``LOAD``), and ``lastrowid`` -- the
+#: PEP 249-conventional (sqlite3, MySQLdb, ...) place an auto-assigned
+#: primary key surfaces after ``INSERT``, ``None`` for anything else.
+RowsAndDescription = tuple[
+    list[tuple[t.Any, ...]], list[tuple] | None, int, t.Any
+]
 
 Postprocess = t.Callable[[t.Any], RowsAndDescription]
 
@@ -62,25 +66,36 @@ class Call:
 
     method: str
     kwargs: dict[str, t.Any] = field(default_factory=dict)
-    postprocess: Postprocess = lambda _raw: ([], None, -1)
+    postprocess: Postprocess = lambda _raw: ([], None, -1, None)
 
 
 def _no_rows(_raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
-    return [], None, -1
+    return [], None, -1, None
+
+
+def _insert_result(raw: dict[str, t.Any]) -> RowsAndDescription:
+    """``insert`` returns ``{"insert_count": n, "ids": [...]}`` --
+    confirmed directly against Milvus Lite, ``ids`` holds the
+    server-assigned primary keys for an ``auto_id`` collection. DBAPI
+    convention (sqlite3, MySQLdb) is ``cursor.lastrowid`` -- the most
+    recently inserted row's key -- which is the last element for a
+    multi-row ``execute()``, matching those DBAPIs' own semantics for a
+    single ``executemany``-shaped call."""
+    ids = raw.get("ids")
+    return [], None, raw.get("insert_count", -1), ids[-1] if ids else None
 
 
 def _mutation_count(key: str) -> Postprocess:
-    """``insert`` always returns ``{"insert_count": n}``. ``delete``
-    usually returns ``{"delete_count": n}`` too, but -- confirmed
-    directly against Milvus Lite -- falls back to a bare list of
-    deleted primary keys on servers old enough to still return them
+    """``delete`` usually returns ``{"delete_count": n}`` but --
+    confirmed directly against Milvus Lite -- falls back to a bare list
+    of deleted primary keys on servers old enough to still return them
     (``MilvusClient.delete``'s own compatibility branch); DBAPI wants a
     single ``rowcount`` either way, not a fetchable row."""
 
     def postprocess(raw: dict[str, t.Any] | list[t.Any]) -> RowsAndDescription:
         if isinstance(raw, list):
-            return [], None, len(raw)
-        return [], None, raw.get(key, -1)
+            return [], None, len(raw), None
+        return [], None, raw.get(key, -1), None
 
     return postprocess
 
@@ -266,14 +281,31 @@ def _build_create_table(
         enable_dynamic_field=False,
         partition_key_field=props.pop("partition_key", None),
     )
-    for column in schema_node.expressions:
+    columns = [
+        c for c in schema_node.expressions if isinstance(c, exp.ColumnDef)
+    ]
+    # A standalone `PRIMARY KEY (col)` table constraint -- standard SQL,
+    # and what SQLAlchemy's own DDLCompiler emits by default instead of
+    # an inline `PRIMARY KEY` on the column -- names the primary column
+    # separately from its ColumnDef; verified directly against
+    # `metadata.create_all()`'s actual output.
+    pk_names = {
+        ident.name
+        for node in schema_node.expressions
+        if isinstance(node, exp.PrimaryKey)
+        for ident in node.expressions
+    }
+    for column in columns:
         name = column.this.name
         milvus_type, extra = _map_datatype(column.kind)
         constraint_kinds = {type(c.kind) for c in (column.constraints or [])}
         milvus_schema.add_field(
             field_name=name,
             datatype=milvus_type,
-            is_primary=exp.PrimaryKeyColumnConstraint in constraint_kinds,
+            is_primary=(
+                exp.PrimaryKeyColumnConstraint in constraint_kinds
+                or name in pk_names
+            ),
             auto_id=exp.AutoIncrementColumnConstraint in constraint_kinds,
             **extra,
         )
@@ -370,7 +402,7 @@ def _build_insert(ast: exp.Insert, parameters: dict[str, t.Any]) -> Call:
     return Call(
         "insert",
         {"collection_name": table_name, "data": rows},
-        _mutation_count("insert_count"),
+        _insert_result,
     )
 
 
@@ -409,7 +441,7 @@ def _search_rows(output_names: list[str]) -> Postprocess:
                 "distance": hit.get("distance"),
             }
             rows.append(tuple(available.get(name) for name in output_names))
-        return rows, _description(output_names), len(rows)
+        return rows, _description(output_names), len(rows), None
 
     return postprocess
 
@@ -417,7 +449,7 @@ def _search_rows(output_names: list[str]) -> Postprocess:
 def _query_rows(output_names: list[str]) -> Postprocess:
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
         rows = [tuple(row.get(name) for name in output_names) for row in raw]
-        return rows, _description(output_names), len(rows)
+        return rows, _description(output_names), len(rows), None
 
     return postprocess
 
@@ -431,7 +463,16 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     output_names = _select_output_names(ast)
     filter_text = _filter_text(ast.args.get("where"), parameters)
     limit_node = ast.args.get("limit")
-    limit = int(limit_node.expression.this) if limit_node else 10
+    # LIMIT is a literal in hand-written MilvusQL, but a bound
+    # parameter in SQLAlchemy-generated text by default (confirmed
+    # directly: `.limit(5)` compiles to `LIMIT :param_1`, not
+    # `LIMIT 5`) -- resolve through the same value path as everything
+    # else instead of assuming a literal.
+    limit = (
+        int(_resolve_value(limit_node.expression, parameters))
+        if limit_node
+        else 10
+    )
 
     order = ast.args.get("order")
     if order is None:

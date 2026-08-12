@@ -1,0 +1,45 @@
+[project]
+name = "milvusql-django"
+version = "0.1.0"
+description = "Django database backend for Milvus, built on the milvusql DBAPI"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Neko1313", email = "nikita.ribalchencko@yandex.ru" }
+]
+requires-python = ">=3.12"
+keywords = ["milvus", "django", "database-backend", "vector-search"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: Django",
+    "Framework :: Django :: 5.0",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "milvusql>=0.1.0,<0.2",
+    "django>=5,<6",
+]
+
+[project.urls]
+Homepage = "https://github.com/Callix-Tools/milvusql"
+Repository = "https://github.com/Callix-Tools/milvusql"
+Issues = "https://github.com/Callix-Tools/milvusql/issues"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+milvusql = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
