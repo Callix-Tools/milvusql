@@ -62,6 +62,25 @@ class Connection:
         self.close()
 
 
+def token_from_credentials(
+    user: str | None, password: str | None
+) -> str | None:
+    """Milvus's ``token`` auth parameter is commonly ``"user:password"``
+    (confirmed against pymilvus's own docs: ``token="root:Milvus"`` is
+    the default-user credential, and ``token="user_1:P@ssw0rd"`` for a
+    custom one) -- it is genuinely a username and password joined by a
+    colon, not an opaque bearer token. Adapters that split a connection
+    URL into separate ``user``/``password`` fields (``milvusql-sqlalchemy``,
+    ``milvusql-django``) call this to reassemble what Milvus actually
+    wants, instead of forwarding ``password`` alone and silently
+    dropping ``user``."""
+    if user and password:
+        return f"{user}:{password}"
+    if password:
+        return password  # a full "user:token" pasted as the URL password
+    return None
+
+
 def connect(
     uri: str = "http://localhost:19530",
     token: str = "",  # nosec B107 -- optional auth token, not a secret default

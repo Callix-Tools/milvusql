@@ -42,10 +42,39 @@ members = ["packages/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--tb=short -v"
+addopts = "--tb=short -v --strict-markers"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
+# tests/{unit,integration}/<entity>/<action>/ holds act.py (happy-path)
+# and error.py (error/edge-case) files rather than test_*.py -- widen
+# the collection glob to pick them up alongside the default pattern.
+# `errors`'s translate() action has no natural act/error split (every
+# test IS about correct error mapping), so it uses descriptive
+# scenario files instead -- those need listing too.
+python_files = [
+    "test_*.py",
+    "*_test.py",
+    "act.py",
+    "error.py",
+    "sqlglot_errors.py",
+    "milvus_exceptions.py",
+    "grpc_errors.py",
+    "fallback.py",
+]
+markers = [
+    # `task tests` runs each workspace package through its own pytest
+    # invocation (see taskfile's `tests` task for why), so this list only
+    # needs the root package's own markers -- milvusql-sqlalchemy/
+    # milvusql-django register their own `unit`/`integration`/`validation`
+    # + domain marker in their own pyproject.toml, kept in sync by hand.
+    "unit: pure-logic test, no external process (Milvus, a real DB) started",
+    "integration: exercises a real (embedded) Milvus Lite instance",
+    "validation: opt-in test against a real, non-Lite Milvus server (excluded by default -- see taskfile's `-m \"not validation\"`)",
+    "dbapi: the root milvusql package's sync/async PEP 249 surface (connection, cursor)",
+    "errors: milvusql.dbapi.errors exception translation",
+    "translate: milvusql.translate.ast_to_pymilvus's AST -> pymilvus dispatch table",
+]
 
 [dependency-groups]
 lint = [

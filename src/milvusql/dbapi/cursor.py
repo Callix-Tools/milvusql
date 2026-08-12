@@ -107,8 +107,11 @@ class Cursor:
         """Not applicable -- Milvus has no prepared-statement input
         binding to size ahead of time."""
 
-    def setoutputsizes(self, size: int, column: int | None = None) -> None:
-        """Not applicable, same reason as ``setinputsizes``."""
+    def setoutputsize(self, size: int, column: int | None = None) -> None:
+        """Not applicable, same reason as ``setinputsizes``. Named
+        singular (``setoutputsize``, not ``setoutputsizes``) -- that's
+        the actual PEP 249 spelling, confirmed against the spec text;
+        SQLAlchemy's own DBAPI protocol checks agree."""
 
     def __iter__(self) -> Cursor:
         return self

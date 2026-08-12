@@ -48,8 +48,14 @@ class AsyncCursor:
             msg = "cursor is closed"
             raise errors.InterfaceError(msg)
 
-    def close(self) -> None:
+    async def close(self) -> None:
         self.closed = True
+
+    async def __aenter__(self) -> AsyncCursor:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
 
     async def execute(
         self, operation: str, parameters: dict[str, t.Any] | None = None
@@ -113,7 +119,21 @@ class AsyncCursor:
         self._index = len(self._rows)
         return chunk
 
-    async def __aiter__(self) -> AsyncCursor:
+    async def setinputsizes(self, sizes: t.Sequence[t.Any]) -> None:
+        """Not applicable -- Milvus has no prepared-statement input
+        binding to size ahead of time. Async per SQLAlchemy's
+        ``AsyncIODBAPICursor`` protocol (unlike ``setoutputsize``,
+        which that protocol declares sync)."""
+
+    def setoutputsize(self, size: int, column: int | None = None) -> None:
+        """Not applicable, same reason as ``setinputsizes``."""
+
+    def __aiter__(self) -> AsyncCursor:
+        # NOT `async def`: `async for` calls `__aiter__()` synchronously
+        # and expects the async iterator back directly, not a coroutine
+        # -- an `async def __aiter__` would make `some.__aiter__()`
+        # return a coroutine object with no `__anext__`, breaking
+        # `async for row in cursor`. Confirmed directly.
         return self
 
     async def __anext__(self) -> tuple[t.Any, ...]:
@@ -149,10 +169,10 @@ class AsyncConnection:
             await self._client.close()
             self.closed = True
 
-    def commit(self) -> None:
+    async def commit(self) -> None:
         """No-op (D7), same reasoning as the sync ``Connection``."""
 
-    def rollback(self) -> None:
+    async def rollback(self) -> None:
         """Fails loudly (D7), same reasoning as the sync ``Connection``."""
         msg = (
             "Milvus has no transaction rollback -- each statement is "

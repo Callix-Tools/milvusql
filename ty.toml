@@ -3,6 +3,18 @@ root = [
     "./src",
     "./packages/milvusql-sqlalchemy/src",
     "./packages/milvusql-django/src",
+    # `tests/dj_app` is a real Django app imported bare (`from dj_app...`,
+    # matching `INSTALLED_APPS = ["dj_app"]`). At runtime this resolves
+    # off two `sys.path` entries at once: pytest's own rootless-import
+    # insertion of `packages/milvusql-django` (`tests/` has an
+    # `__init__.py`, needed so pytest/ty can tell the many same-named
+    # `act.py`/`error.py` files apart, so that's where the package walk
+    # stops) for `tests.unit....`/`tests.integration....`-qualified
+    # intra-suite imports, plus `tests/conftest.py`'s own explicit
+    # `sys.path.insert` of `packages/milvusql-django/tests` itself for
+    # the bare `dj_app` import -- both need to be roots here too.
+    "./packages/milvusql-django",
+    "./packages/milvusql-django/tests",
     "./",
 ]
 

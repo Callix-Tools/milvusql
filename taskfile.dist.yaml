@@ -11,10 +11,16 @@ tasks:
     vars:
       LINT_PATHS: src tests packages/milvusql-sqlalchemy/src packages/milvusql-sqlalchemy/tests packages/milvusql-django/src packages/milvusql-django/tests
     cmds:
-      - if: "[[ -n $CI ]]"
-        cmd: mkdir -p reports
-      - if: "[[ -z $CI ]]"
-        cmd: uv run ruff format {{.LINT_PATHS}}
+      - |
+        # NOTE: `if: ... / cmd: ...` list-item pairs are not a real Task
+        # conditional (Task silently ignores an unrecognized `if:` key and
+        # always runs `cmd:`) -- branching lives in plain shell instead,
+        # driven by the real `$CI` env var GitHub Actions itself sets.
+        if [[ -n "$CI" ]]; then
+          mkdir -p reports
+        else
+          uv run ruff format {{.LINT_PATHS}}
+        fi
       - |
         uv run ruff check \
           {{ if eq (env "CI") "true" -}}
@@ -31,27 +37,77 @@ tasks:
           --output-format gitlab > reports/gl-code-quality-report.json{{ end }}
 
   tests:
-    desc: Run tests for the whole workspace (use COVERAGE=true for reports)
+    desc: >-
+      Run tests for the whole workspace (use COVERAGE=true for reports).
+      Pass args after `--` to target a specific path/pattern directly, e.g.
+      `task tests -- tests/unit/errors -k grpc` -- that bypasses the
+      per-package split below and runs one plain pytest invocation instead.
     vars:
-      TEST_PATHS: tests packages/milvusql-sqlalchemy/tests packages/milvusql-django/tests
+      # Each package gets its OWN pytest invocation (own rootdir), not one
+      # combined `pytest tests packages/*/tests` call: the entity/action
+      # test layout needs `__init__.py` all the way down for pytest to tell
+      # same-named act.py/error.py files apart, and three same-named `tests`
+      # packages collected in one process collide
+      # (`ImportPathMismatchError` -- confirmed directly). Coverage from the
+      # three separate runs is merged back into one report afterward.
+      PACKAGE_ROOTS: "milvusql:tests milvusql-sqlalchemy:packages/milvusql-sqlalchemy/tests milvusql-django:packages/milvusql-django/tests"
     cmds:
       - |
-        uv run pytest \
-          -n {{.CONCURRENCY}} \
-          -m "not validation" \
-          {{ if eq .COVERAGE "true" -}}
-          --cov=src \
-          --cov-report=term-missing:skip-covered \
-          --cov-report=xml:reports/coverage.xml \
-          --junitxml=reports/junit.xml \
-          {{ end -}}
-          {{ if .SEED -}}
-          --randomly-seed={{.SEED}} \
-          {{ end -}}
-          {{ if eq .FAILFAST "true" -}}
-          -x \
-          {{ end -}}
-          {{.CLI_ARGS | default .TEST_PATHS}}
+        set -uo pipefail
+        if [[ -n "${CI:-}" ]]; then
+          mkdir -p reports
+        fi
+
+        # One consolidated script, not several `cmds:` steps: Task runs every
+        # `cmds:` entry regardless of what an earlier one's shell process
+        # `exit`-ed with (confirmed directly) -- only a *non-zero* exit stops
+        # the task early, so branching between "direct mode" and "the
+        # per-package loop + combine" has to live inside one script.
+        if [[ -n "{{.CLI_ARGS}}" ]]; then
+          exec uv run pytest \
+            -n {{.CONCURRENCY | default "auto"}} \
+            -m "not validation" \
+            {{ if .SEED -}}
+            --randomly-seed={{.SEED}} \
+            {{ end -}}
+            {{ if eq .FAILFAST "true" -}}
+            -x \
+            {{ end -}}
+            {{.CLI_ARGS}}
+        fi
+
+        # Every package runs even if an earlier one fails -- one bad package
+        # shouldn't hide the other two's results in the same CI log -- but
+        # the task still exits non-zero overall if any of them did.
+        failed=0
+        for pkg_root in {{.PACKAGE_ROOTS}}; do
+          pkg="${pkg_root%%:*}"
+          path="${pkg_root#*:}"
+          COVERAGE_FILE="reports/.coverage.${pkg}" \
+          uv run pytest \
+            -n {{.CONCURRENCY | default "auto"}} \
+            -m "not validation" \
+            {{ if eq .COVERAGE "true" -}}
+            --cov=src --cov=packages/milvusql-sqlalchemy/src --cov=packages/milvusql-django/src \
+            --cov-report= \
+            --junitxml="reports/junit-${pkg}.xml" \
+            {{ end -}}
+            {{ if .SEED -}}
+            --randomly-seed={{.SEED}} \
+            {{ end -}}
+            {{ if eq .FAILFAST "true" -}}
+            -x \
+            {{ end -}}
+            "$path" || failed=1
+        done
+
+        {{ if eq .COVERAGE "true" -}}
+        uv run coverage combine reports/.coverage.milvusql reports/.coverage.milvusql-sqlalchemy reports/.coverage.milvusql-django
+        uv run coverage xml -o reports/coverage.xml
+        uv run coverage report --skip-covered
+        {{ end -}}
+
+        exit "$failed"
 
   # ---------------------------------------------------------------------------
   # Release

@@ -1,32 +1,31 @@
 # milvusql-sqlalchemy
 
 A SQLAlchemy 2.0 dialect for [Milvus](https://milvus.io), built on the
-[`milvusql`](https://github.com/Callix-Tools/milvusql) DBAPI (which in turn
-uses [`sqlglot-milvus`](https://github.com/Callix-Tools/sqlglot-milvus) as its
-parser).
+[`milvusql`](https://github.com/Callix-Tools/milvusql) DBAPI.
+
+```bash
+pip install milvusql-sqlalchemy
+```
 
 ```python
-from sqlalchemy import create_engine, select, MetaData, Table, Column, Integer, String
+from sqlalchemy import create_engine, select
 from milvusql_sqlalchemy.types import VECTOR
 
-engine = create_engine("milvusql://localhost:19530/default")
+engine = create_engine(
+    "milvusql:///items.db"
+)  # Milvus Lite, or a real server's URI
 
-metadata = MetaData()
-items = Table(
-    "items", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("category", String(64)),
-    Column("embedding", VECTOR(768)),
-)
-metadata.create_all(engine)
-
-with engine.connect() as conn:
+with (
+    engine.connect() as conn
+):  # items: Table with an `embedding` VECTOR column
     rows = conn.execute(
         select(items.c.id, items.c.category)
         .order_by(items.c.embedding.l2_distance([0.1] * 768))
         .limit(5)
     ).all()
 ```
+
+**Full docs: https://Callix-Tools.github.io/milvusql-docs/docs/sqlalchemy/overview**
 
 Status: early development, not yet published.
 

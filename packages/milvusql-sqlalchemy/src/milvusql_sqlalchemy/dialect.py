@@ -16,13 +16,16 @@ is unambiguous.
 
 from __future__ import annotations
 
+import inspect
 import typing as t
 
+from sqlalchemy import pool
 from sqlalchemy.engine import default
 from sqlalchemy.sql import schema
+from sqlalchemy.util import await_only
 
 import milvusql.dbapi
-from milvusql_sqlalchemy import reflection
+from milvusql_sqlalchemy import asyncio_dbapi, reflection
 from milvusql_sqlalchemy.compiler import MilvusDDLCompiler, MilvusSQLCompiler
 
 if t.TYPE_CHECKING:
@@ -38,15 +41,49 @@ if t.TYPE_CHECKING:
     from sqlalchemy.engine.url import URL
 
 
+def _unwrap(dbapi_connection: t.Any) -> t.Any:
+    """The async dialect (``asyncio_dbapi.py``) hands out
+    ``AsyncAdapt_dbapi_connection`` instances wrapping our real
+    ``milvusql.aio.AsyncConnection`` -- not the connection itself.
+    ``.driver_connection`` is that wrapper's own public unwrap point
+    (confirmed directly against ``sqlalchemy.engine.interfaces
+    .AdaptedConnection``); the sync dialect's ``dbapi_connection`` *is*
+    already our raw ``milvusql.dbapi.Connection``, with no such
+    attribute, so this is a no-op for it."""
+    return getattr(dbapi_connection, "driver_connection", dbapi_connection)
+
+
 def _raw_client(connection: SAConnection) -> t.Any:
-    """The ``pymilvus.MilvusClient`` behind a SQLAlchemy ``Connection``
-    -- reflection needs Milvus's own describe/list calls, which have no
-    SQL-text equivalent to route through ``connection.execute()``."""
+    """The ``pymilvus.MilvusClient``/``AsyncMilvusClient`` behind a
+    SQLAlchemy ``Connection`` -- reflection needs Milvus's own
+    describe/list calls, which have no SQL-text equivalent to route
+    through ``connection.execute()``."""
     dbapi_connection = connection.connection.dbapi_connection
     # Narrows `DBAPIConnection | None` for ty; a dead connection would
     # already have failed earlier in the call chain.
     assert dbapi_connection is not None  # noqa: S101  # nosec B101
-    return dbapi_connection._client
+    return _unwrap(dbapi_connection)._client
+
+
+def _reflect(result: t.Any) -> t.Any:
+    """``_raw_client()`` returns a plain ``MilvusClient`` under the
+    sync dialect (an already-resolved value) or an ``AsyncMilvusClient``
+    under ``MilvusDialect_aio`` (a coroutine) -- SQLAlchemy's own
+    ``Dialect`` API declares every reflection method synchronous
+    regardless of sync/async engine (confirmed directly:
+    ``AsyncConnection`` exposes no async reflection methods of its
+    own, only ``run_sync()``, which is the only way in to any of
+    these). When the async engine is the one calling in, that already
+    runs inside the greenlet ``run_sync()``/SQLAlchemy's own internal
+    reflection bridge spawns, so ``await_only()`` -- the same bridge
+    primitive ``sqlalchemy.connectors.asyncio`` itself uses -- is the
+    correct, supported way to actually run the coroutine here, instead
+    of it leaking back to the caller unawaited (confirmed directly:
+    that used to surface as a bare, unhelpful ``TypeError`` deep in
+    unrelated code)."""
+    if inspect.isawaitable(result):
+        return await_only(result)
+    return result
 
 
 class MilvusDialect(default.DefaultDialect):
@@ -107,8 +144,16 @@ class MilvusDialect(default.DefaultDialect):
                 "uri": f"{scheme}://{url.host}:{url.port or 19530}",
                 "db_name": url.database or "",
             }
-        if url.password:
-            kwargs["token"] = url.password
+        # "milvusql://user:password@host:port/db" -- Milvus's `token`
+        # auth parameter is itself a "user:password" pair (confirmed
+        # against pymilvus's docs), so a URL with both a username and
+        # password reassembles them into one token rather than
+        # forwarding the password alone and silently dropping the user.
+        token = milvusql.dbapi.token_from_credentials(
+            url.username, url.password
+        )
+        if token:
+            kwargs["token"] = token
         return [], kwargs
 
     def do_rollback(self, dbapi_connection: t.Any) -> None:
@@ -126,7 +171,7 @@ class MilvusDialect(default.DefaultDialect):
         round-trips whatever ``set_isolation_level`` stored -- the cast
         below documents the deliberate, understood mismatch rather than
         silencing it."""
-        level = dbapi_connection.consistency_level or "Bounded"
+        level = _unwrap(dbapi_connection).consistency_level or "Bounded"
         return t.cast("IsolationLevel", level)
 
     def set_isolation_level(
@@ -135,7 +180,7 @@ class MilvusDialect(default.DefaultDialect):
         """A statement's own ``CONSISTENCY LEVEL`` clause still wins
         over this connection-level default -- that's enforced in
         ``milvusql.dbapi.Cursor.execute``, not here."""
-        dbapi_connection.consistency_level = level
+        _unwrap(dbapi_connection).consistency_level = level
 
     def get_schema_names(
         self, connection: SAConnection, **kw: t.Any
@@ -154,7 +199,7 @@ class MilvusDialect(default.DefaultDialect):
     def get_table_names(
         self, connection: SAConnection, schema: str | None = None, **kw: t.Any
     ) -> list[str]:
-        return list(_raw_client(connection).list_collections())
+        return list(_reflect(_raw_client(connection).list_collections()))
 
     def get_view_names(
         self, connection: SAConnection, schema: str | None = None, **kw: t.Any
@@ -168,7 +213,9 @@ class MilvusDialect(default.DefaultDialect):
         schema: str | None = None,
         **kw: t.Any,
     ) -> list[ReflectedColumn]:
-        description = _raw_client(connection).describe_collection(table_name)
+        description = _reflect(
+            _raw_client(connection).describe_collection(table_name)
+        )
         return reflection.columns_from_description(description)
 
     def get_pk_constraint(
@@ -178,7 +225,9 @@ class MilvusDialect(default.DefaultDialect):
         schema: str | None = None,
         **kw: t.Any,
     ) -> ReflectedPrimaryKeyConstraint:
-        description = _raw_client(connection).describe_collection(table_name)
+        description = _reflect(
+            _raw_client(connection).describe_collection(table_name)
+        )
         return reflection.pk_constraint_from_description(description)
 
     def get_foreign_keys(
@@ -200,10 +249,50 @@ class MilvusDialect(default.DefaultDialect):
         client = _raw_client(connection)
         return [
             reflection.index_from_describe(
-                client.describe_index(table_name, field_name)
+                _reflect(client.describe_index(table_name, field_name))
             )
-            for field_name in client.list_indexes(table_name)
+            for field_name in _reflect(client.list_indexes(table_name))
         ]
 
 
-__all__ = ["MilvusDialect"]
+class MilvusDialect_aio(MilvusDialect):  # noqa: N801 -- matches upstream's own
+    # naming for driver-suffixed dialect classes, e.g. SQLAlchemy's own
+    # `SQLiteDialect_aiosqlite`, `PGDialect_asyncpg`.
+    """``milvusql+aio`` -- for
+    :func:`sqlalchemy.ext.asyncio.create_async_engine`.
+
+    Everything (DDL rendering, reflection, ``construct_arguments``,
+    the consistency-level fallback) is inherited unchanged from
+    :class:`MilvusDialect`; only the driver name and the DBAPI module
+    differ. See ``asyncio_dbapi.py`` for why no connection/cursor
+    subclassing was needed to make ``milvusql.aio`` work with
+    SQLAlchemy's generic async adapter."""
+
+    driver = "aio"
+    is_async = True
+    # SQLAlchemy re-checks this per dialect *class*, not just via
+    # inheritance -- confirmed directly: omitting it here (even though
+    # `MilvusDialect` already sets it `True`) makes `create_async_engine`
+    # warn "will not make use of SQL compilation caching" at import time.
+    supports_statement_cache = True
+
+    # `DefaultDialect.get_pool_class` just reads this attribute (falling
+    # back to plain `QueuePool` if unset) -- it does NOT branch on
+    # `is_async` itself, so every async dialect (`asyncmy`, `asyncpg`,
+    # `aiosqlite`'s file-db case, ...) sets this explicitly. Without it,
+    # `create_async_engine` raises "Pool class QueuePool cannot be used
+    # with asyncio engine" (confirmed directly).
+    poolclass = pool.AsyncAdaptedQueuePool
+
+    @classmethod
+    def import_dbapi(cls) -> DBAPIModule:
+        # Same deliberate, understood cast as the sync dialect's
+        # `import_dbapi` -- see its comment. No lazy import needed
+        # here the way `aiosqlite`'s dialect needs one: `asyncio_dbapi`
+        # only touches `milvusql`/`sqlalchemy`, both already hard
+        # dependencies regardless of sync or async use, not an
+        # optional third-party driver package.
+        return t.cast("DBAPIModule", asyncio_dbapi.dbapi)
+
+
+__all__ = ["MilvusDialect", "MilvusDialect_aio"]

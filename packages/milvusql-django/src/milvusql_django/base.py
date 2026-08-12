@@ -161,8 +161,16 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             port = settings_dict.get("PORT") or 19530
             params["uri"] = f"{scheme}://{host}:{port}"
             params["db_name"] = name
-        if settings_dict.get("PASSWORD"):
-            params["token"] = settings_dict["PASSWORD"]
+        # DATABASES["default"]["USER"]/"PASSWORD" -- Milvus's `token`
+        # auth parameter is itself a "user:password" pair (confirmed
+        # against pymilvus's docs), so both settings reassemble into
+        # one token rather than forwarding PASSWORD alone and silently
+        # dropping USER.
+        token = Database.token_from_credentials(
+            settings_dict.get("USER"), settings_dict.get("PASSWORD")
+        )
+        if token:
+            params["token"] = token
         params.update(settings_dict.get("OPTIONS", {}))
         return params
 

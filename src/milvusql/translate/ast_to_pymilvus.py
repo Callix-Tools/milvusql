@@ -299,14 +299,29 @@ def _build_create_table(
         name = column.this.name
         milvus_type, extra = _map_datatype(column.kind)
         constraint_kinds = {type(c.kind) for c in (column.constraints or [])}
+        is_primary = (
+            exp.PrimaryKeyColumnConstraint in constraint_kinds
+            or name in pk_names
+        )
+        # A `Mapped[T | None]` column (no explicit `NOT NULL`, what
+        # SQLAlchemy's own DDL compiler emits for it) needs
+        # `nullable=True` on the Milvus `FieldSchema`, or `pymilvus`
+        # rejects a Python `None` at insert time with "FieldData 'x' has
+        # 0 rows, expected 1" -- confirmed directly. Primary keys and
+        # vector fields can't be nullable in Milvus, so this only
+        # applies to ordinary scalar columns.
+        nullable = (
+            not is_primary
+            and exp.NotNullColumnConstraint not in constraint_kinds
+            and milvus_type
+            not in (DataType.FLOAT_VECTOR, DataType.SPARSE_FLOAT_VECTOR)
+        )
         milvus_schema.add_field(
             field_name=name,
             datatype=milvus_type,
-            is_primary=(
-                exp.PrimaryKeyColumnConstraint in constraint_kinds
-                or name in pk_names
-            ),
+            is_primary=is_primary,
             auto_id=exp.AutoIncrementColumnConstraint in constraint_kinds,
+            nullable=nullable,
             **extra,
         )
 
@@ -420,7 +435,26 @@ def _build_delete(ast: exp.Delete, parameters: dict[str, t.Any]) -> Call:
 # -----------------------------------------------------------------------
 
 
+def _select_field_names(ast: exp.Select) -> list[str]:
+    """The real Milvus field names to request via ``output_fields`` --
+    unwraps ``t.col AS alias`` down to ``col``. Deliberately distinct
+    from :func:`_select_output_names`: SQLAlchemy's ORM always labels
+    every column (``SELECT t.id AS t_id, ...``, confirmed directly in
+    ``Session.get()``'s emitted SQL), and asking Milvus for a field
+    literally named ``t_id`` returns nothing for it -- silently
+    (Milvus's ``query``/``search`` just omit an unknown output field,
+    they don't error), which used to make every ORM load return rows
+    of ``None``s."""
+    return [
+        column.this.name if isinstance(column, exp.Alias) else column.name
+        for column in ast.expressions
+    ]
+
+
 def _select_output_names(ast: exp.Select) -> list[str]:
+    """The labels to report back through ``cursor.description`` and to
+    build result tuples with -- the alias when there is one, the bare
+    column name otherwise."""
     return [column.output_name for column in ast.expressions]
 
 
@@ -430,7 +464,9 @@ def _description(output_names: list[str]) -> list[tuple]:
     ]
 
 
-def _search_rows(output_names: list[str]) -> Postprocess:
+def _search_rows(
+    field_names: list[str], output_names: list[str]
+) -> Postprocess:
     def postprocess(raw: list[list[dict[str, t.Any]]]) -> RowsAndDescription:
         hits = raw[0] if raw else []
         rows = []
@@ -440,15 +476,17 @@ def _search_rows(output_names: list[str]) -> Postprocess:
                 "id": hit.get("id"),
                 "distance": hit.get("distance"),
             }
-            rows.append(tuple(available.get(name) for name in output_names))
+            rows.append(tuple(available.get(name) for name in field_names))
         return rows, _description(output_names), len(rows), None
 
     return postprocess
 
 
-def _query_rows(output_names: list[str]) -> Postprocess:
+def _query_rows(
+    field_names: list[str], output_names: list[str]
+) -> Postprocess:
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
-        rows = [tuple(row.get(name) for name in output_names) for row in raw]
+        rows = [tuple(row.get(name) for name in field_names) for row in raw]
         return rows, _description(output_names), len(rows), None
 
     return postprocess
@@ -460,6 +498,7 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
         raise errors.NotSupportedError(msg)
 
     table_name = ast.args["from_"].this.name
+    field_names = _select_field_names(ast)
     output_names = _select_output_names(ast)
     filter_text = _filter_text(ast.args.get("where"), parameters)
     limit_node = ast.args.get("limit")
@@ -478,12 +517,12 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     if order is None:
         kwargs: dict[str, t.Any] = {
             "collection_name": table_name,
-            "output_fields": output_names,
+            "output_fields": field_names,
             "limit": limit,
         }
         if filter_text:
             kwargs["filter"] = filter_text
-        return Call("query", kwargs, _query_rows(output_names))
+        return Call("query", kwargs, _query_rows(field_names, output_names))
 
     ordered = order.expressions[0]
     distance_node = ordered.this
@@ -506,7 +545,7 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
         "data": [query_vector],
         "anns_field": column_name,
         "limit": limit,
-        "output_fields": output_names,
+        "output_fields": field_names,
         "search_params": {"metric_type": metric_type, "params": knobs},
     }
     if filter_text:
@@ -515,7 +554,7 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     if consistency is not None:
         kwargs["consistency_level"] = consistency.this.name
 
-    return Call("search", kwargs, _search_rows(output_names))
+    return Call("search", kwargs, _search_rows(field_names, output_names))
 
 
 # -----------------------------------------------------------------------

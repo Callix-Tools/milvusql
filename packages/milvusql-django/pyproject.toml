@@ -43,3 +43,14 @@ milvusql = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--tb=short -v --strict-markers"
+# tests/{unit,integration}/<entity>/<action>/ holds act.py (happy-path)
+# and error.py (error/edge-case) files rather than test_*.py -- widen
+# the collection glob to pick them up alongside the default pattern.
+python_files = ["test_*.py", "*_test.py", "act.py", "error.py"]
+markers = [
+    "unit: pure-logic test, no external process (Milvus, a real DB) started",
+    "integration: exercises a real (embedded) Milvus Lite instance",
+    "validation: opt-in test against a real, non-Lite Milvus server (excluded by default -- see taskfile's `-m \"not validation\"`)",
+    "django: the milvusql-django backend package",
+]

@@ -4,7 +4,11 @@ module must expose at module level."""
 
 from __future__ import annotations
 
-from milvusql.dbapi.connection import Connection, connect
+from milvusql.dbapi.connection import (
+    Connection,
+    connect,
+    token_from_credentials,
+)
 from milvusql.dbapi.cursor import Cursor
 from milvusql.dbapi.errors import (
     DatabaseError,
@@ -45,4 +49,5 @@ __all__ = [
     "connect",
     "paramstyle",
     "threadsafety",
+    "token_from_credentials",
 ]
