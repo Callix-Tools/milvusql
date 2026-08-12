@@ -149,7 +149,15 @@ tasks:
     cmds:
       - rm -rf dist
       - uv build --all-packages
-      - uv publish
+      # --check-url: if a previous run of this task already published some
+      # of these files (confirmed directly -- a bad classifier failed
+      # milvusql-sqlalchemy mid-publish once, after milvusql/milvusql-django
+      # had already succeeded), a bare `uv publish` hard-errors on every
+      # already-published file with a generic "already exists" -- this
+      # skips a file that's byte-identical to what's already live instead,
+      # so a retry after fixing a real bug doesn't require hand-picking
+      # which files are actually still missing.
+      - uv publish --check-url https://pypi.org/simple/
 
   release:github:
     desc: Create GitHub Release with changelog notes (requires TAG=vX.Y.Z)

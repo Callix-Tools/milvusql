@@ -17,7 +17,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
-    "Framework :: SQLAlchemy",
+    # NOTE: no "Framework :: SQLAlchemy" -- not a registered PyPI Trove
+    # classifier (confirmed directly: PyPI rejected the upload with a 400
+    # for it, see https://pypi.org/classifiers/ for the real list).
     "Topic :: Database",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
