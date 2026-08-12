@@ -1,0 +1,51 @@
+line-length = 79
+target-version = "py312"
+fix = true
+unsafe-fixes = true
+
+[lint]
+select = [
+    "A",
+    "B",
+    "F",
+    "I",
+    "Q",
+    "ASYNC",
+    "N",
+    "W",
+    "UP",
+    "T20",
+    "SIM",
+    "ANN",
+    "PL",
+    "PT",
+    "RET",
+    "E",
+    "S",
+    "C4",
+    "EM",
+    "DTZ",
+    "RUF",
+    "ARG",
+    "TID"
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+    "ANN",
+    "D",
+    "PLR2004",
+    "ARG001",
+    "ARG002",
+    "E501",
+    "S105",
+    "B008",
+    "ASYNC240",
+    "S101",
+    "RUF012",
+    "S608",
+    "S301",
+    "PLW1510",
+    "PT011",
+    "S603",
+]

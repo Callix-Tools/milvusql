@@ -1,0 +1,72 @@
+[project]
+name = "milvusql"
+version = "0.1.0"
+description = "PEP 249 DBAPI (sync + async) for Milvus, backed by sqlglot-milvus"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Neko1313", email = "nikita.ribalchencko@yandex.ru" }
+]
+requires-python = ">=3.12"
+keywords = ["milvus", "dbapi", "pep249", "vector-search", "asyncio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: AsyncIO",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pymilvus>=2.6,<3",
+    "sqlglot-milvus>=0.1.0,<0.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/Callix-Tools/milvusql"
+Repository = "https://github.com/Callix-Tools/milvusql"
+Issues = "https://github.com/Callix-Tools/milvusql/issues"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short -v"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[dependency-groups]
+lint = [
+    "bandit~=1.8.6",
+    "ruff~=0.16.2",
+    "ty~=0.0.70",
+]
+test = [
+    "greenlet>=3.5.5",
+    "milvus-lite>=2.4,<4",
+    "pytest~=8.4.2",
+    "pytest-asyncio~=1.2.0",
+    "pytest-cov~=7.1.0",
+    "pytest-randomly~=4.0.1",
+    "pytest-xdist[psutil]~=3.8.0",
+]
+
+# Tools settings
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[tool.coverage.run]
+concurrency = ["greenlet"]

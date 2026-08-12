@@ -1,0 +1,123 @@
+version: "3"
+
+tasks:
+  install:
+    desc: Install all workspace dependencies including sub-package groups
+    cmds:
+      - uv sync --all-groups --all-packages
+
+  lint:
+    desc: Run linters for core package
+    cmds:
+      - if: "[[ -n $CI ]]"
+        cmd: mkdir -p reports
+      - if: "[[ -z $CI ]]"
+        cmd: uv run ruff format src tests
+      - |
+        uv run ruff check \
+          {{ if eq (env "CI") "true" -}}
+          --output-format json --output-file reports/ruff.json \
+          {{ else -}}
+          --fix \
+          {{ end -}}
+          src tests
+      - |
+        uv run bandit -r src{{ if eq (env "CI") "true" }} \
+          -o reports/bandit.json --format json{{ end }}
+      - |
+        uv run ty check{{ if eq (env "CI") "true" }} \
+          --output-format gitlab > reports/gl-code-quality-report.json{{ end }}
+
+  tests:
+    desc: Run core tests (use COVERAGE=true for reports)
+    cmds:
+      - |
+        uv run pytest \
+          -n {{.CONCURRENCY}} \
+          -m "not validation" \
+          {{ if eq .COVERAGE "true" -}}
+          --cov=src \
+          --cov-report=term-missing:skip-covered \
+          --cov-report=xml:reports/coverage.xml \
+          --junitxml=reports/junit.xml \
+          {{ end -}}
+          {{ if .SEED -}}
+          --randomly-seed={{.SEED}} \
+          {{ end -}}
+          {{ if eq .FAILFAST "true" -}}
+          -x \
+          {{ end -}}
+          {{.CLI_ARGS | default "tests"}}
+
+  # ---------------------------------------------------------------------------
+  # Release
+  # ---------------------------------------------------------------------------
+
+  release:version:
+    desc: Determine next version via conventional commits
+    cmds:
+      - |
+        NEXT=$(git cliff --bumped-version 2>/dev/null || echo "")
+        if [[ -z "$NEXT" ]]; then
+          echo "No previous tag found, bootstrapping with v0.1.0"
+          NEXT="v0.1.0"
+        fi
+        NEXT_CLEAN="${NEXT#v}"
+        echo "Next version: $NEXT ($NEXT_CLEAN)"
+        if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+          echo "tag=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "version=$NEXT_CLEAN" >> "$GITHUB_OUTPUT"
+        fi
+
+  release:bump:
+    desc: Bump version in all packages (requires VERSION=x.y.z)
+    requires:
+      vars: [VERSION]
+    cmds:
+      - uv version {{.VERSION}} --frozen
+      - uv lock
+
+  release:changelog:
+    desc: Generate CHANGELOG.md (requires TAG=vX.Y.Z)
+    requires:
+      vars: [TAG]
+    cmds:
+      - git cliff --tag {{.TAG}} --output CHANGELOG.md
+
+  release:commit:
+    desc: Commit version bump and changelog, create annotated tag (requires TAG=vX.Y.Z)
+    requires:
+      vars: [TAG]
+    cmds:
+      - |
+        git add pyproject.toml \
+                uv.lock \
+                CHANGELOG.md
+        git commit -m "chore(release): {{.TAG}}"
+        git tag -a "{{.TAG}}" -m "Release {{.TAG}}"
+
+  release:push:
+    desc: Push commit and tag to origin (requires TAG=vX.Y.Z)
+    requires:
+      vars: [TAG]
+    cmds:
+      - git push origin main
+      - git push origin {{.TAG}}
+
+  release:publish:
+    desc: Build and publish all workspace packages to PyPI
+    cmds:
+      - rm -rf dist
+      - uv build --all-packages
+      - uv publish
+
+  release:github:
+    desc: Create GitHub Release with changelog notes (requires TAG=vX.Y.Z)
+    requires:
+      vars: [TAG]
+    cmds:
+      - |
+        git cliff --latest --strip all > /tmp/release-notes.md
+        gh release create {{.TAG}} \
+          --title {{.TAG}} \
+          --notes-file /tmp/release-notes.md
