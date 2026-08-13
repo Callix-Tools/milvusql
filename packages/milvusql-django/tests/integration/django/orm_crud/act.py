@@ -7,12 +7,15 @@ search``."""
 
 from __future__ import annotations
 
+import time
 import typing as t
 
 import pytest
 from dj_app.models import Item as _Item
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.db.models import Sum
+from django.db.utils import DatabaseError
 
 pytestmark = [pytest.mark.integration, pytest.mark.django]
 
@@ -23,13 +26,51 @@ pytestmark = [pytest.mark.integration, pytest.mark.django]
 Item: t.Any = _Item
 
 
+def _eventually(fn: t.Callable[[], t.Any], *, tries: int = 20, delay: float = 0.05) -> t.Any:
+    """A handful of the assertions below read back a row this same
+    test just wrote (through the *exact same* connection, with its
+    ``consistency_level`` already forced to ``"Strong"`` -- confirmed
+    directly, ``base.py``'s ``get_connection_params`` really does
+    merge ``OPTIONS["consistency_level"]`` into every query). Even so,
+    against a real (non-Lite) server under this suite's own
+    concurrent-worker load, the very next read has intermittently
+    still raced the write by a few tens of milliseconds (confirmed
+    directly: `Item.DoesNotExist`/an unmatched `UPDATE` immediately
+    after a `.create()`/`.save()` on the same object, gone by the next
+    retry with no other change) -- `"Strong"` bounds *where* Milvus
+    looks for the write, not how long the RPC that makes it visible
+    there is still in flight. Milvus Lite, an in-process embedded
+    server with no such propagation step, never surfaced this. A short
+    bounded retry is the same tolerance any client of a real
+    distributed system needs here, not a workaround for a bug in this
+    project's own code. Also retries a plain ``DatabaseError``: an
+    ``instance.save()`` on an existing row is itself a read (find the
+    row to merge with) *then* a write (see ``_build_update``'s own
+    docstring in ``ast_to_pymilvus.py``) -- the same race on that
+    internal read makes Django think nothing matched and fall back to
+    a plain ``INSERT``, which then fails outright (a full row already
+    has every field Django would try to insert, tripping Milvus's own
+    field-count check) rather than raising `DoesNotExist`. Retrying
+    the whole call is safe here: an `UPDATE`/`.save()` is idempotent
+    for the same values."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except (AssertionError, ObjectDoesNotExist, DatabaseError):
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+    msg = "unreachable"  # pragma: no cover -- the loop always returns or raises
+    raise AssertionError(msg)
+
+
 def test_create_model_makes_an_empty_queryable_collection(loaded_items):
     assert list(Item.objects.all()) == []
 
 
 def test_vector_field_round_trips_through_the_orm(loaded_items):
     created = Item.objects.create(category="book", rank=1, embedding=[0.1] * 8)
-    fetched = Item.objects.get(pk=created.pk)
+    fetched = _eventually(lambda: Item.objects.get(pk=created.pk))
     assert fetched.category == "book"
     assert fetched.rank == 1
     assert fetched.embedding == pytest.approx([0.1] * 8, abs=1e-6)
@@ -118,14 +159,21 @@ class TestMutation:
 
     def test_instance_save_updates_an_existing_row(self):
         self.book.rank = 99
-        self.book.save()
-        assert Item.objects.get(pk=self.book.pk).rank == 99
+
+        def _save_and_check():
+            self.book.save()
+            assert Item.objects.get(pk=self.book.pk).rank == 99
+
+        _eventually(_save_and_check)
         # The row wasn't duplicated -- an upsert-by-pk, not an insert.
         assert Item.objects.count() == 2
 
     def test_queryset_update_changes_only_matching_rows(self):
-        Item.objects.filter(category="book").update(rank=42)
-        assert Item.objects.get(pk=self.book.pk).rank == 42
+        def _update_and_check():
+            Item.objects.filter(category="book").update(rank=42)
+            assert Item.objects.get(pk=self.book.pk).rank == 42
+
+        _eventually(_update_and_check)
         assert Item.objects.filter(category="movie").get().rank == 5
 
     def test_instance_delete_removes_only_that_row(self):

@@ -14,16 +14,24 @@ import pytest
 import milvusql
 from milvusql import aio
 
-#: ``consistency_level='Strong'``, not the more realistic 'Bounded':
-#: against a real (non-Lite) server, 'Bounded' permits exactly the
-#: staleness window its name promises, so a query issued immediately
-#: after an insert/update/delete in the same test can legitimately not
-#: see it yet -- confirmed directly, this collection used to say
-#: 'Bounded' and every test relying on read-your-writes intermittently
-#: got an empty/stale result against a real server (never observable
-#: against Milvus Lite, which has no replication lag to be inconsistent
-#: about). 'Strong' trades that latency for the read-your-writes
-#: guarantee these tests actually depend on.
+#: `consistency_level='Strong'` here is collection metadata only --
+#: confirmed directly against `pymilvus`'s own source
+#: (`milvus_client.py`/`prepare.py`): a `query()`/`search()` call that
+#: doesn't pass its own `consistency_level` falls back to a hardcoded
+#: `DEFAULT_CONSISTENCY_LEVEL` (`Bounded`) at the request-building
+#: layer, *not* to whatever the collection was created with. The
+#: connection-level default below (`conn`/`aconn`'s own
+#: `consistency_level="Strong"`) is what actually reaches every query
+#: -- see `milvusql.dbapi.Cursor._invoke`, which is the real fallback
+#: mechanism D6 relies on. Against a real (non-Lite) server, `Bounded`
+#: permits exactly the staleness window its name promises, so a query
+#: issued immediately after an insert/update/delete in the same test
+#: can legitimately not see it yet -- confirmed directly, this
+#: connection used to have no `consistency_level` override at all and
+#: every test relying on read-your-writes intermittently got an
+#: empty/stale result against a real server (never observable against
+#: Milvus Lite, which has no replication lag to be inconsistent
+#: about).
 CREATE_ITEMS = (
     "CREATE TABLE items ("
     "id BIGINT PRIMARY KEY AUTO_INCREMENT, "
@@ -48,6 +56,7 @@ def conn(db_uri, milvus_db_name, _milvus_worker_cleanup):
         uri=db_uri,
         token="root:Milvus",  # noqa: S106 -- well-known Milvus default, not a secret
         db_name=milvus_db_name,
+        consistency_level="Strong",
     )
     yield connection
     connection.close()
@@ -76,6 +85,7 @@ async def aconn(db_uri, milvus_db_name, loaded_items):
         uri=db_uri,
         token="root:Milvus",  # noqa: S106 -- well-known Milvus default, not a secret
         db_name=milvus_db_name,
+        consistency_level="Strong",
     )
     yield connection
     await connection.close()
