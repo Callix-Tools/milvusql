@@ -33,6 +33,7 @@ from sqlglot_milvus.expressions import (
     HYBRID_ARG,
     METRIC_TYPES,
     SEARCH_PARAMS_ARG,
+    AddField,
     HybridSearch,
     LoadTable,
     ReleaseTable,
@@ -224,7 +225,7 @@ def _render_filter_value(value: t.Any) -> str:  # noqa: ANN401
     raise errors.NotSupportedError(msg)
 
 
-def _render_filter(  # noqa: PLR0911 -- one return per AST node case, clearer flat than nested
+def _render_filter(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clearer flat than nested
     node: exp.Expression, parameters: dict[str, t.Any]
 ) -> str:
     """MilvusQL's WHERE tree -> Milvus's boolean filter-expression text.
@@ -276,6 +277,48 @@ def _render_filter(  # noqa: PLR0911 -- one return per AST node case, clearer fl
             for value in node.expressions
         )
         return f"{column} in [{values}]"
+    if isinstance(node, exp.Like):
+        # Milvus's filter DSL has its own native `field like "pattern"`
+        # syntax (confirmed directly against Milvus Lite, SQL-style `%`/
+        # `_` wildcards) -- no transpiling needed. `NOT LIKE` compiles
+        # to a `negate` flag on the same node (unlike `NOT IN`/
+        # `IS NOT NULL`, which wrap in a separate `exp.Not`), so it is
+        # handled here rather than falling through to the generic `Not`
+        # case above.
+        column = _render_filter(node.this, parameters)
+        pattern = _render_filter_value(
+            _resolve_value(node.expression, parameters)
+        )
+        text = f"{column} like {pattern}"
+        return f"not ({text})" if node.args.get("negate") else text
+    if isinstance(node, exp.Between):
+        # Milvus's filter DSL has no `BETWEEN` keyword at all (confirmed
+        # directly: a bare `id BETWEEN 1 AND 2` is a syntax error), so
+        # this transpiles to the equivalent `>=`/`<=` pair every other
+        # comparison here already renders -- `NOT BETWEEN` gets this for
+        # free via the generic `Not` case above, since (unlike `LIKE`)
+        # it wraps in a separate `exp.Not` rather than a node flag.
+        column = _render_filter(node.this, parameters)
+        low = _render_filter_value(
+            _resolve_value(node.args["low"], parameters)
+        )
+        high = _render_filter_value(
+            _resolve_value(node.args["high"], parameters)
+        )
+        return f"({column} >= {low} and {column} <= {high})"
+    if isinstance(node, exp.Is):
+        # Milvus's filter DSL only has `is null`/`is not null`
+        # (confirmed directly) -- no other `IS <predicate>` form (e.g.
+        # `IS TRUE`) to transpile to, so anything but a `NULL` right-hand
+        # side is a real gap, not a silent guess.
+        if not isinstance(node.expression, exp.Null):
+            msg = (
+                "unsupported IS comparison: IS "
+                f"{node.expression.__class__.__name__}"
+            )
+            raise errors.NotSupportedError(msg)
+        column = _render_filter(node.this, parameters)
+        return f"{column} is null"
     if isinstance(node, exp.Column):
         return node.this.name
     if isinstance(
@@ -466,13 +509,45 @@ def _build_drop_table(ast: exp.Drop) -> Call:
     )
 
 
-# ALTER TABLE ADD FIELD (Track A's ``AddField`` node) is intentionally
-# not wired up here yet: ``MilvusClient.add_collection_field`` returns
-# ``UNIMPLEMENTED`` against Milvus Lite (verified directly -- a raw
-# ``grpc.RpcError``, not even a ``MilvusException``), so there is no way
-# to test it in this phase's Milvus Lite-only suite. Out of the
-# phase-1 scope committed in the design plan; add it back once there is
-# a real (or newer Lite) server to verify against.
+def _build_alter_add_field(ast: exp.Alter) -> Call:
+    """``ALTER TABLE items ADD FIELD tag VARCHAR(32)``.
+
+    sqlglot-milvus's own grammar rejects every other ``ALTER`` action
+    (``DROP``/``ALTER COLUMN``/``MODIFY``) at *parse* time with a
+    ``ParseError`` (Milvus can't perform them at all), so the single
+    action reaching here is always an ``AddField`` -- the ``isinstance``
+    check below is defense in depth against a synthetic or
+    foreign-dialect AST, not a real branch the grammar can produce.
+
+    ``MilvusClient.add_collection_field`` returns ``UNIMPLEMENTED``
+    against Milvus Lite (verified directly -- a raw ``grpc.RpcError``,
+    not even a ``MilvusException``), which ``errors.translate`` already
+    maps to :class:`~milvusql.dbapi.errors.NotSupportedError` (see
+    ``_translate_grpc_error``). So on Lite this still raises the same
+    exception type it always has -- now for real, from the RPC layer,
+    rather than a blanket pre-emptive rejection that would also have
+    blocked a real Milvus server that *does* implement it.
+
+    A newly added field always needs ``nullable=True``: existing rows
+    have no value to backfill for it, and ``pymilvus`` itself requires
+    it for a vector field (raises ``ParamError`` otherwise) -- setting
+    it unconditionally is correct for every column kind, not just
+    vectors.
+    """
+    actions = ast.args.get("actions") or []
+    if len(actions) != 1 or not isinstance(actions[0], AddField):
+        msg = "unsupported ALTER TABLE action"
+        raise errors.NotSupportedError(msg)
+    column = actions[0].this
+    milvus_type, extra = _map_datatype(column.kind)
+    kwargs: dict[str, t.Any] = {
+        "collection_name": ast.this.name,
+        "field_name": column.this.name,
+        "data_type": milvus_type,
+        "nullable": True,
+        **extra,
+    }
+    return Call("add_collection_field", kwargs, _no_rows)
 
 
 # -----------------------------------------------------------------------
@@ -480,24 +555,75 @@ def _build_drop_table(ast: exp.Drop) -> Call:
 # -----------------------------------------------------------------------
 
 
-def _build_insert(ast: exp.Insert, parameters: dict[str, t.Any]) -> Call:
+def _insert_rows(
+    ast: exp.Insert, parameters: dict[str, t.Any]
+) -> list[dict[str, t.Any]]:
+    """The row dicts one bind-parameter set's ``INSERT`` names, shared
+    between a single-row ``execute()`` and the batched
+    ``executemany()`` path below -- both need exactly the same
+    ``column -> resolved value`` mapping, just assembled from a
+    different number of parameter sets."""
     schema_node = ast.this
-    table_name = schema_node.this.name
     columns = [ident.name for ident in schema_node.expressions]
     values_node = ast.args["expression"]
-
-    rows = [
+    return [
         {
             name: _resolve_value(value, parameters)
             for name, value in zip(columns, row.expressions, strict=True)
         }
         for row in values_node.expressions
     ]
+
+
+def _build_insert(ast: exp.Insert, parameters: dict[str, t.Any]) -> Call:
+    table_name = ast.this.this.name
+    rows = _insert_rows(ast, parameters)
     return Call(
         "insert",
         {"collection_name": table_name, "data": rows},
         _insert_result,
     )
+
+
+def _build_batch_insert(
+    ast: exp.Insert, seq_of_parameters: t.Sequence[dict[str, t.Any]]
+) -> Call:
+    """``executemany()`` over an ``INSERT`` -- unlike every other
+    statement shape, Milvus's own ``insert()`` already accepts a full
+    list of rows in one RPC (confirmed directly: ``data=[...]`` is not
+    limited to one row), so every bind-parameter set's row(s) are
+    merged into a single call instead of one RPC per parameter set.
+    ``_insert_result`` needs no changes for this: it already reduces a
+    multi-row ``insert()`` response to one ``rowcount``/``lastrowid``
+    pair the same way, whether the multiple rows came from one
+    multi-VALUES statement or many parameter sets."""
+    table_name = ast.this.this.name
+    rows = [
+        row
+        for parameters in seq_of_parameters
+        for row in _insert_rows(ast, parameters)
+    ]
+    return Call(
+        "insert",
+        {"collection_name": table_name, "data": rows},
+        _insert_result,
+    )
+
+
+def build_batch_call(
+    ast: exp.Expression, seq_of_parameters: t.Sequence[dict[str, t.Any]]
+) -> Call | None:
+    """``executemany()``'s entry point: a parsed statement and every
+    one of its bind-parameter sets -> a single batched ``Call``, or
+    ``None`` when Milvus has no batched primitive for this statement
+    shape (``UPDATE``'s ``query``-then-``upsert`` pair and ``DELETE``'s
+    single-filter shape don't merge across independent parameter sets
+    the way ``INSERT``'s row list does) -- the caller then falls back
+    to one :func:`build_call` per parameter set, same as before this
+    existed."""
+    if isinstance(ast, exp.Insert):
+        return _build_batch_insert(ast, seq_of_parameters)
+    return None
 
 
 def _build_delete(ast: exp.Delete, parameters: dict[str, t.Any]) -> Call:
@@ -624,9 +750,32 @@ def _sorted_query_rows(
     every matching row (fetched up to :data:`_DEFAULT_QUERY_LIMIT`,
     same ceiling a plain unordered SELECT is already subject to) in
     Python and only *then* applies the real ``LIMIT`` -- sorting after
-    truncating would return the wrong rows entirely."""
+    truncating would return the wrong rows entirely.
+
+    If the ``WHERE`` filter itself matches more than
+    :data:`_DEFAULT_QUERY_LIMIT` rows, the fetch above is itself
+    truncated -- the sort would then run over an arbitrary subset of
+    the true matches, silently returning the wrong "top N" with no
+    error at all. ``postprocess`` below detects that (the fetch came
+    back at the ceiling) and raises rather than guess: there is no way
+    to fetch a larger page from ``query()`` in this one-RPC-per-``Call``
+    model, and ``pymilvus``'s own pagination helper
+    (``MilvusClient.query_iterator``) has no counterpart on
+    ``AsyncMilvusClient`` at all (confirmed directly) -- adopting it
+    here would make the sync and async cursors behave differently for
+    the same MilvusQL text, which this module is deliberately built to
+    never do (D1/D12)."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
+        if len(raw) >= _DEFAULT_QUERY_LIMIT:
+            msg = (
+                "ORDER BY cannot be honored: the WHERE filter matches "
+                f"at least Milvus's own per-call row ceiling "
+                f"({_DEFAULT_QUERY_LIMIT}), so the true sort order "
+                "across every matching row cannot be verified. Narrow "
+                "the WHERE filter to match fewer rows."
+            )
+            raise errors.NotSupportedError(msg)
         rows = list(raw)
         # Stable-sort by the least significant key first so the most
         # significant key (applied last) wins ties -- the standard way
@@ -660,6 +809,30 @@ _AGG_FUNCS: dict[type[exp.Expression], str] = {
 }
 
 
+def _table_name(ast: exp.Select) -> str:
+    """The single collection a ``SELECT`` reads from.
+
+    Milvus has no cross-collection JOIN and no subquery-as-source, so
+    both are rejected explicitly here rather than silently narrowing to
+    whatever ``.this.name`` happens to resolve to: a ``JOIN`` was
+    previously dropped without a word (the query just ran against the
+    first table, as if the ``JOIN`` had never been written), and a
+    subquery in ``FROM`` produced an unclear ``AttributeError`` deep in
+    ``pymilvus`` instead of a clean, actionable error at translate
+    time."""
+    if ast.args.get("joins"):
+        msg = "JOIN is not supported: Milvus has no cross-collection join"
+        raise errors.NotSupportedError(msg)
+    from_this = ast.args["from_"].this
+    if not isinstance(from_this, exp.Table):
+        msg = (
+            "SELECT ... FROM <subquery> is not supported: FROM must "
+            "name a single collection"
+        )
+        raise errors.NotSupportedError(msg)
+    return from_this.name
+
+
 def _unwrap_alias(node: exp.Expression) -> exp.Expression:
     return node.this if isinstance(node, exp.Alias) else node
 
@@ -690,7 +863,26 @@ def _count_star_rows(count: int, output_names: list[str]) -> Postprocess:
 def _reduce_aggregate_rows(
     specs: list[tuple[str, str | None]], output_names: list[str]
 ) -> Postprocess:
+    """``SUM``/``AVG``/``MIN``/``MAX``/``COUNT(<column>)`` (everything
+    but a pure ``COUNT(*)``, which the server-side fast path above
+    handles instead): Milvus computes none of these itself, so every
+    matching row is fetched (up to :data:`_DEFAULT_QUERY_LIMIT`) and
+    reduced here in Python. Same reasoning as
+    :func:`_sorted_query_rows` for why hitting that ceiling raises
+    instead of silently reducing over a truncated subset -- a ``SUM``
+    or ``AVG`` computed from only *some* of the matching rows is a
+    wrong number with no indication it is wrong."""
+
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
+        if len(raw) >= _DEFAULT_QUERY_LIMIT:
+            msg = (
+                "aggregate cannot be honored: the WHERE filter matches "
+                f"at least Milvus's own per-call row ceiling "
+                f"({_DEFAULT_QUERY_LIMIT}), so the aggregate cannot be "
+                "computed over every matching row. Narrow the WHERE "
+                "filter to match fewer rows."
+            )
+            raise errors.NotSupportedError(msg)
         values: list[t.Any] = []
         for func, column in specs:
             if func == "count":
@@ -719,7 +911,7 @@ def _reduce_aggregate_rows(
 
 
 def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
-    table_name = ast.args["from_"].this.name
+    table_name = _table_name(ast)
     filter_text = _filter_text(ast.args.get("where"), parameters)
     output_names = _select_output_names(ast)
 
@@ -789,7 +981,7 @@ def _build_hybrid_search(
     ast: exp.Select,
     parameters: dict[str, t.Any],
 ) -> Call:
-    table_name = ast.args["from_"].this.name
+    table_name = _table_name(ast)
     field_names = _select_field_names(ast)
     output_names = _select_output_names(ast)
     filter_text = _filter_text(ast.args.get("where"), parameters)
@@ -867,7 +1059,18 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     if _is_aggregate_select(ast):
         return _build_aggregate(ast, parameters)
 
-    table_name = ast.args["from_"].this.name
+    if ast.args.get("group") is not None:
+        # `_is_aggregate_select` already returns False whenever GROUP BY
+        # is present (grouped or not), so every GROUP BY query falls
+        # through to here. Milvus's `query()`/`search()` have no
+        # server-side grouping and nothing downstream reduces per-group
+        # -- silently falling through to the plain-select path below
+        # used to run the query ungrouped and return one row per
+        # matching entity instead of one row per group.
+        msg = "GROUP BY is not supported"
+        raise errors.NotSupportedError(msg)
+
+    table_name = _table_name(ast)
     field_names = _select_field_names(ast)
     output_names = _select_output_names(ast)
     filter_text = _filter_text(ast.args.get("where"), parameters)
@@ -978,8 +1181,7 @@ def build_call(
         msg = f"unsupported CREATE kind: {ast.args.get('kind')}"
         raise errors.NotSupportedError(msg)
     if isinstance(ast, exp.Alter):
-        msg = "ALTER TABLE is not implemented yet (out of phase-1 scope)"
-        raise errors.NotSupportedError(msg)
+        return _build_alter_add_field(ast)
     if isinstance(ast, exp.Drop):
         if ast.args.get("kind") == "TABLE":
             return _build_drop_table(ast)
@@ -992,4 +1194,4 @@ def build_call(
     return builder(client, ast, parameters)
 
 
-__all__ = ["Call", "RowsAndDescription", "build_call"]
+__all__ = ["Call", "RowsAndDescription", "build_batch_call", "build_call"]

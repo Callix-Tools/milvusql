@@ -22,7 +22,11 @@ from sqlglot.errors import SqlglotError
 
 from milvusql._shared import CONSISTENCY_AWARE_METHODS, parse_cached
 from milvusql.dbapi import errors
-from milvusql.translate.ast_to_pymilvus import Call, build_call
+from milvusql.translate.ast_to_pymilvus import (
+    Call,
+    build_batch_call,
+    build_call,
+)
 
 
 class AsyncCursor:
@@ -69,14 +73,11 @@ class AsyncCursor:
             **call.kwargs
         )
 
-    async def execute(
-        self, operation: str, parameters: dict[str, t.Any] | None = None
-    ) -> AsyncCursor:
-        self._check_open()
-        bound = dict(parameters or {})
+    async def _run(self, call: Call) -> None:
+        """Async mirror of ``Cursor._run`` (sync). Shared by
+        :meth:`execute` and :meth:`executemany`'s batched-``INSERT``
+        fast path."""
         try:
-            ast = parse_cached(operation)
-            call = build_call(self.connection._client, ast, bound)
             raw = await self._invoke(call)
             # See `Cursor.execute` (sync): `Call.then` drives UPDATE's
             # second RPC. A no-op loop for every other statement.
@@ -94,13 +95,41 @@ class AsyncCursor:
         self.lastrowid = lastrowid
         self._rows = rows
         self._index = 0
+
+    async def execute(
+        self, operation: str, parameters: dict[str, t.Any] | None = None
+    ) -> AsyncCursor:
+        self._check_open()
+        bound = dict(parameters or {})
+        try:
+            ast = parse_cached(operation)
+            call = build_call(self.connection._client, ast, bound)
+        except (SqlglotError, MilvusException, grpc.RpcError) as exc:
+            raise errors.translate(exc) from exc
+        await self._run(call)
         return self
 
     async def executemany(
         self, operation: str, seq_of_parameters: t.Iterable[dict[str, t.Any]]
     ) -> AsyncCursor:
+        self._check_open()
+        seq = list(seq_of_parameters)
+        if not seq:
+            self.rowcount = 0
+            return self
+        try:
+            ast = parse_cached(operation)
+            batch = build_batch_call(ast, seq)
+        except (SqlglotError, MilvusException, grpc.RpcError) as exc:
+            raise errors.translate(exc) from exc
+        if batch is not None:
+            # See `Cursor.executemany` (sync): a native batched
+            # primitive for this statement shape -- one round trip
+            # instead of one per parameter set.
+            await self._run(batch)
+            return self
         total = 0
-        for parameters in seq_of_parameters:
+        for parameters in seq:
             await self.execute(operation, parameters)
             if self.rowcount > 0:
                 total += self.rowcount

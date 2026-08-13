@@ -61,6 +61,62 @@ class TestSelectFilterQuery:
         )
         assert call.kwargs["filter"] == "false"
 
+    def test_like_renders_as_milvus_native_like_syntax(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM items WHERE category LIKE :pat LIMIT 5",
+            {"pat": "book%"},
+        )
+        assert call.kwargs["filter"] == 'category like "book%"'
+
+    def test_not_like_renders_via_the_negate_flag_not_a_not_wrapper(
+        self, build_call_helper
+    ):
+        """``NOT LIKE`` compiles to a ``negate`` flag on the same
+        ``exp.Like`` node (unlike ``NOT IN``/``IS NOT NULL``, which
+        wrap in a separate ``exp.Not``)."""
+        call = build_call_helper(
+            "SELECT id FROM items WHERE category NOT LIKE :pat LIMIT 5",
+            {"pat": "book%"},
+        )
+        assert call.kwargs["filter"] == 'not (category like "book%")'
+
+    def test_is_null_renders_as_milvus_native_is_null_syntax(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM items WHERE category IS NULL LIMIT 5"
+        )
+        assert call.kwargs["filter"] == "category is null"
+
+    def test_is_not_null_renders_via_the_shared_not_wrapper(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM items WHERE category IS NOT NULL LIMIT 5"
+        )
+        assert call.kwargs["filter"] == "not (category is null)"
+
+    def test_between_transpiles_to_a_gte_lte_pair(self, build_call_helper):
+        """Milvus's filter DSL has no ``BETWEEN`` keyword at all
+        (confirmed directly: a bare ``id BETWEEN 1 AND 2`` is a syntax
+        error), so it transpiles to the equivalent range check."""
+        call = build_call_helper(
+            "SELECT id FROM items WHERE id BETWEEN :lo AND :hi LIMIT 5",
+            {"lo": 1, "hi": 10},
+        )
+        assert call.kwargs["filter"] == "(id >= 1 and id <= 10)"
+
+    def test_not_between_renders_via_the_shared_not_wrapper(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM items WHERE id NOT BETWEEN :lo AND :hi LIMIT 5",
+            {"lo": 1, "hi": 10},
+        )
+        assert call.kwargs["filter"] == "not ((id >= 1 and id <= 10))"
+
     def test_no_limit_clause_falls_back_to_milvus_own_ceiling(
         self, build_call_helper
     ):
