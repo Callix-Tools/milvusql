@@ -750,9 +750,32 @@ def _sorted_query_rows(
     every matching row (fetched up to :data:`_DEFAULT_QUERY_LIMIT`,
     same ceiling a plain unordered SELECT is already subject to) in
     Python and only *then* applies the real ``LIMIT`` -- sorting after
-    truncating would return the wrong rows entirely."""
+    truncating would return the wrong rows entirely.
+
+    If the ``WHERE`` filter itself matches more than
+    :data:`_DEFAULT_QUERY_LIMIT` rows, the fetch above is itself
+    truncated -- the sort would then run over an arbitrary subset of
+    the true matches, silently returning the wrong "top N" with no
+    error at all. ``postprocess`` below detects that (the fetch came
+    back at the ceiling) and raises rather than guess: there is no way
+    to fetch a larger page from ``query()`` in this one-RPC-per-``Call``
+    model, and ``pymilvus``'s own pagination helper
+    (``MilvusClient.query_iterator``) has no counterpart on
+    ``AsyncMilvusClient`` at all (confirmed directly) -- adopting it
+    here would make the sync and async cursors behave differently for
+    the same MilvusQL text, which this module is deliberately built to
+    never do (D1/D12)."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
+        if len(raw) >= _DEFAULT_QUERY_LIMIT:
+            msg = (
+                "ORDER BY cannot be honored: the WHERE filter matches "
+                f"at least Milvus's own per-call row ceiling "
+                f"({_DEFAULT_QUERY_LIMIT}), so the true sort order "
+                "across every matching row cannot be verified. Narrow "
+                "the WHERE filter to match fewer rows."
+            )
+            raise errors.NotSupportedError(msg)
         rows = list(raw)
         # Stable-sort by the least significant key first so the most
         # significant key (applied last) wins ties -- the standard way
@@ -840,7 +863,26 @@ def _count_star_rows(count: int, output_names: list[str]) -> Postprocess:
 def _reduce_aggregate_rows(
     specs: list[tuple[str, str | None]], output_names: list[str]
 ) -> Postprocess:
+    """``SUM``/``AVG``/``MIN``/``MAX``/``COUNT(<column>)`` (everything
+    but a pure ``COUNT(*)``, which the server-side fast path above
+    handles instead): Milvus computes none of these itself, so every
+    matching row is fetched (up to :data:`_DEFAULT_QUERY_LIMIT`) and
+    reduced here in Python. Same reasoning as
+    :func:`_sorted_query_rows` for why hitting that ceiling raises
+    instead of silently reducing over a truncated subset -- a ``SUM``
+    or ``AVG`` computed from only *some* of the matching rows is a
+    wrong number with no indication it is wrong."""
+
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
+        if len(raw) >= _DEFAULT_QUERY_LIMIT:
+            msg = (
+                "aggregate cannot be honored: the WHERE filter matches "
+                f"at least Milvus's own per-call row ceiling "
+                f"({_DEFAULT_QUERY_LIMIT}), so the aggregate cannot be "
+                "computed over every matching row. Narrow the WHERE "
+                "filter to match fewer rows."
+            )
+            raise errors.NotSupportedError(msg)
         values: list[t.Any] = []
         for func, column in specs:
             if func == "count":
