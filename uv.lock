@@ -1059,14 +1059,14 @@ wheels = [
 
 [[package]]
 name = "sqlglot-milvus"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "sqlglot" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1a/76/484d9729ed18164d8124920dd32d7083be8e4dd091d1ed6aca631f5685d7/sqlglot_milvus-0.1.0.tar.gz", hash = "sha256:d5d3e9ebfb2bf3355604dc63660e464c33a9851d99dbf42de13d16483a188759", size = 20386, upload-time = "2026-08-12T07:30:11.833Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/8e/7c91055bc222998f93e483f5599dab46754ad59ed0f646839bee6c03e3e7/sqlglot_milvus-0.1.1.tar.gz", hash = "sha256:8c4e14a5e9a1f2f348e49e9cdf251472468b4c4f18ceb27af5161c7ef54632a1", size = 21603, upload-time = "2026-08-13T07:41:20.736Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/06/7d/440e4b98134a20d6dc565c608e4eefb09de5499fb9150edc7418df1c7e13/sqlglot_milvus-0.1.0-py3-none-any.whl", hash = "sha256:9b23a1cb35211ba00079f339c37f4718460c6b4e582d2b718ec6b18b82a0a47f", size = 23338, upload-time = "2026-08-12T07:30:10.751Z" },
+    { url = "https://files.pythonhosted.org/packages/56/e3/c0dd01b4b670e87d285acadd3a8d81306664bcfa056dff5c2e2dc3d2eb96/sqlglot_milvus-0.1.1-py3-none-any.whl", hash = "sha256:30f4697efca2ade967418b16cc3d4244223f6ec7cb7bc99ab0f637389c31321b", size = 24540, upload-time = "2026-08-13T07:41:19.546Z" },
 ]
 
 [[package]]
