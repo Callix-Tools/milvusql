@@ -199,11 +199,20 @@ def milvus_container(
                     }
                 )
             )
-    try:
-        yield owned_container
-    finally:
-        if owned_container:
-            owned_container.stop()
+    # Deliberately never `.stop()` it here, even in the owning worker:
+    # pytest-xdist workers do NOT synchronize when their own session
+    # ends -- the worker that happened to start the container can
+    # finish (and tear down its session-scoped fixtures) while sibling
+    # workers are still mid-test against the exact same shared server,
+    # confirmed directly by a real CI run failing with "Fail
+    # connecting to server ... illegal connection params or server
+    # unavailable" partway through once the owning worker's tests
+    # simply ran out first. Cleanup is left to testcontainers' own
+    # Ryuk reaper (enabled by default), which removes it once the
+    # whole test run's Docker session actually ends -- correct for a
+    # CI runner's container being thrown away anyway, and a
+    # `docker ps`-visible leak rather than a silent race in local dev.
+    yield owned_container
 
 
 @pytest.fixture(scope="session")
