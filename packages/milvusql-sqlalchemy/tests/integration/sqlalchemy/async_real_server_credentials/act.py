@@ -69,9 +69,10 @@ async def test_credentials_host_and_port_reach_a_real_server(
 
     try:
         async with engine.connect() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 items.insert(), [{"category": "book", "embedding": [0.1] * 8}]
             )
+            (generated_id,) = result.inserted_primary_key
             await conn.commit()
             # CREATE INDEX doesn't LOAD -- same gotcha as
             # ``seeded_engine``'s fixture docstring.
@@ -86,7 +87,12 @@ async def test_credentials_host_and_port_reach_a_real_server(
                     )
                 )
             ).all()
-        assert rows == [(1, "book")]
+        # Milvus's real `auto_id` allocator assigns large,
+        # timestamp-derived ids -- not the small sequential ones
+        # Milvus Lite happened to hand out -- so this compares against
+        # whatever id the insert above actually got back, not a
+        # literal.
+        assert rows == [(generated_id, "book")]
     finally:
         async with engine.connect() as conn:
             await conn.run_sync(items.drop)

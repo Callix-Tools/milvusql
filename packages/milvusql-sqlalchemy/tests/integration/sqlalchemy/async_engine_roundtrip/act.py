@@ -41,11 +41,23 @@ async def test_vector_search_returns_the_nearest_row(seeded_engine_aio):
         rows = (
             await conn.execute(
                 select(items.c.id, items.c.category)
-                .order_by(items.c.embedding.l2_distance([0.1] * 8))
+                # `seeded_engine`'s index is built with `metric_type=
+                # "COSINE"` -- a real (non-Lite) server rejects a
+                # search whose own metric doesn't match the index's
+                # (confirmed directly: "metric type not match:
+                # invalid parameter[expected=COSINE][actual=L2]"),
+                # so this has to ask for the same metric the index
+                # actually has, not `l2_distance`.
+                .order_by(items.c.embedding.cosine_distance([0.1] * 8))
                 .limit(5)
             )
         ).all()
-    assert rows == [(1, "book")]
+    # The seeded row's id is server-assigned (a real Milvus server's
+    # auto_id allocator, unlike Milvus Lite, does not hand out small
+    # sequential ids) -- only its non-id shape is asserted here.
+    assert len(rows) == 1
+    assert rows[0].category == "book"
+    assert rows[0].id is not None
 
 
 async def test_plain_filter_select_returns_the_matching_row(
@@ -60,7 +72,11 @@ async def test_plain_filter_select_returns_the_matching_row(
                 )
             )
         ).all()
-    assert rows == [(1, "book")]
+    # Same server-assigned-id caveat as
+    # ``test_vector_search_returns_the_nearest_row`` above.
+    assert len(rows) == 1
+    assert rows[0].category == "book"
+    assert rows[0].id is not None
 
 
 async def test_insert_is_visible_to_a_later_select(seeded_engine_aio):

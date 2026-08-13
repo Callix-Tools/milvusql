@@ -41,7 +41,20 @@ def db_uri(milvus_sync_url: str, _milvus_worker_cleanup) -> str:
 
 @pytest.fixture
 def engine(db_uri):
-    eng = create_engine(db_uri)
+    # 'Strong', not Milvus's own 'Bounded' default: against a real
+    # (non-Lite) server, 'Bounded' permits exactly the staleness
+    # window its name promises, so a query issued immediately after an
+    # insert/commit in the same test -- including SQLAlchemy's own
+    # ORM `Session` refreshing an object's attributes right after
+    # `commit()` -- can legitimately not see it yet. Confirmed
+    # directly: `orm_autoincrement_insert`'s `Session.add()` +
+    # `commit()` intermittently raised `ObjectDeletedError` against a
+    # real server with no isolation_level set (never observable
+    # against Milvus Lite, which has no replication lag to be
+    # inconsistent about). A test that specifically wants to exercise
+    # 'Bounded' itself (``consistency_level_regression``) builds its
+    # own engine rather than using this fixture.
+    eng = create_engine(db_uri, isolation_level="Strong")
     yield eng
     eng.dispose()
 

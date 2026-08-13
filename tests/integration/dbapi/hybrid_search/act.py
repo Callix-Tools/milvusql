@@ -35,14 +35,17 @@ def loaded_docs(conn, cur):
         "INSERT INTO docs (dense, sparse, category) VALUES (:d, :s, :c)",
         {"d": [0.1, 0.1, 0.1, 0.1], "s": [0.9, 0.9, 0.9, 0.9], "c": "a"},
     )
+    id_a = cur.lastrowid
     cur.execute(
         "INSERT INTO docs (dense, sparse, category) VALUES (:d, :s, :c)",
         {"d": [0.9, 0.9, 0.9, 0.9], "s": [0.1, 0.1, 0.1, 0.1], "c": "b"},
     )
-    return conn
+    id_b = cur.lastrowid
+    return id_a, id_b
 
 
 def test_hybrid_search_returns_a_rank_fused_result(loaded_docs, cur):
+    id_a, id_b = loaded_docs
     cur.execute(
         "SELECT id, category FROM docs HYBRID SEARCH "
         "(dense <=> :d WEIGHT 0.5, sparse <=> :s WEIGHT 0.5) "
@@ -50,12 +53,13 @@ def test_hybrid_search_returns_a_rank_fused_result(loaded_docs, cur):
         {"d": [0.1, 0.1, 0.1, 0.1], "s": [0.9, 0.9, 0.9, 0.9]},
     )
     rows = cur.fetchall()
-    assert {row[0] for row in rows} == {1, 2}
+    assert {row[0] for row in rows} == {id_a, id_b}
 
 
 def test_hybrid_search_applies_the_shared_filter_to_every_arm(
     loaded_docs, cur
 ):
+    id_a, _id_b = loaded_docs
     cur.execute(
         "SELECT id FROM docs WHERE category = :cat HYBRID SEARCH "
         "(dense <=> :d WEIGHT 0.5, sparse <=> :s WEIGHT 0.5) "
@@ -66,4 +70,4 @@ def test_hybrid_search_applies_the_shared_filter_to_every_arm(
             "s": [0.9, 0.9, 0.9, 0.9],
         },
     )
-    assert cur.fetchall() == [(1,)]
+    assert cur.fetchall() == [(id_a,)]

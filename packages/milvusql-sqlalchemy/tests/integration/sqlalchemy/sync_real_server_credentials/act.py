@@ -47,9 +47,10 @@ def test_credentials_host_and_port_reach_a_real_server(remote_engine):
 
     try:
         with engine.connect() as conn:
-            conn.execute(
+            result = conn.execute(
                 items.insert(), [{"category": "book", "embedding": [0.1] * 8}]
             )
+            (generated_id,) = result.inserted_primary_key
             conn.commit()
             # CREATE INDEX doesn't LOAD -- same gotcha as
             # ``seeded_engine``'s fixture docstring.
@@ -61,6 +62,11 @@ def test_credentials_host_and_port_reach_a_real_server(remote_engine):
                     items.c.category == "book"
                 )
             ).all()
-        assert rows == [(1, "book")]
+        # Milvus's real `auto_id` allocator assigns large,
+        # timestamp-derived ids -- not the small sequential ones
+        # Milvus Lite happened to hand out -- so this compares against
+        # whatever id the insert above actually got back, not a
+        # literal.
+        assert rows == [(generated_id, "book")]
     finally:
         items.drop(engine)

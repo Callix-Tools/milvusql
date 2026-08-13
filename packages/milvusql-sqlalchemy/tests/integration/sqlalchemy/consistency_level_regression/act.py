@@ -86,7 +86,19 @@ def test_engine_level_isolation_level_does_not_break_every_query(db_uri):
             assert result.inserted_primary_key is not None  # nosec B101
             (generated_id,) = result.inserted_primary_key
             conn.commit()
-        with engine.connect() as conn:
+        with engine.connect() as raw_conn:
+            # This engine's own default is 'Bounded' (what's actually
+            # under test above -- that setting it doesn't break every
+            # later query), and 'Bounded' genuinely permits the read-
+            # your-writes staleness window its name promises against a
+            # real (non-Lite) server -- confirmed directly: this
+            # assertion intermittently saw an empty result with no
+            # override here. Overriding to 'Strong' just for this
+            # verification read makes the assertion deterministic
+            # without weakening what's actually being exercised (the
+            # insert above still ran, and committed, under the
+            # engine's own 'Bounded' default).
+            conn = raw_conn.execution_options(isolation_level="Strong")
             rows = conn.execute(select(items.c.id)).all()
         # Milvus's real `auto_id` allocator assigns large,
         # timestamp-derived ids -- not the small sequential ones

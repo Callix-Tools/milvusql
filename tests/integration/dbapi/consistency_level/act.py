@@ -1,8 +1,12 @@
 """D6: a query's own ``CONSISTENCY LEVEL`` always wins; the
 connection-level default only fills in when a statement doesn't set
-one. Exercised against a stub client so the assertion is on the exact
-kwargs passed, not on Milvus's observable read consistency (not
-something a single-node Lite instance can distinguish)."""
+one. Exercised against a real Milvus server (via ``testcontainers``),
+but the assertion is still on the exact ``consistency_level`` kwarg
+``search()`` was actually called with (via a spy wrapping the real
+call), not on Milvus's observable read consistency -- the same
+staleness window this exercises is exactly what genuine eventual
+consistency makes unobservable/nondeterministic to assert on
+directly."""
 
 from __future__ import annotations
 
@@ -12,9 +16,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.dbapi]
 
 EMB_BOOK = [0.1] * 8
 
+#: `<=>` (cosine distance), not `<->` (L2): `CREATE_ITEMS_INDEX`
+#: (``tests/fixtures/dbapi.py``) builds its index with `metric_type=
+#: 'COSINE'` -- a real (non-Lite) server rejects a search whose own
+#: metric doesn't match the index's.
 VECTOR_SEARCH_SQL = (
     "SELECT id, category FROM items WHERE category = :cat "
-    "ORDER BY embedding <-> :q LIMIT 5 SEARCH PARAMS (ef_search=64)"
+    "ORDER BY embedding <=> :q LIMIT 5 SEARCH PARAMS (ef_search=64)"
 )
 
 

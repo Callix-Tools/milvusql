@@ -345,5 +345,20 @@ class MilvusDialect_aio(MilvusDialect):  # noqa: N801 -- matches upstream's own
         # optional third-party driver package.
         return t.cast("DBAPIModule", asyncio_dbapi.dbapi)
 
+    def get_driver_connection(self, connection: t.Any) -> t.Any:
+        """``DefaultDialect``'s own default (``return connection``) is
+        correct for a normal DBAPI, but leaves an async dialect's own
+        ``AdaptedConnection`` (``asyncio_dbapi.py``'s
+        ``AsyncAdapt_dbapi_connection`` wrapper) unopened for anyone
+        who calls ``AsyncConnection.get_raw_connection()`` and expects
+        back what the docstring promises: the real driver connection,
+        not the DBAPI-facing adapter -- confirmed directly (same
+        pattern ``aiosqlite``'s own dialect overrides this hook for):
+        without this, ``(await conn.get_raw_connection()).
+        driver_connection`` still returns an ``AsyncAdapt_dbapi_connection``,
+        not the ``milvusql.aio.AsyncConnection`` underneath it, and
+        ``._client`` raises ``AttributeError``."""
+        return connection._connection
+
 
 __all__ = ["MilvusDialect", "MilvusDialect_aio"]
