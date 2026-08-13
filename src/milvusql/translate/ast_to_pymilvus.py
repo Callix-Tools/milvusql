@@ -650,7 +650,25 @@ def _build_delete(ast: exp.Delete, parameters: dict[str, t.Any]) -> Call:
 def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
     """``UPDATE table SET col = val[, ...] WHERE ...`` -- see
     :class:`Call`'s docstring for why this is a read (``query``) whose
-    ``then`` chains into a write (``upsert``), not one RPC."""
+    ``then`` chains into a write (``upsert``), not one RPC.
+
+    Known, confirmed limitation for an ``auto_id`` primary key (every
+    table this module's own ``AUTO_INCREMENT`` DDL creates): a real
+    (non-Lite) Milvus server's ``upsert()`` does **not** honor the
+    primary key value in ``merged`` below for an ``auto_id=True``
+    collection -- it silently mints a *new* server-assigned id for the
+    row regardless, even though the row's other columns are correctly
+    overwritten in place (confirmed directly: updating only a
+    non-primary-key column still changes the row's id; the total row
+    count is unaffected, so this is a rename in place, not a
+    duplicate). Milvus Lite was more lenient here and preserved the
+    given id, which is what let this go unnoticed until tested against
+    a real server. There is no workaround through any Milvus API: an
+    ``auto_id`` field categorically cannot be given an explicit value
+    on any write, upsert included, so an ``UPDATE`` can never guarantee
+    the row's id survives it. Callers that need a stable identity
+    across updates need a non-``auto_id`` (caller-assigned) primary
+    key instead."""
     table_name = ast.this.name
     # `UPDATE`'s `SET` list is always `col = <expr>` (`exp.EQ`) by
     # grammar -- `_resolve_value` is what actually rejects an
