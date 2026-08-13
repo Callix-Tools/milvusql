@@ -57,7 +57,7 @@ def test_standalone_primary_key_constraint_is_recognized(build_call_helper):
     own docstring) -- this is the shape that produces."""
     call = build_call_helper(
         "CREATE TABLE items (id BIGINT, category VARCHAR(64), "
-        "PRIMARY KEY (id))"
+        "embedding VECTOR(8), PRIMARY KEY (id))"
     )
     fields = {f.name: f for f in call.kwargs["schema"].fields}
     assert fields["id"].is_primary is True
@@ -67,7 +67,8 @@ def test_with_properties_map_shards_and_pass_through_consistency_level(
     build_call_helper,
 ):
     call = build_call_helper(
-        "CREATE TABLE items (id BIGINT PRIMARY KEY, category VARCHAR(8)) "
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, category VARCHAR(8), "
+        "embedding VECTOR(8)) "
         "WITH (shards=2, consistency_level='Bounded')"
     )
     assert call.kwargs["num_shards"] == 2
@@ -78,7 +79,8 @@ def test_partition_key_property_is_consumed_building_the_schema(
     build_call_helper,
 ):
     call = build_call_helper(
-        "CREATE TABLE items (id BIGINT PRIMARY KEY, category VARCHAR(8)) "
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, category VARCHAR(8), "
+        "embedding VECTOR(8)) "
         "WITH (partition_key='category')"
     )
     assert "partition_key" not in call.kwargs
@@ -87,5 +89,7 @@ def test_partition_key_property_is_consumed_building_the_schema(
 
 
 def test_ddl_postprocess_returns_no_rows(build_call_helper):
-    call = build_call_helper("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+    call = build_call_helper(
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, embedding VECTOR(8))"
+    )
     assert call.postprocess(object()) == ([], None, -1, None)

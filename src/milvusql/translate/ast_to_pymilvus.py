@@ -411,9 +411,15 @@ def _build_create_table(
         if isinstance(node, exp.PrimaryKey)
         for ident in node.expressions
     }
+    has_vector_field = False
     for column in columns:
         name = column.this.name
         milvus_type, extra = _map_datatype(column.kind)
+        if milvus_type in (
+            DataType.FLOAT_VECTOR,
+            DataType.SPARSE_FLOAT_VECTOR,
+        ):
+            has_vector_field = True
         constraint_kinds = {type(c.kind) for c in (column.constraints or [])}
         is_primary = (
             exp.PrimaryKeyColumnConstraint in constraint_kinds
@@ -440,6 +446,25 @@ def _build_create_table(
             nullable=nullable,
             **extra,
         )
+
+    if not has_vector_field:
+        # Milvus refuses `create_collection()` outright for a schema
+        # with zero vector fields -- confirmed directly against a
+        # real, non-Lite server (Milvus Lite silently tolerates it,
+        # which is what let this go unnoticed for a while). Raised
+        # here, client-side, before the RPC even goes out: the
+        # server's own rejection is a bare, unhelpful low-level gRPC
+        # error with no indication of *why*. This is a real,
+        # documented limitation, not a bug to paper over -- notably,
+        # it means a tool that creates a table with no vector column
+        # of its own (e.g. Alembic's ``alembic_version`` bookkeeping
+        # table) cannot be made to work against this backend.
+        msg = (
+            f"CREATE TABLE {table_name!r} has no VECTOR/SPARSEVEC "
+            "column -- Milvus requires at least one vector field per "
+            "collection."
+        )
+        raise errors.NotSupportedError(msg)
 
     kwargs: dict[str, t.Any] = {
         "collection_name": table_name,

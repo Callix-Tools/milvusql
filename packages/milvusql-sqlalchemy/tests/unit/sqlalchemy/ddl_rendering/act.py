@@ -55,14 +55,14 @@ class TestCreateTableDDL:
         """Only the ``Table``'s designated autoincrement column gets
         ``AUTO_INCREMENT``; a ``VARCHAR`` primary key never does.
 
-        Neither column here is a ``VECTOR``/``SPARSEVEC`` -- Milvus
-        refuses ``CREATE TABLE`` outright for a schema with zero
-        vector fields (confirmed directly against a real, non-Lite
-        server), so ``MilvusDDLCompiler.visit_create_table`` splices
-        in a hidden pad-vector column for exactly this shape of table
-        (see ``padding.py``'s module docstring -- chiefly for
-        Alembic's own ``alembic_version`` bookkeeping table, which has
-        the same no-vector-column shape as this test's own ``items``)."""
+        DDL *rendering* doesn't care that neither column here is a
+        ``VECTOR``/``SPARSEVEC`` -- Milvus's real "at least one vector
+        field" requirement is enforced server-side, in
+        ``ast_to_pymilvus._build_create_table`` (a client-side,
+        explicit ``NotSupportedError``, confirmed directly against a
+        real, non-Lite server: unenforced there any other way), not by
+        this compiler rejecting or altering the SQL text itself -- see
+        ``create_table/error.py``'s own coverage for that."""
         metadata = MetaData()
         items = Table(
             "items",
@@ -75,13 +75,10 @@ class TestCreateTableDDL:
             "CREATE TABLE items ( "
             "id VARCHAR(36) NOT NULL PRIMARY KEY, "
             "val VARCHAR(8), "
-            "_milvusql_pad_vector VECTOR(2), "
             "PRIMARY KEY (id) )"
         )
 
     def test_no_dialect_options_omits_the_with_clause(self, dialect):
-        """No vector column here either -- see the previous test's
-        docstring for why the pad column is expected."""
         metadata = MetaData()
         items = Table(
             "items", metadata, Column("id", BigInteger, primary_key=True)
@@ -90,7 +87,6 @@ class TestCreateTableDDL:
         assert sql == (
             "CREATE TABLE items ( "
             "id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, "
-            "_milvusql_pad_vector VECTOR(2), "
             "PRIMARY KEY (id) )"
         )
 
