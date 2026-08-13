@@ -21,6 +21,13 @@ pytestmark = [pytest.mark.unit, pytest.mark.sqlalchemy]
 #: Shaped exactly like ``MilvusClient.describe_collection()``'s real
 #: return value for a collection built from ``id BIGINT PRIMARY KEY
 #: AUTO_INCREMENT, embedding VECTOR(8), category VARCHAR(64)``.
+#:
+#: Verified directly against a live Milvus Lite client: a field dict
+#: only carries a ``"nullable"`` key at all when the column really is
+#: nullable (``True``); a ``NOT NULL`` scalar column, the primary key,
+#: and vector columns all omit the key entirely -- so ``category``
+#: here (a plain nullable scalar) carries ``"nullable": True`` while
+#: ``id`` and ``embedding`` omit it, matching reality.
 _ITEMS_DESCRIPTION = {
     "collection_name": "items",
     "auto_id": True,
@@ -48,6 +55,7 @@ _ITEMS_DESCRIPTION = {
             "description": "",
             "type": int(DataType.VARCHAR),
             "params": {"max_length": 64},
+            "nullable": True,
         },
     ],
 }
@@ -67,6 +75,47 @@ class TestColumnsFromDescription:
         assert category_col["nullable"] is True
         assert category_col["autoincrement"] is False
         assert category_col["default"] is None
+
+    def test_vector_column_is_never_nullable(self):
+        """Milvus enforces that vector fields can never be nullable
+        (see ``ast_to_pymilvus.py``'s writer-path reasoning) -- the
+        reflected value must agree, not default to ``True`` just
+        because the field isn't the primary key."""
+        columns = columns_from_description(_ITEMS_DESCRIPTION)
+        embedding_col = next(c for c in columns if c["name"] == "embedding")
+        assert embedding_col["nullable"] is False
+
+    def test_explicit_not_null_scalar_column_reflects_not_nullable(self):
+        """A scalar column declared ``NOT NULL`` omits the ``nullable``
+        key entirely in ``describe_collection()`` output (verified live)
+        -- it must reflect as ``nullable=False``, not the previous
+        ``is_primary``-keyed guess that made every non-PK column
+        ``nullable=True`` regardless of its real flag."""
+        description = {
+            "fields": [
+                {
+                    "name": "tag",
+                    "type": int(DataType.VARCHAR),
+                    "params": {"max_length": 16},
+                }
+            ]
+        }
+        columns = columns_from_description(description)
+        assert columns[0]["nullable"] is False
+
+    def test_explicit_nullable_scalar_column_reflects_nullable(self):
+        description = {
+            "fields": [
+                {
+                    "name": "note",
+                    "type": int(DataType.VARCHAR),
+                    "params": {"max_length": 16},
+                    "nullable": True,
+                }
+            ]
+        }
+        columns = columns_from_description(description)
+        assert columns[0]["nullable"] is True
 
     def test_vector_field_becomes_a_vector_type_with_its_dim(self):
         columns = columns_from_description(_ITEMS_DESCRIPTION)

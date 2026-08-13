@@ -57,7 +57,7 @@ def columns_from_description(
         {
             "name": field["name"],
             "type": _column_type(field),
-            "nullable": not field.get("is_primary", False),
+            "nullable": bool(field.get("nullable", False)),
             "default": None,
             "autoincrement": field.get("auto_id", False),
         }

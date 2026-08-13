@@ -510,13 +510,18 @@ def _build_drop_table(ast: exp.Drop) -> Call:
 
 
 def _build_alter_add_field(ast: exp.Alter) -> Call:
-    """``ALTER TABLE items ADD FIELD tag VARCHAR(32)``.
+    """``ALTER TABLE items ADD FIELD tag VARCHAR(32)`` or the standard
+    SQL spelling ``ALTER TABLE items ADD COLUMN tag VARCHAR(32)``.
 
     sqlglot-milvus's own grammar rejects every other ``ALTER`` action
     (``DROP``/``ALTER COLUMN``/``MODIFY``) at *parse* time with a
     ``ParseError`` (Milvus can't perform them at all), so the single
-    action reaching here is always an ``AddField`` -- the ``isinstance``
-    check below is defense in depth against a synthetic or
+    action reaching here is always either an ``AddField`` (Milvus's own
+    ``ADD FIELD`` spelling, wrapping a ``ColumnDef``) or a bare
+    ``ColumnDef`` (standard SQL's ``ADD COLUMN`` spelling, e.g. as
+    rendered by Alembic's default ``add_column()``) -- both mean the
+    same thing and are unwrapped to the same ``ColumnDef`` below. The
+    ``else`` branch is defense in depth against a synthetic or
     foreign-dialect AST, not a real branch the grammar can produce.
 
     ``MilvusClient.add_collection_field`` returns ``UNIMPLEMENTED``
@@ -535,10 +540,17 @@ def _build_alter_add_field(ast: exp.Alter) -> Call:
     vectors.
     """
     actions = ast.args.get("actions") or []
-    if len(actions) != 1 or not isinstance(actions[0], AddField):
+    if len(actions) != 1:
         msg = "unsupported ALTER TABLE action"
         raise errors.NotSupportedError(msg)
-    column = actions[0].this
+    action = actions[0]
+    if isinstance(action, AddField):
+        column = action.this
+    elif isinstance(action, exp.ColumnDef):
+        column = action
+    else:
+        msg = "unsupported ALTER TABLE action"
+        raise errors.NotSupportedError(msg)
     milvus_type, extra = _map_datatype(column.kind)
     kwargs: dict[str, t.Any] = {
         "collection_name": ast.this.name,

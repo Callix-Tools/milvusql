@@ -77,7 +77,7 @@ def test_reflected_columns_match_the_created_schema(seeded_engine):
     assert columns["id"]["autoincrement"] is True
     assert isinstance(columns["id"]["type"], BigInteger)
     assert columns["category"]["nullable"] is True
-    assert columns["embedding"]["nullable"] is True
+    assert columns["embedding"]["nullable"] is False
     assert isinstance(columns["embedding"]["type"], VECTOR)
     assert columns["embedding"]["type"].dim == 8
 
