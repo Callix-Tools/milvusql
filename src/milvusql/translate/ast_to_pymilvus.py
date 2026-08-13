@@ -225,7 +225,7 @@ def _render_filter_value(value: t.Any) -> str:  # noqa: ANN401
     raise errors.NotSupportedError(msg)
 
 
-def _render_filter(  # noqa: PLR0911 -- one return per AST node case, clearer flat than nested
+def _render_filter(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clearer flat than nested
     node: exp.Expression, parameters: dict[str, t.Any]
 ) -> str:
     """MilvusQL's WHERE tree -> Milvus's boolean filter-expression text.
@@ -277,6 +277,48 @@ def _render_filter(  # noqa: PLR0911 -- one return per AST node case, clearer fl
             for value in node.expressions
         )
         return f"{column} in [{values}]"
+    if isinstance(node, exp.Like):
+        # Milvus's filter DSL has its own native `field like "pattern"`
+        # syntax (confirmed directly against Milvus Lite, SQL-style `%`/
+        # `_` wildcards) -- no transpiling needed. `NOT LIKE` compiles
+        # to a `negate` flag on the same node (unlike `NOT IN`/
+        # `IS NOT NULL`, which wrap in a separate `exp.Not`), so it is
+        # handled here rather than falling through to the generic `Not`
+        # case above.
+        column = _render_filter(node.this, parameters)
+        pattern = _render_filter_value(
+            _resolve_value(node.expression, parameters)
+        )
+        text = f"{column} like {pattern}"
+        return f"not ({text})" if node.args.get("negate") else text
+    if isinstance(node, exp.Between):
+        # Milvus's filter DSL has no `BETWEEN` keyword at all (confirmed
+        # directly: a bare `id BETWEEN 1 AND 2` is a syntax error), so
+        # this transpiles to the equivalent `>=`/`<=` pair every other
+        # comparison here already renders -- `NOT BETWEEN` gets this for
+        # free via the generic `Not` case above, since (unlike `LIKE`)
+        # it wraps in a separate `exp.Not` rather than a node flag.
+        column = _render_filter(node.this, parameters)
+        low = _render_filter_value(
+            _resolve_value(node.args["low"], parameters)
+        )
+        high = _render_filter_value(
+            _resolve_value(node.args["high"], parameters)
+        )
+        return f"({column} >= {low} and {column} <= {high})"
+    if isinstance(node, exp.Is):
+        # Milvus's filter DSL only has `is null`/`is not null`
+        # (confirmed directly) -- no other `IS <predicate>` form (e.g.
+        # `IS TRUE`) to transpile to, so anything but a `NULL` right-hand
+        # side is a real gap, not a silent guess.
+        if not isinstance(node.expression, exp.Null):
+            msg = (
+                "unsupported IS comparison: IS "
+                f"{node.expression.__class__.__name__}"
+            )
+            raise errors.NotSupportedError(msg)
+        column = _render_filter(node.this, parameters)
+        return f"{column} is null"
     if isinstance(node, exp.Column):
         return node.this.name
     if isinstance(
@@ -513,24 +555,75 @@ def _build_alter_add_field(ast: exp.Alter) -> Call:
 # -----------------------------------------------------------------------
 
 
-def _build_insert(ast: exp.Insert, parameters: dict[str, t.Any]) -> Call:
+def _insert_rows(
+    ast: exp.Insert, parameters: dict[str, t.Any]
+) -> list[dict[str, t.Any]]:
+    """The row dicts one bind-parameter set's ``INSERT`` names, shared
+    between a single-row ``execute()`` and the batched
+    ``executemany()`` path below -- both need exactly the same
+    ``column -> resolved value`` mapping, just assembled from a
+    different number of parameter sets."""
     schema_node = ast.this
-    table_name = schema_node.this.name
     columns = [ident.name for ident in schema_node.expressions]
     values_node = ast.args["expression"]
-
-    rows = [
+    return [
         {
             name: _resolve_value(value, parameters)
             for name, value in zip(columns, row.expressions, strict=True)
         }
         for row in values_node.expressions
     ]
+
+
+def _build_insert(ast: exp.Insert, parameters: dict[str, t.Any]) -> Call:
+    table_name = ast.this.this.name
+    rows = _insert_rows(ast, parameters)
     return Call(
         "insert",
         {"collection_name": table_name, "data": rows},
         _insert_result,
     )
+
+
+def _build_batch_insert(
+    ast: exp.Insert, seq_of_parameters: t.Sequence[dict[str, t.Any]]
+) -> Call:
+    """``executemany()`` over an ``INSERT`` -- unlike every other
+    statement shape, Milvus's own ``insert()`` already accepts a full
+    list of rows in one RPC (confirmed directly: ``data=[...]`` is not
+    limited to one row), so every bind-parameter set's row(s) are
+    merged into a single call instead of one RPC per parameter set.
+    ``_insert_result`` needs no changes for this: it already reduces a
+    multi-row ``insert()`` response to one ``rowcount``/``lastrowid``
+    pair the same way, whether the multiple rows came from one
+    multi-VALUES statement or many parameter sets."""
+    table_name = ast.this.this.name
+    rows = [
+        row
+        for parameters in seq_of_parameters
+        for row in _insert_rows(ast, parameters)
+    ]
+    return Call(
+        "insert",
+        {"collection_name": table_name, "data": rows},
+        _insert_result,
+    )
+
+
+def build_batch_call(
+    ast: exp.Expression, seq_of_parameters: t.Sequence[dict[str, t.Any]]
+) -> Call | None:
+    """``executemany()``'s entry point: a parsed statement and every
+    one of its bind-parameter sets -> a single batched ``Call``, or
+    ``None`` when Milvus has no batched primitive for this statement
+    shape (``UPDATE``'s ``query``-then-``upsert`` pair and ``DELETE``'s
+    single-filter shape don't merge across independent parameter sets
+    the way ``INSERT``'s row list does) -- the caller then falls back
+    to one :func:`build_call` per parameter set, same as before this
+    existed."""
+    if isinstance(ast, exp.Insert):
+        return _build_batch_insert(ast, seq_of_parameters)
+    return None
 
 
 def _build_delete(ast: exp.Delete, parameters: dict[str, t.Any]) -> Call:
@@ -1059,4 +1152,4 @@ def build_call(
     return builder(client, ast, parameters)
 
 
-__all__ = ["Call", "RowsAndDescription", "build_call"]
+__all__ = ["Call", "RowsAndDescription", "build_batch_call", "build_call"]

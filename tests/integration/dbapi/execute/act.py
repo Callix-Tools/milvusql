@@ -97,6 +97,75 @@ class TestSync:
         assert cur.rowcount == 2
 
 
+class TestExecutemanyBatching:
+    """``executemany()`` over ``INSERT`` merges every parameter set into
+    one ``insert()`` RPC (see ``build_batch_call``) instead of one RPC
+    per row -- verified end to end here, not just at the
+    ``build_batch_call`` unit level, since the interesting part is that
+    the sync ``Cursor`` actually takes the batched path."""
+
+    def test_insert_executemany_issues_a_single_rpc(
+        self, loaded_items, cur, monkeypatch
+    ):
+        calls = []
+        real_insert = cur.connection._client.insert
+
+        def counting_insert(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_insert(*args, **kwargs)
+
+        monkeypatch.setattr(cur.connection._client, "insert", counting_insert)
+        cur.executemany(
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)",
+            [{"emb": EMB_BOOK, "cat": f"cat{i}"} for i in range(5)],
+        )
+        assert cur.rowcount == 5
+        assert len(calls) == 1
+        assert len(calls[0][1]["data"]) == 5
+
+    def test_lastrowid_is_the_last_row_across_every_parameter_set(
+        self, loaded_items, cur
+    ):
+        cur.executemany(
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)",
+            [{"emb": EMB_BOOK, "cat": f"cat{i}"} for i in range(3)],
+        )
+        # Capture before the follow-up SELECT below, which -- correctly
+        # -- resets `lastrowid` back to `None` (see `_query_rows`):
+        # `lastrowid` only ever means "what the most recent INSERT
+        # assigned," not "whatever it once was."
+        lastrowid = cur.lastrowid
+        rows = cur.execute(
+            "SELECT id FROM items ORDER BY id DESC LIMIT 1"
+        ).fetchall()
+        assert lastrowid == rows[0][0]
+
+    def test_an_empty_parameter_sequence_is_a_no_op(self, loaded_items, cur):
+        cur.executemany(
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)", []
+        )
+        assert cur.rowcount == 0
+
+    def test_update_executemany_still_falls_back_to_one_rpc_per_row(
+        self, loaded_items, cur
+    ):
+        """``UPDATE`` has no batched primitive (``build_batch_call``
+        returns ``None`` for it) -- ``executemany`` must still work,
+        just via the pre-existing one-``execute()``-per-parameter-set
+        loop."""
+        _seed(cur)
+        cur.executemany(
+            "UPDATE items SET category = :new WHERE category = :old",
+            [
+                {"new": "novel", "old": "book"},
+                {"new": "film", "old": "movie"},
+            ],
+        )
+        assert cur.rowcount == 2
+        cur.execute("SELECT id, category FROM items LIMIT 10")
+        assert sorted(cur.fetchall()) == [(1, "novel"), (2, "film")]
+
+
 class TestAsync:
     async def test_insert_reports_rowcount(self, acur):
         await acur.execute(
@@ -135,6 +204,25 @@ class TestAsync:
             ],
         )
         assert acur.rowcount == 2
+
+    async def test_insert_executemany_issues_a_single_rpc(
+        self, acur, monkeypatch
+    ):
+        calls = []
+        real_insert = acur.connection._client.insert
+
+        async def counting_insert(*args, **kwargs):
+            calls.append((args, kwargs))
+            return await real_insert(*args, **kwargs)
+
+        monkeypatch.setattr(acur.connection._client, "insert", counting_insert)
+        await acur.executemany(
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)",
+            [{"emb": EMB_BOOK, "cat": f"cat{i}"} for i in range(5)],
+        )
+        assert acur.rowcount == 5
+        assert len(calls) == 1
+        assert len(calls[0][1]["data"]) == 5
 
 
 class TestUpdate:
@@ -217,6 +305,63 @@ class TestScalarOrderByAndInFilter:
         cur.execute(
             'SELECT id FROM items WHERE "category" IN (:a, :b) LIMIT 10',
             {"a": "movie", "b": "nonexistent"},
+        )
+        assert cur.fetchall() == [(2,)]
+
+
+class TestLikeIsNullBetween:
+    """``LIKE``/``IS [NOT] NULL``/``[NOT] BETWEEN`` against a real
+    Milvus Lite instance -- worth exercising end to end, not just at
+    the ``build_call`` unit level, since ``BETWEEN`` in particular
+    transpiles to a shape Milvus's filter DSL never sees literally."""
+
+    def test_like_matches_a_prefix_pattern(self, loaded_items, cur):
+        _seed(cur)
+        cur.execute(
+            "SELECT id FROM items WHERE category LIKE :pat LIMIT 10",
+            {"pat": "boo%"},
+        )
+        assert cur.fetchall() == [(1,)]
+
+    def test_not_like_excludes_a_prefix_pattern(self, loaded_items, cur):
+        _seed(cur)
+        cur.execute(
+            "SELECT id FROM items WHERE category NOT LIKE :pat LIMIT 10",
+            {"pat": "boo%"},
+        )
+        assert cur.fetchall() == [(2,)]
+
+    def test_is_null_matches_only_the_null_row(self, loaded_items, cur):
+        _seed(cur)
+        cur.execute(
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)",
+            {"emb": EMB_BOOK, "cat": None},
+        )
+        cur.execute("SELECT id FROM items WHERE category IS NULL LIMIT 10")
+        assert cur.fetchall() == [(3,)]
+
+    def test_is_not_null_excludes_the_null_row(self, loaded_items, cur):
+        _seed(cur)
+        cur.execute(
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)",
+            {"emb": EMB_BOOK, "cat": None},
+        )
+        cur.execute("SELECT id FROM items WHERE category IS NOT NULL LIMIT 10")
+        assert sorted(cur.fetchall()) == [(1,), (2,)]
+
+    def test_between_matches_an_inclusive_range(self, loaded_items, cur):
+        _seed(cur)
+        cur.execute(
+            "SELECT id FROM items WHERE id BETWEEN :lo AND :hi LIMIT 10",
+            {"lo": 1, "hi": 1},
+        )
+        assert cur.fetchall() == [(1,)]
+
+    def test_not_between_excludes_the_range(self, loaded_items, cur):
+        _seed(cur)
+        cur.execute(
+            "SELECT id FROM items WHERE id NOT BETWEEN :lo AND :hi LIMIT 10",
+            {"lo": 1, "hi": 1},
         )
         assert cur.fetchall() == [(2,)]
 

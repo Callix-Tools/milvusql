@@ -14,7 +14,11 @@ from sqlglot.errors import SqlglotError
 
 from milvusql._shared import CONSISTENCY_AWARE_METHODS, parse_cached
 from milvusql.dbapi import errors
-from milvusql.translate.ast_to_pymilvus import Call, build_call
+from milvusql.translate.ast_to_pymilvus import (
+    Call,
+    build_batch_call,
+    build_call,
+)
 
 if t.TYPE_CHECKING:
     from milvusql.dbapi.connection import Connection
@@ -55,19 +59,16 @@ class Cursor:
             call.kwargs["consistency_level"] = default_level
         return getattr(self.connection._client, call.method)(**call.kwargs)
 
-    def execute(
-        self, operation: str, parameters: dict[str, t.Any] | None = None
-    ) -> Cursor:
-        self._check_open()
-        bound = dict(parameters or {})
+    def _run(self, call: Call) -> None:
+        """Run ``call`` (looping through ``Call.then`` for a statement
+        that needs a second RPC), translate any upstream exception, and
+        set every cursor-state attribute PEP 249 promises after
+        ``execute()``. Shared by :meth:`execute` and
+        :meth:`executemany`'s batched-``INSERT`` fast path -- both end
+        at "one ``Call``, translate errors, unpack ``postprocess()``",
+        they only differ in how the ``Call`` gets built."""
         try:
-            ast = parse_cached(operation)
-            call = build_call(self.connection._client, ast, bound)
             raw = self._invoke(call)
-            # `Call.then` drives a statement that needs a second RPC
-            # (UPDATE: read, then upsert -- see `Call`'s docstring).
-            # Most statements never set it, so this loop runs zero
-            # times for them.
             while call.then is not None:
                 next_call = call.then(raw)
                 if next_call is None:
@@ -82,13 +83,47 @@ class Cursor:
         self.lastrowid = lastrowid
         self._rows = rows
         self._index = 0
+
+    def execute(
+        self, operation: str, parameters: dict[str, t.Any] | None = None
+    ) -> Cursor:
+        self._check_open()
+        bound = dict(parameters or {})
+        try:
+            ast = parse_cached(operation)
+            call = build_call(self.connection._client, ast, bound)
+        except (SqlglotError, MilvusException, grpc.RpcError) as exc:
+            raise errors.translate(exc) from exc
+        self._run(call)
         return self
 
     def executemany(
         self, operation: str, seq_of_parameters: t.Iterable[dict[str, t.Any]]
     ) -> Cursor:
+        self._check_open()
+        seq = list(seq_of_parameters)
+        if not seq:
+            # Nothing to do -- and nothing to parse, matching every
+            # other DBAPI's treatment of an empty executemany() batch.
+            self.rowcount = 0
+            return self
+        try:
+            ast = parse_cached(operation)
+            batch = build_batch_call(ast, seq)
+        except (SqlglotError, MilvusException, grpc.RpcError) as exc:
+            raise errors.translate(exc) from exc
+        if batch is not None:
+            # Milvus has a native batched primitive for this statement
+            # shape (currently: INSERT's `insert(data=[...])` accepts
+            # every row in one RPC) -- one round trip instead of one
+            # per parameter set.
+            self._run(batch)
+            return self
+        # No batched primitive for this statement shape (UPDATE,
+        # DELETE, ...) -- fall back to one execute() per parameter set,
+        # same as every DBAPI without native batch support does.
         total = 0
-        for parameters in seq_of_parameters:
+        for parameters in seq:
             self.execute(operation, parameters)
             if self.rowcount > 0:
                 total += self.rowcount

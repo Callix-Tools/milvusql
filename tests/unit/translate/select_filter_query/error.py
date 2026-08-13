@@ -33,3 +33,15 @@ class TestSubqueryFromIsRejected:
         ``.name`` off a ``Subquery`` node does not fail cleanly."""
         with pytest.raises(milvusql.NotSupportedError, match="subquery"):
             build_call_helper("SELECT id FROM (SELECT id FROM items) AS sub")
+
+
+class TestIsComparisonIsRejectedForAnythingButNull:
+    def test_is_true_raises_not_supported_error(self, build_call_helper):
+        """Milvus's filter DSL only has ``is null``/``is not null`` --
+        no other ``IS <predicate>`` form (e.g. ``IS TRUE``) to
+        transpile to."""
+        with pytest.raises(milvusql.NotSupportedError, match="IS"):
+            build_call_helper(
+                "SELECT id FROM items WHERE (category = :cat) IS TRUE",
+                {"cat": "book"},
+            )
