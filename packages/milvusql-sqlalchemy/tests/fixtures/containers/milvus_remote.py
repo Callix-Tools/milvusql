@@ -74,9 +74,9 @@ def _start_milvus_container() -> MilvusContainer:
     """Starts one ``MilvusContainer``, matching Milvus's own official
     single-container startup script (``scripts/standalone_embed.sh``).
 
-    Three real divergences from that script/from a normal dev machine,
-    each confirmed directly against this exact image/environment
-    combination via successive real CI failures:
+    Four real divergences from that script/from ``MilvusContainer``'s
+    own defaults, each confirmed directly against this exact
+    image/environment combination via successive real CI failures:
 
     1. ``testcontainers``' ``MilvusContainer`` sets ``ETCD_USE_EMBED``
        but never ``DEPLOY_MODE=STANDALONE`` -- Milvus defaults to
@@ -90,14 +90,26 @@ def _start_milvus_container() -> MilvusContainer:
        which the official script does -- a restrictive default
        seccomp profile (as some CI runners use) can make Milvus's own
        process abort during startup with no useful message.
-    3. ``MilvusContainer``'s own default wait-strategy timeout
-       (``testcontainers_config.timeout``, 120s) is too short on a
-       CPU-constrained CI runner -- confirmed directly: a real CI run
-       took well over 120s to emit ``"Welcome to use Milvus!"`` even
-       after fixes 1-2 let the process actually start, timing out
-       repeatedly. Milvus's own compose healthcheck already budgets a
-       90s ``start_period``; 300s here is a deliberately generous
-       margin over that on top of a slower, shared CI CPU.
+    3. ``MilvusContainer``'s own default wait-strategy log message,
+       ``"Welcome to use Milvus!"``, does not actually appear anywhere
+       in ``milvusdb/milvus:v2.6.22``'s real startup output -- the
+       banner it prints is ``"Welcome to Milvus!"`` (no ``"use"``),
+       confirmed verbatim from a real CI run's captured container
+       stderr after fixes 1-2 let the process genuinely start and run
+       for minutes. Since ``CompositeWaitStrategy`` runs its
+       sub-strategies in sequence, that permanently-unmet log-message
+       step blocked the (otherwise-passing) HTTP healthz step from
+       ever even running. Matched instead on a line the running
+       process's stdout actually contains --
+       ``"...Milvus Proxy successfully initialized and ready to
+       serve!..."`` -- a stronger, more semantically meaningful
+       readiness signal than a startup banner anyway, and hopefully
+       less prone to drifting across Milvus versions.
+    4. The default wait-strategy timeout (``testcontainers_config.
+       timeout``, 120s) is too short on a CPU-constrained CI runner on
+       top of that -- Milvus's own compose healthcheck already budgets
+       a 90s ``start_period``; 300s here is a deliberately generous
+       margin over that.
 
     On any startup failure, re-raise with the container's own
     stdout/stderr attached -- the bare ``RuntimeError`` a failed wait
@@ -110,7 +122,7 @@ def _start_milvus_container() -> MilvusContainer:
     )
     container.waiting_for(
         CompositeWaitStrategy(
-            LogMessageWaitStrategy("Welcome to use Milvus!"),
+            LogMessageWaitStrategy("successfully initialized and ready to serve"),
             HttpWaitStrategy(container.healthcheck_port, "/healthz"),
         ).with_startup_timeout(300)
     )
