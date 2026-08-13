@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-08-13
+### Bug Fixes
+
+- **sqlalchemy**: fix(sqlalchemy): full-surface SQLAlchemy testing — 2 real bugs found and pinned by @Neko1313 in [#1](https://github.com/Callix-Tools/milvusql/pull/1)
+- fix: sqlglot-milvus 0.1.1, JOIN/GROUP BY/subquery/ALTER gaps, batched executemany, LIKE/IS NULL/BETWEEN, row-ceiling detection by @Neko1313 in [#3](https://github.com/Callix-Tools/milvusql/pull/3)
+- fix: unwrap trivial wrapping subqueries (Session.query().count() regression) by @Neko1313 in [#4](https://github.com/Callix-Tools/milvusql/pull/4)
+
+
+### New Contributors
+
+- @Neko1313 made their first contribution in [#4](https://github.com/Callix-Tools/milvusql/pull/4)
+
+
+
+**Full Changelog**: https://github.com/Callix-Tools/milvusql/compare/v0.1.1...v0.1.2
 ## [0.1.1] - 2026-08-12
 ### Miscellaneous
 
