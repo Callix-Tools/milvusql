@@ -151,3 +151,40 @@ class TestSelectFilterQuery:
         ]
         assert rowcount == 1
         assert lastrowid is None
+
+
+class TestTrivialSubqueryIsFlattened:
+    """The shape SQLAlchemy's legacy ``Query.count()``/``Query.exists()``
+    wrap *every* query in: a subquery that does nothing but relabel
+    columns and (optionally) filter a single real table. Rejecting it
+    outright would break that common, harmless idiom, so
+    ``_flatten_trivial_subquery`` unwraps it instead -- see
+    ``_build_select``."""
+
+    def test_a_subquery_with_no_where_flattens_to_the_real_table(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM (SELECT items.id AS id FROM items) AS anon_1"
+        )
+        assert call.kwargs["collection_name"] == "items"
+        assert "filter" not in call.kwargs
+
+    def test_the_inner_where_survives_flattening(self, build_call_helper):
+        """``Query(Model).filter(...).count()`` puts the filter
+        *inside* the subquery, not the outer query -- confirmed
+        directly against SQLAlchemy's own compiled SQL."""
+        call = build_call_helper(
+            "SELECT id FROM (SELECT items.id AS id FROM items "
+            "WHERE items.category = :cat) AS anon_1",
+            {"cat": "book"},
+        )
+        assert call.kwargs["filter"] == 'category == "book"'
+
+    def test_inner_and_outer_where_are_anded_together(self, build_call_helper):
+        call = build_call_helper(
+            "SELECT id FROM (SELECT items.id AS id FROM items "
+            "WHERE items.category = :cat) AS anon_1 WHERE id > :n",
+            {"cat": "book", "n": 1},
+        )
+        assert call.kwargs["filter"] == '(id > 1 and category == "book")'

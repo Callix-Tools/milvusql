@@ -15,8 +15,30 @@ from __future__ import annotations
 import pytest
 from milvusql_sqlalchemy.types import VECTOR
 from sqlalchemy import BigInteger, inspect, select
+from sqlalchemy.orm import Session
 
 pytestmark = [pytest.mark.integration, pytest.mark.sqlalchemy]
+
+
+def test_legacy_query_count_flattens_its_wrapping_subquery(seeded_engine):
+    """``Session.query(...).count()`` always wraps the query in a
+    subquery (confirmed directly against the compiled SQL) -- a real
+    regression risk from rejecting every subquery-in-FROM outright, not
+    just a hypothetical one. ``_flatten_trivial_subquery`` unwraps this
+    specific safe shape instead."""
+    engine, items = seeded_engine
+    with Session(engine) as session:
+        assert session.query(items).count() == 1
+        assert (
+            session.query(items).filter(items.c.category == "book").count()
+            == 1
+        )
+        assert (
+            session.query(items)
+            .filter(items.c.category == "nonexistent")
+            .count()
+            == 0
+        )
 
 
 def test_vector_search_returns_the_nearest_row(seeded_engine):
