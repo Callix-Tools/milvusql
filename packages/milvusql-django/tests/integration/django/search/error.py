@@ -1,5 +1,5 @@
 """``vector_search``/``hybrid_search`` -- integration coverage for
-their error paths against a real (embedded) Milvus Lite instance."""
+their error paths against a real Milvus server (via ``testcontainers``)."""
 
 from __future__ import annotations
 

@@ -1,6 +1,7 @@
 """Shared seed data for the ``search`` action's ``act.py``/
 ``error.py``: both need the same two-row ``Item`` collection, seeded
-against a real (embedded) Milvus Lite instance via ``loaded_items``."""
+against a real Milvus server (via ``testcontainers``) via
+``loaded_items``."""
 
 from __future__ import annotations
 

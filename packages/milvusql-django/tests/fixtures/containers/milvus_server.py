@@ -35,8 +35,6 @@ from urllib.parse import urlsplit
 
 import pytest
 from pymilvus import MilvusClient
-from sqlalchemy import create_engine
-from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.community.milvus import MilvusContainer
 
 # Default super-user credential documented by pymilvus itself for a
@@ -60,7 +58,7 @@ def milvus_container(request: pytest.FixtureRequest):
     when the collected run actually needs one. Yields ``None`` when no
     ``integration`` test was collected, or when ``MILVUS_TEST_URI``
     already points at a server to use instead: in both cases
-    ``milvus_remote_target`` below is what tests/fixtures actually
+    ``milvus_server_target`` below is what tests/fixtures actually
     consult."""
     if not _has_integration_marker(request):
         yield None
@@ -74,7 +72,7 @@ def milvus_container(request: pytest.FixtureRequest):
 
 
 @pytest.fixture(scope="session")
-def milvus_remote_target(milvus_container) -> tuple[str, int]:
+def milvus_server_target(milvus_container) -> tuple[str, int]:
     """Resolves to the ``(host, port)`` of the real Milvus server to
     test against, regardless of whether it came from ``MILVUS_TEST_URI``
     or a freshly started container."""
@@ -90,14 +88,15 @@ def milvus_remote_target(milvus_container) -> tuple[str, int]:
 
 
 @pytest.fixture(scope="session")
-def milvus_db_name(milvus_remote_target: tuple[str, int], worker_id: str) -> str:
+def milvus_db_name(milvus_server_target: tuple[str, int], worker_id: str) -> str:
     """A Milvus database dedicated to this pytest-xdist worker
     (``worker_id`` is ``"master"`` outside ``-n``), so parallel workers
     never see each other's collections. Created once per worker via a
     plain, throwaway control-plane client -- not through the
-    ``milvusql`` DBAPI/dialect, since this is test setup, not the code
-    under test."""
-    host, port = milvus_remote_target
+    ``milvusql`` DBAPI/backend, since this is test setup, not the code
+    under test. Never dropped at session end: the container itself
+    (or env-provided server) is what's ephemeral."""
+    host, port = milvus_server_target
     name = f"test_{worker_id}"
     client = MilvusClient(uri=f"http://{host}:{port}", token=_ROOT_TOKEN)
     try:
@@ -108,36 +107,18 @@ def milvus_db_name(milvus_remote_target: tuple[str, int], worker_id: str) -> str
     return name
 
 
-@pytest.fixture(scope="session")
-def milvus_sync_url(milvus_remote_target: tuple[str, int], milvus_db_name: str) -> str:
-    """The real ``milvusql://user:pass@host:port/db`` URL string every
-    sync integration fixture/test in this package builds its engine
-    from."""
-    host, port = milvus_remote_target
-    return f"milvusql://{_ROOT_USER}:{_ROOT_PASSWORD}@{host}:{port}/{milvus_db_name}"
-
-
-@pytest.fixture(scope="session")
-def milvus_async_url(
-    milvus_remote_target: tuple[str, int], milvus_db_name: str
-) -> str:
-    """The async equivalent of ``milvus_sync_url``:
-    ``milvusql+aio://user:pass@host:port/db``."""
-    host, port = milvus_remote_target
-    return f"milvusql+aio://{_ROOT_USER}:{_ROOT_PASSWORD}@{host}:{port}/{milvus_db_name}"
-
-
 @pytest.fixture
-def _milvus_worker_cleanup(milvus_remote_target: tuple[str, int], milvus_db_name: str):
+def _milvus_worker_cleanup(
+    milvus_server_target: tuple[str, int], milvus_db_name: str
+):
     """Drops every collection left behind in this worker's database
     after each test. All tests in a worker share one database, so this
     replaces Milvus Lite's old "fresh file per test" isolation -- wired
-    as a dependency of ``remote_engine``/``remote_engine_aio`` (and, via
-    ``tests/fixtures/engine.py``'s ``db_uri``, of ``engine``/
-    ``seeded_engine``/``seeded_engine_aio``), never as a bare
-    ``autouse=True``, so it never fires for ``unit`` tests."""
+    as a dependency of ``tests.fixtures.django_db``'s ``connection``
+    fixture, never as a bare ``autouse=True``, so it never fires for
+    ``unit`` tests."""
     yield
-    host, port = milvus_remote_target
+    host, port = milvus_server_target
     client = MilvusClient(
         uri=f"http://{host}:{port}", token=_ROOT_TOKEN, db_name=milvus_db_name
     )
@@ -146,23 +127,3 @@ def _milvus_worker_cleanup(milvus_remote_target: tuple[str, int], milvus_db_name
             client.drop_collection(collection)
     finally:
         client.close()
-
-
-@pytest.fixture
-def remote_engine(milvus_sync_url: str, _milvus_worker_cleanup):
-    """A sync ``Engine`` built from a real
-    ``milvusql://user:pass@host:port/db`` URL string -- proving
-    credentials, host, and port all round-trip through
-    ``create_connect_args`` to a real, non-Lite server."""
-    eng = create_engine(milvus_sync_url)
-    yield eng
-    eng.dispose()
-
-
-@pytest.fixture
-async def remote_engine_aio(milvus_async_url: str, _milvus_worker_cleanup):
-    """The async equivalent of ``remote_engine``, built from a real
-    ``milvusql+aio://user:pass@host:port/db`` URL string."""
-    eng = create_async_engine(milvus_async_url)
-    yield eng
-    await eng.dispose()

@@ -1,8 +1,8 @@
 """Sync-side equivalent of ``async_real_server_credentials/act.py``:
 proves ``milvusql://user:pass@host:port/db`` (the sync dialect's
 share of the same real host/port/credentials round trip) reaches a
-real, non-Lite Milvus server -- create, insert, plain filtered
-``SELECT``, drop."""
+real Milvus server -- create, insert, plain filtered ``SELECT``,
+drop."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from sqlalchemy import (
     select,
 )
 
-pytestmark = [pytest.mark.validation, pytest.mark.sqlalchemy]
+pytestmark = [pytest.mark.integration, pytest.mark.sqlalchemy]
 
 
 def test_credentials_host_and_port_reach_a_real_server(remote_engine):

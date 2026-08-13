@@ -1,10 +1,11 @@
 """Integration coverage exercising ``MilvusDialect`` end to end through
-a real ``sqlalchemy.Engine`` backed by an embedded Milvus Lite
-instance: ``metadata.create_all()``, ``CREATE INDEX`` + load, insert,
-vector search, and reflection via ``sqlalchemy.inspect()``. Each test
-rebuilds its own collection through ``seeded_engine`` (``tmp_path``
-based, see ``tests/fixtures/engine.py``), so ``pytest-randomly`` can
-freely reorder them without collection-name collisions.
+a real ``sqlalchemy.Engine`` backed by a real Milvus server (via
+``testcontainers``): ``metadata.create_all()``, ``CREATE INDEX`` +
+load, insert, vector search, and reflection via ``sqlalchemy.inspect()``.
+Each test rebuilds its own collection through ``seeded_engine`` (see
+``tests/fixtures/engine.py``), and every matching collection is
+dropped again at teardown, so ``pytest-randomly`` can freely reorder
+them without collection-name collisions.
 
 Every test in this module is a happy-path/documented-behavior
 confirmation through a real engine -- including ``TestHasTable``'s

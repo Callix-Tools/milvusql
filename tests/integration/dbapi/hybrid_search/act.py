@@ -1,6 +1,7 @@
-"""Integration coverage for ``HYBRID SEARCH`` against a real (embedded)
-Milvus Lite instance -- two indexed vector fields, combined and
-reranked, not just the ``build_call`` dispatch shape unit tests cover."""
+"""Integration coverage for ``HYBRID SEARCH`` against a real Milvus
+server (via ``testcontainers``) -- two indexed vector fields, combined
+and reranked, not just the ``build_call`` dispatch shape unit tests
+cover."""
 
 from __future__ import annotations
 

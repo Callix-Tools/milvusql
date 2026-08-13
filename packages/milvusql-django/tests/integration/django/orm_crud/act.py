@@ -1,5 +1,5 @@
 """Integration coverage: schema-editor DDL and ORM CRUD/filtering
-against a real (embedded) Milvus Lite instance, through Django's
+against a real Milvus server (via ``testcontainers``), through Django's
 normal query compiler and ``CursorWrapper``'s live ``%s`` -> ``:name``
 translation. ``vector_search``/``hybrid_search``'s own hand-written
 MilvusQL text is covered separately, in ``tests/integration/django/

@@ -33,7 +33,6 @@ tasks:
           mkdir -p {{.TASKFILE_DIR}}/reports
           uv run pytest {{.TASKFILE_DIR}}/tests \
             -n {{.CONCURRENCY | default "auto"}} \
-            -m "not validation" \
             {{ if .SEED -}}
             --randomly-seed={{.SEED}} \
             {{ end -}}
@@ -48,7 +47,6 @@ tasks:
           echo "Running milvusql-sqlalchemy tests for development..."
           uv run pytest {{.TASKFILE_DIR}}/tests \
             -n {{.CONCURRENCY | default "auto"}} \
-            -m "not validation" \
             {{ if .SEED -}}
             --randomly-seed={{.SEED}} \
             {{ end -}}

@@ -6,10 +6,12 @@ runs) -- pytest imports every test module during collection, before
 any fixture executes, so this has to happen as top-level code here,
 not inside a fixture function: ``conftest.py`` is always imported
 before sibling/descendant test modules, fixtures are not.
-Each test still gets its own on-disk Milvus Lite file via
-``connection``, so ``pytest-randomly`` can freely reorder tests
-without collection-name collisions (same reasoning as the root
-suite's ``conftest.py``). ``dj_app`` is a real importable app package
+Each test gets a real Milvus server via ``connection`` (a
+``testcontainers``-backed instance shared per pytest-xdist worker, with
+per-test collection cleanup -- see
+``tests/fixtures/containers/milvus_server.py``), so ``pytest-randomly``
+can freely reorder tests without collection-name collisions. ``dj_app``
+is a real importable app package
 (``tests/dj_app/``) -- ``django.test.utils.isolate_apps()`` doesn't
 work for a throwaway label with no backing package, it tries to
 import it as a real module and raises ``ModuleNotFoundError``.

@@ -1,5 +1,5 @@
 """``vector_search``/``hybrid_search`` -- integration coverage against
-a real (embedded) Milvus Lite instance. Both build MilvusQL text
+a real Milvus server (via ``testcontainers``). Both build MilvusQL text
 directly and execute it through ``connection.cursor()``, so this also
 exercises ``CursorWrapper``'s translation and ``VectorField``
 round-tripping live, the same non-relational bypass the module

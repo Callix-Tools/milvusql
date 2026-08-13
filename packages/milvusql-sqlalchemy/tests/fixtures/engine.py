@@ -1,7 +1,14 @@
 """Fixtures for the milvusql-sqlalchemy test suite: every integration
-test gets its own Milvus Lite instance (via ``tmp_path``), so
-``pytest-randomly`` can freely reorder tests without collection-name
-collisions."""
+test in this package runs against one REAL Milvus server (a
+``testcontainers``-started container, or ``MILVUS_TEST_URI`` --
+see ``tests/fixtures/containers/milvus_remote.py``) shared across the
+whole pytest-xdist worker process. Isolation across workers is a
+dedicated Milvus *database* per worker id; isolation across tests
+*within* one worker is a per-test collection-drop teardown
+(``_milvus_worker_cleanup``, pulled in transitively through
+``db_uri``) -- this replaces what a fresh Milvus Lite on-disk file per
+test used to guarantee, so ``pytest-randomly`` can still freely
+reorder tests without collection-name collisions."""
 
 from __future__ import annotations
 
@@ -21,8 +28,15 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 
 @pytest.fixture
-def db_uri(tmp_path) -> str:
-    return f"milvusql:///{tmp_path}/milvus.db"
+def db_uri(milvus_sync_url: str, _milvus_worker_cleanup) -> str:
+    """The real ``milvusql://root:Milvus@host:port/db`` URL string,
+    with this test's post-run collection cleanup already wired in as a
+    dependency -- so any engine built from this string directly (not
+    just through ``engine``/``seeded_engine`` below), e.g.
+    ``consistency_level_regression/act.py``'s own
+    ``create_engine(db_uri, isolation_level=...)``, still gets a clean
+    slate for the next test."""
+    return milvus_sync_url
 
 
 @pytest.fixture
@@ -73,18 +87,19 @@ def seeded_engine(engine):
 
 @pytest.fixture
 async def seeded_engine_aio(seeded_engine):
-    """The exact same on-disk collection as ``seeded_engine`` --
-    created, HNSW-indexed, and loaded through the *sync* engine, then
-    reopened through ``create_async_engine`` for the async-path test to
-    use. Not built through the async engine directly: ``CREATE INDEX``
-    cannot be exercised through ``milvusql+aio`` against Milvus Lite --
-    the ``AllocTimestamp`` RPC its completion-wait calls into isn't
-    implemented on Milvus Lite's *async* gRPC server (confirmed
-    directly; the sync server handles the equivalent sync call fine,
-    already documented in the root package's
-    ``ast_to_pymilvus._build_create_index`` docstring). Milvus Lite is
-    one on-disk server -- both clients see the same collection, same
-    reasoning as the root package's own ``loaded_items`` fixture."""
+    """The exact same collection as ``seeded_engine`` -- created,
+    HNSW-indexed, and loaded through the *sync* engine, then reopened
+    through ``create_async_engine`` for the async-path test to use.
+    ``ast_to_pymilvus``'s ``_build_create_index`` docstring notes the
+    ``AllocTimestamp``-completion-wait gap in ``CREATE INDEX`` is
+    specifically a Milvus *Lite* async-gRPC-server limitation, not a
+    general one -- so against this package's real server it may well
+    work fine through the async engine directly, but this fixture
+    keeps the already-proven sync-build-then-reopen path rather than
+    switching without having independently re-verified the async path
+    end to end. Both clients talk to the same real server/database,
+    same reasoning as the root package's own ``loaded_items``
+    fixture."""
     sync_engine, items = seeded_engine
     aio_engine = create_async_engine(
         sync_engine.url.set(drivername="milvusql+aio")

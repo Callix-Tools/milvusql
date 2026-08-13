@@ -1,5 +1,6 @@
 """Integration coverage for the ORM/schema-editor's one documented
-unsupported operation, against a real (embedded) Milvus Lite instance."""
+unsupported operation, against a real Milvus server (via
+``testcontainers``)."""
 
 from __future__ import annotations
 

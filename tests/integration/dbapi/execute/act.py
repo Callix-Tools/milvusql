@@ -1,7 +1,8 @@
-"""Integration coverage against a real (embedded) Milvus Lite
-instance: insert/search/select/delete through both the sync
-``Cursor`` and the async ``AsyncCursor``, verifying they return the
-same shape of answer for the same MilvusQL text."""
+"""Integration coverage against a real Milvus server (via
+``testcontainers``, see ``tests/fixtures/containers/milvus_server.py``):
+insert/search/select/delete through both the sync ``Cursor`` and the
+async ``AsyncCursor``, verifying they return the same shape of answer
+for the same MilvusQL text."""
 
 from __future__ import annotations
 

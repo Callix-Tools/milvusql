@@ -1,6 +1,11 @@
-"""Fixtures for the DBAPI test suite: every test gets its own Milvus
-Lite instance (via ``tmp_path``), so ``pytest-randomly`` can freely
-reorder tests without collection-name collisions."""
+"""Fixtures for the DBAPI test suite: all tests in one pytest-xdist
+worker share a single real Milvus server (started via
+``testcontainers``, see ``tests.fixtures.containers.milvus_server``)
+and a single database dedicated to that worker (``milvus_db_name``).
+Isolation across tests -- so ``pytest-randomly`` can freely reorder
+them without collection-name collisions -- comes from a per-test
+teardown that drops every collection in the worker's database after
+each test that requests ``conn``/``aconn`` (``_milvus_worker_cleanup``)."""
 
 from __future__ import annotations
 
@@ -23,13 +28,17 @@ CREATE_ITEMS_INDEX = (
 
 
 @pytest.fixture
-def db_uri(tmp_path) -> str:
-    return str(tmp_path / "milvus.db")
+def db_uri(milvus_uri: str) -> str:
+    return milvus_uri
 
 
 @pytest.fixture
-def conn(db_uri):
-    connection = milvusql.connect(uri=db_uri)
+def conn(db_uri, milvus_db_name, _milvus_worker_cleanup):
+    connection = milvusql.connect(
+        uri=db_uri,
+        token="root:Milvus",  # noqa: S106 -- well-known Milvus default, not a secret
+        db_name=milvus_db_name,
+    )
     yield connection
     connection.close()
 
@@ -43,8 +52,8 @@ def cur(conn):
 def loaded_items(conn, cur):
     """A collection with an index, loaded and ready to search --
     everything CREATE INDEX needs, built through the sync client
-    regardless of which client the test itself exercises (Milvus Lite
-    is one on-disk server; both clients see the same collection)."""
+    regardless of which client the test itself exercises (both
+    clients point at the same real server and database)."""
     cur.execute(CREATE_ITEMS)
     cur.execute(CREATE_ITEMS_INDEX)
     cur.execute("LOAD TABLE items")
@@ -52,8 +61,12 @@ def loaded_items(conn, cur):
 
 
 @pytest.fixture
-async def aconn(db_uri, loaded_items):
-    connection = aio.connect(uri=db_uri)
+async def aconn(db_uri, milvus_db_name, loaded_items):
+    connection = aio.connect(
+        uri=db_uri,
+        token="root:Milvus",  # noqa: S106 -- well-known Milvus default, not a secret
+        db_name=milvus_db_name,
+    )
     yield connection
     await connection.close()
 

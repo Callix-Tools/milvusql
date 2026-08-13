@@ -66,11 +66,10 @@ markers = [
     # `task tests` runs each workspace package through its own pytest
     # invocation (see taskfile's `tests` task for why), so this list only
     # needs the root package's own markers -- milvusql-sqlalchemy/
-    # milvusql-django register their own `unit`/`integration`/`validation`
-    # + domain marker in their own pyproject.toml, kept in sync by hand.
+    # milvusql-django register their own `unit`/`integration` + domain
+    # marker in their own pyproject.toml, kept in sync by hand.
     "unit: pure-logic test, no external process (Milvus, a real DB) started",
-    "integration: exercises a real (embedded) Milvus Lite instance",
-    "validation: opt-in test against a real, non-Lite Milvus server (excluded by default -- see taskfile's `-m \"not validation\"`)",
+    "integration: exercises a real Milvus server (via testcontainers)",
     "dbapi: the root milvusql package's sync/async PEP 249 surface (connection, cursor)",
     "errors: milvusql.dbapi.errors exception translation",
     "translate: milvusql.translate.ast_to_pymilvus's AST -> pymilvus dispatch table",
@@ -84,6 +83,12 @@ lint = [
 ]
 test = [
     "greenlet>=3.5.5",
+    # Not used to back any *integration* test anymore (those all run
+    # against a real, testcontainers-provisioned Milvus server) -- kept
+    # because pymilvus itself requires this package importable just to
+    # validate/construct a client for a local ".db"-style URI, which is
+    # still a real, documented `milvusql.connect()` mode a handful of
+    # unit tests exercise (e.g. async_dbapi's adapter-wrapping test).
     "milvus-lite>=2.4,<4",
     "pytest~=8.4.2",
     "pytest-asyncio~=1.2.0",

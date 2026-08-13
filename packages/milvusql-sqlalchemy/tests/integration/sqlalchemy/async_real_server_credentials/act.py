@@ -1,21 +1,18 @@
-"""Validation coverage proving the exact URL shape a real deployment
-needs actually works end to end: ``milvusql+aio://user:pass@host:port/db``
+"""Coverage proving the exact URL shape a real deployment needs
+actually works end to end: ``milvusql+aio://user:pass@host:port/db``
 -- host, port, *and* a ``user:password`` credential pair all carried
-through ``MilvusDialect_aio.create_connect_args`` to a real, non-Lite
-Milvus server (started via ``testcontainers``, or pointed at
-``MILVUS_VALIDATION_URI`` -- see
+through ``MilvusDialect_aio.create_connect_args`` to a real Milvus
+server (started via ``testcontainers``, or pointed at
+``MILVUS_TEST_URI`` -- see
 ``tests/fixtures/containers/milvus_remote.py``).
 
-Every other integration test in this package only ever builds a
-``milvusql:///path/to/file.db`` URL (the no-host, Milvus-Lite-file
-branch of ``create_connect_args``) -- none of them exercise a real
-host/port/credentials round trip. This module closes that gap: create
-a collection, insert a row, run a plain filtered ``SELECT`` through
-``AsyncConnection.execute()``, then drop the collection -- the
-lifecycle is built fresh here (not shared with ``seeded_engine``/
-``seeded_engine_aio``) because a real server, unlike Milvus Lite's
-per-test ``tmp_path`` file, needs its own explicit create/drop instead
-of just discarding a temp file."""
+Every other integration test in this package builds its engine
+through ``tests/fixtures/engine.py``'s ``db_uri``/``engine`` chain,
+which also points at the same real server/database -- this module
+still keeps its own throwaway, uuid-suffixed collection (created and
+dropped within the test itself) rather than reusing ``seeded_engine``/
+``seeded_engine_aio``, so it stays self-contained and unaffected by
+whatever else is running concurrently in this worker's database."""
 
 from __future__ import annotations
 
@@ -33,7 +30,7 @@ from sqlalchemy import (
     select,
 )
 
-pytestmark = [pytest.mark.validation, pytest.mark.sqlalchemy]
+pytestmark = [pytest.mark.integration, pytest.mark.sqlalchemy]
 
 
 def _items_table(metadata: MetaData, name: str) -> Table:

@@ -60,7 +60,6 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = [
     "unit: pure-logic test, no external process (Milvus, a real DB) started",
-    "integration: exercises a real (embedded) Milvus Lite instance",
-    "validation: opt-in test against a real, non-Lite Milvus server (excluded by default -- see taskfile's `-m \"not validation\"`)",
+    "integration: exercises a real Milvus server",
     "sqlalchemy: the milvusql-sqlalchemy dialect package",
 ]
