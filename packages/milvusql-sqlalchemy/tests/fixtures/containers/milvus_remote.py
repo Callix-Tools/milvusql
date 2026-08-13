@@ -65,6 +65,37 @@ def _has_integration_marker(request: pytest.FixtureRequest) -> bool:
     )
 
 
+def _start_milvus_container() -> MilvusContainer:
+    """Starts one ``MilvusContainer``, matching Milvus's own official
+    single-container startup script (``scripts/standalone_embed.sh``),
+    which additionally passes ``--security-opt seccomp:unconfined`` --
+    ``testcontainers``' ``MilvusContainer`` does not set this by
+    default, and a restrictive default seccomp profile (as some CI
+    runners use) can make Milvus's own process abort during startup
+    with no useful message. On any startup failure, re-raise with the
+    container's own stdout/stderr attached -- the bare
+    ``RuntimeError`` a failed wait strategy raises otherwise carries an
+    empty ``Container error: .``, which is not enough to diagnose a
+    real crash from."""
+    container = MilvusContainer(image=_IMAGE).with_kwargs(
+        security_opt=["seccomp:unconfined"]
+    )
+    try:
+        container.start()
+    except Exception as exc:
+        try:
+            stdout, stderr = container.get_logs()
+        except Exception:
+            stdout, stderr = b"", b""
+        msg = (
+            f"Milvus container failed to start: {exc}\n"
+            f"--- container stdout ---\n{stdout.decode(errors='replace')}\n"
+            f"--- container stderr ---\n{stderr.decode(errors='replace')}"
+        )
+        raise RuntimeError(msg) from exc
+    return container
+
+
 def _container_info_file(tmp_path_factory: pytest.TempPathFactory):
     """Path to the small JSON file every pytest-xdist worker shares
     (``tmp_path_factory.getbasetemp().parent`` is the base tmp dir
@@ -113,8 +144,7 @@ def milvus_container(
     owned_container = None
     with FileLock(str(info_file) + ".lock"):
         if not info_file.is_file():
-            owned_container = MilvusContainer(image=_IMAGE)
-            owned_container.start()
+            owned_container = _start_milvus_container()
             info_file.write_text(
                 json.dumps(
                     {
