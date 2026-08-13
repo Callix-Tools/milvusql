@@ -16,10 +16,11 @@ is unambiguous.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import typing as t
 
-from sqlalchemy import exc, pool
+from sqlalchemy import event, exc, pool
 from sqlalchemy.engine import default
 from sqlalchemy.sql import schema
 from sqlalchemy.util import await_only
@@ -27,6 +28,20 @@ from sqlalchemy.util import await_only
 import milvusql.dbapi
 from milvusql_sqlalchemy import asyncio_dbapi, reflection
 from milvusql_sqlalchemy.compiler import MilvusDDLCompiler, MilvusSQLCompiler
+from milvusql_sqlalchemy.padding import (
+    PAD_VECTOR_FIELD,
+    table_needs_pad_vector,
+)
+
+with contextlib.suppress(ImportError):
+    # Registers `MilvusImpl` with Alembic (see that module's own
+    # docstring for why importing it is what registers it) -- guarded
+    # so this package works without Alembic installed at all; only
+    # `MigrationContext.configure()` ever needs the registration to
+    # already have happened, and that can't run before this dialect
+    # module itself has been imported to resolve `create_engine(...)`
+    # in the first place.
+    from milvusql_sqlalchemy import alembic_impl as _alembic_impl  # noqa: F401
 
 if t.TYPE_CHECKING:
     from sqlalchemy.engine import Connection as SAConnection
@@ -359,6 +374,40 @@ class MilvusDialect_aio(MilvusDialect):  # noqa: N801 -- matches upstream's own
         not the ``milvusql.aio.AsyncConnection`` underneath it, and
         ``._client`` raises ``AttributeError``."""
         return connection._connection
+
+
+@event.listens_for(schema.Table, "after_create")
+def _load_pad_vector_table(
+    target: schema.Table,
+    connection: SAConnection,
+    **kw: t.Any,  # noqa: ARG001 -- required by the `after_create` event signature
+) -> None:
+    """Registered globally on ``schema.Table``, not on any instance
+    this package constructs itself -- deliberately, so this also
+    catches a table Alembic creates internally (its own
+    ``alembic_version`` bookkeeping table, chiefly) through this
+    dialect without ever importing ``milvusql_sqlalchemy``'s own
+    ``Table``/``MetaData`` objects. ``compiler.py``'s
+    ``visit_create_table`` already spliced the hidden pad-vector
+    column into the ``CREATE TABLE`` text itself (see ``padding.py``'s
+    module docstring) -- Milvus still needs an index and a ``LOAD``
+    before *any* query succeeds against a real server, not just vector
+    search, the same requirement ``milvusql_django.schema.
+    create_index_and_load`` exists for. Every dialect fires this event
+    on every ``CREATE TABLE``, not just this one's -- the ``dialect.
+    name`` guard is what keeps this a no-op for anyone using a
+    different backend in the same process."""
+    if connection.dialect.name != "milvusql":
+        return
+    if not table_needs_pad_vector(target):
+        return
+    table_name = target.name
+    connection.exec_driver_sql(
+        f'CREATE INDEX idx_{PAD_VECTOR_FIELD} ON "{table_name}" '
+        f'("{PAD_VECTOR_FIELD}") USING HNSW '
+        "WITH (metric_type='COSINE')"
+    )
+    connection.exec_driver_sql(f'LOAD TABLE "{table_name}"')
 
 
 __all__ = ["MilvusDialect", "MilvusDialect_aio"]

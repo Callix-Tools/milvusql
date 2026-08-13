@@ -98,6 +98,11 @@ test = [
     # still a real, documented `milvusql.connect()` mode a handful of
     # unit tests exercise (e.g. async_dbapi's adapter-wrapping test).
     "milvus-lite>=2.4,<4",
+    # milvusql-sqlalchemy's own Alembic integration coverage --
+    # exercises real `alembic upgrade`/`downgrade` against a real
+    # Milvus server through this dialect, not just the underlying
+    # SQLAlchemy Core operations Alembic itself compiles to.
+    "alembic>=1.13,<2",
     "pytest~=8.4.2",
     "pytest-asyncio~=1.2.0",
     "pytest-cov~=7.1.0",

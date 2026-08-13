@@ -21,6 +21,11 @@ import typing as t
 from sqlalchemy.sql import compiler
 
 from milvusql_sqlalchemy.hybrid import HybridSearchClause
+from milvusql_sqlalchemy.padding import (
+    PAD_VECTOR_DIM,
+    PAD_VECTOR_FIELD,
+    table_needs_pad_vector,
+)
 
 if t.TYPE_CHECKING:
     from sqlalchemy.sql.schema import Table
@@ -80,6 +85,29 @@ class MilvusDDLCompiler(compiler.DDLCompiler):
                 "partition_key": options.get("partition_key"),
             }
         )
+
+    def visit_create_table(self, create: t.Any, **kw: t.Any) -> str:
+        text = super().visit_create_table(create, **kw)
+        table = create.element
+        if not table_needs_pad_vector(table):
+            return text
+        # Milvus refuses `CREATE TABLE`/`create_collection()` outright
+        # for a schema with zero vector fields -- see `padding.py`'s
+        # module docstring for why this table (chiefly Alembic's own
+        # `alembic_version` bookkeeping table, which has none) needs a
+        # hidden pad column spliced in. The base compiler always closes
+        # the column list with the literal two-character sequence
+        # "\n)" immediately before its own `post_create_table()`
+        # suffix (verified directly against `DDLCompiler.
+        # visit_create_table`'s source: every column/constraint line
+        # it writes has no leading newline before its own trailing
+        # paren, e.g. `VECTOR(8)`, so that exact sequence appears
+        # nowhere earlier in the rendered text) -- splicing a new
+        # column in right there needs no column-list reimplementation.
+        quoted = self.preparer.quote(PAD_VECTOR_FIELD)
+        pad_column = f", \n\t{quoted} VECTOR({PAD_VECTOR_DIM})"
+        index = text.rindex("\n)")
+        return text[:index] + pad_column + text[index:]
 
     def visit_create_index(
         self,
