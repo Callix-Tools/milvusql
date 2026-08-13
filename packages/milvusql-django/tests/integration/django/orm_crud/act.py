@@ -7,10 +7,12 @@ search``."""
 
 from __future__ import annotations
 
+import time
 import typing as t
 
 import pytest
 from dj_app.models import Item as _Item
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.db.models import Sum
 
@@ -21,6 +23,35 @@ pytestmark = [pytest.mark.integration, pytest.mark.django]
 #: exercised for real, just invisible statically. Same kind of
 #: understood cast ``test_translate.py`` uses for ``MilvusClient``.
 Item: t.Any = _Item
+
+
+def _eventually(fn: t.Callable[[], t.Any], *, tries: int = 20, delay: float = 0.05) -> t.Any:
+    """``TestMutation``'s own read-immediately-after-write assertions
+    (not ``test_vector_field_round_trips_through_the_orm``'s -- that
+    one's failure was a real, deterministic bug, `AutoField`'s 32-bit
+    range silently discarding every large real ``auto_id`` pk lookup;
+    see ``milvusql_django.DatabaseOperations.integer_field_ranges``'s
+    docstring, fixed there). With that fixed, `self.book.save()`/
+    `Item.objects.filter(...).update()` immediately followed by
+    `Item.objects.get(pk=...)` in the *same* test still intermittently
+    raised `Item.DoesNotExist`, even under `consistency_level=
+    "Strong"` -- confirmed directly: gone on the very next retry with
+    no other change, so a genuine write-visibility lag against this
+    suite's own concurrently-loaded real (non-Lite) server, not a
+    logic bug. `"Strong"` bounds *where* Milvus looks for the write,
+    not how long the RPC that makes it visible there is still in
+    flight. Never observable against Milvus Lite's single in-process
+    server. A short bounded retry is the same tolerance any client of
+    a real distributed system needs here."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except (AssertionError, ObjectDoesNotExist):
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+    msg = "unreachable"  # pragma: no cover -- the loop always returns or raises
+    raise AssertionError(msg)
 
 
 def test_create_model_makes_an_empty_queryable_collection(loaded_items):
@@ -119,13 +150,13 @@ class TestMutation:
     def test_instance_save_updates_an_existing_row(self):
         self.book.rank = 99
         self.book.save()
-        assert Item.objects.get(pk=self.book.pk).rank == 99
+        assert _eventually(lambda: Item.objects.get(pk=self.book.pk)).rank == 99
         # The row wasn't duplicated -- an upsert-by-pk, not an insert.
         assert Item.objects.count() == 2
 
     def test_queryset_update_changes_only_matching_rows(self):
         Item.objects.filter(category="book").update(rank=42)
-        assert Item.objects.get(pk=self.book.pk).rank == 42
+        assert _eventually(lambda: Item.objects.get(pk=self.book.pk)).rank == 42
         assert Item.objects.filter(category="movie").get().rank == 5
 
     def test_instance_delete_removes_only_that_row(self):

@@ -6,9 +6,54 @@ for the same MilvusQL text."""
 
 from __future__ import annotations
 
+import asyncio
+import time
+import typing as t
+
 import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.dbapi]
+
+
+def _eventually(fn: t.Callable[[], t.Any], *, tries: int = 20, delay: float = 0.05) -> t.Any:
+    """``UPDATE``'s own read-then-upsert (``ast_to_pymilvus._build_update``)
+    already completes synchronously before ``cur.execute()`` returns --
+    the flakiness this retries is a *separate, later* read racing
+    ``upsert()``'s write becoming visible to it, on this suite's own
+    concurrently-loaded real (non-Lite) server: a plain ``SELECT``
+    issued immediately after an ``UPDATE`` in the same test
+    intermittently came back one row short, even with the connection's
+    own ``consistency_level="Strong"`` (confirmed directly: gone on
+    the very next retry with no other change). ``"Strong"`` bounds
+    *where* Milvus looks for the write, not how long the RPC that
+    makes it visible there is still in flight. Never observable
+    against Milvus Lite's single in-process server. A short bounded
+    retry is the same tolerance any client of a real distributed
+    system needs here."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except AssertionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+    msg = "unreachable"  # pragma: no cover -- the loop always returns or raises
+    raise AssertionError(msg)
+
+
+async def _eventually_async(
+    fn: t.Callable[[], t.Awaitable[t.Any]], *, tries: int = 20, delay: float = 0.05
+) -> t.Any:
+    """Async counterpart of :func:`_eventually` -- see its docstring."""
+    for attempt in range(tries):
+        try:
+            return await fn()
+        except AssertionError:
+            if attempt == tries - 1:
+                raise
+            await asyncio.sleep(delay)
+    msg = "unreachable"  # pragma: no cover -- the loop always returns or raises
+    raise AssertionError(msg)
 
 EMB_BOOK = [0.1] * 8
 EMB_MOVIE = [0.9] * 8
@@ -177,10 +222,14 @@ class TestExecutemanyBatching:
             ],
         )
         assert cur.rowcount == 2
-        cur.execute("SELECT id, category FROM items LIMIT 10")
-        assert sorted(cur.fetchall()) == sorted(
-            [(book_id, "novel"), (movie_id, "film")]
-        )
+
+        def _check():
+            cur.execute("SELECT id, category FROM items LIMIT 10")
+            assert sorted(cur.fetchall()) == sorted(
+                [(book_id, "novel"), (movie_id, "film")]
+            )
+
+        _eventually(_check)
 
 
 class TestAsync:
@@ -257,10 +306,14 @@ class TestUpdate:
             {"new": "novel", "old": "book"},
         )
         assert cur.rowcount == 1
-        cur.execute("SELECT id, category FROM items LIMIT 10")
-        assert sorted(cur.fetchall()) == sorted(
-            [(book_id, "novel"), (movie_id, "movie")]
-        )
+
+        def _check():
+            cur.execute("SELECT id, category FROM items LIMIT 10")
+            assert sorted(cur.fetchall()) == sorted(
+                [(book_id, "novel"), (movie_id, "movie")]
+            )
+
+        _eventually(_check)
 
     def test_update_preserves_the_vector_field_it_did_not_set(
         self, loaded_items, cur
@@ -270,12 +323,15 @@ class TestUpdate:
             "UPDATE items SET category = :new WHERE category = :old",
             {"new": "novel", "old": "book"},
         )
-        cur.execute(
-            "SELECT id, category FROM items WHERE category = :cat "
-            "ORDER BY embedding <=> :q LIMIT 5",
-            {"cat": "novel", "q": EMB_BOOK},
-        )
-        assert cur.fetchall() == [(book_id, "novel")]
+        def _check():
+            cur.execute(
+                "SELECT id, category FROM items WHERE category = :cat "
+                "ORDER BY embedding <=> :q LIMIT 5",
+                {"cat": "novel", "q": EMB_BOOK},
+            )
+            assert cur.fetchall() == [(book_id, "novel")]
+
+        _eventually(_check)
 
     def test_update_matching_nothing_reports_zero_rowcount(
         self, loaded_items, cur
@@ -294,10 +350,14 @@ class TestUpdate:
             {"new": "novel", "old": "book"},
         )
         assert acur.rowcount == 1
-        await acur.execute("SELECT id, category FROM items LIMIT 10")
-        assert sorted(await acur.fetchall()) == sorted(
-            [(book_id, "novel"), (movie_id, "movie")]
-        )
+
+        async def _check():
+            await acur.execute("SELECT id, category FROM items LIMIT 10")
+            assert sorted(await acur.fetchall()) == sorted(
+                [(book_id, "novel"), (movie_id, "movie")]
+            )
+
+        await _eventually_async(_check)
 
 
 class TestAggregate:
