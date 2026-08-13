@@ -39,6 +39,20 @@ settings.configure(
     DATABASES={"default": {"ENGINE": "milvusql_django", "NAME": ""}},
     INSTALLED_APPS=["dj_app"],
     USE_TZ=True,
+    # Django's plain `AutoField` (its own implicit default for a model
+    # with no explicit primary key, `dj_app.models.Item` included)
+    # assumes a 32-bit range (`connection.ops.integer_field_range`,
+    # confirmed directly: `(-2147483648, 2147483647)`) -- and silently
+    # short-circuits any `.filter(pk=X)`/`.get(pk=X)` whose value
+    # falls outside it to an empty result via `IntegerFieldOverflow`
+    # raising `EmptyResultSet`, *without ever issuing a query*. A real
+    # Milvus server's actual `auto_id` allocator hands out large,
+    # snowflake-style ids (confirmed directly: values like
+    # 468353823765898985, routinely ~4x10^17) that are nowhere near
+    # 32-bit range -- Milvus Lite's small sequential ids never
+    # triggered this. `BigAutoField`'s range is the full 64 bits
+    # Milvus's own ids actually live in.
+    DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
 )
 django.setup()
 
