@@ -10,7 +10,15 @@ import uuid
 
 import pytest
 from milvusql_sqlalchemy.types import VECTOR
-from sqlalchemy import BigInteger, Column, Index, MetaData, String, Table, select
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Index,
+    MetaData,
+    String,
+    Table,
+    select,
+)
 
 pytestmark = [pytest.mark.validation, pytest.mark.sqlalchemy]
 
