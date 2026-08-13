@@ -809,6 +809,61 @@ _AGG_FUNCS: dict[type[exp.Expression], str] = {
 }
 
 
+def _flatten_trivial_subquery(ast: exp.Select) -> exp.Select:
+    """Unwrap a ``FROM (SELECT ... FROM <table> [WHERE ...]) AS x``
+    that does nothing but relabel columns and (optionally) filter a
+    single real table -- exactly the shape SQLAlchemy's legacy
+    ``Query.count()``/``Query.exists()`` wrap *every* query in
+    (confirmed directly: ``session.query(Model).filter(...).count()``
+    puts the filter inside the subquery, not the outer one). Rejecting
+    every subquery outright -- correct for a genuine join, union or
+    aggregate subquery -- would also break that common, harmless idiom.
+
+    Safe because the inner and outer ``WHERE`` both restrict the same
+    rows of the same table, so they can be ANDed together against the
+    real table with no change in meaning. Only fires when the inner
+    query has no ``JOIN``/``GROUP BY``/``ORDER BY``/``LIMIT``/
+    ``DISTINCT`` of its own -- any of those would change which rows or
+    how many reach the outer query, and this function does not attempt
+    to merge that. Returns ``ast`` unchanged when there is nothing this
+    confident to flatten (including a bare ``SELECT`` with no ``FROM``
+    at all, e.g. ``SELECT EXISTS(...)`` -- :func:`_table_name` still
+    rejects that cleanly, same as every other shape left unflattened)."""
+    from_node = ast.args.get("from_")
+    if from_node is None:
+        return ast
+    from_this = from_node.this
+    if not isinstance(from_this, exp.Subquery):
+        return ast
+    inner = from_this.this
+    inner_from = (
+        inner.args.get("from_") if isinstance(inner, exp.Select) else None
+    )
+    if (
+        not isinstance(inner, exp.Select)
+        or not isinstance(inner_from, exp.From)
+        or not isinstance(inner_from.this, exp.Table)
+        or inner.args.get("joins")
+        or inner.args.get("group")
+        or inner.args.get("order")
+        or inner.args.get("limit")
+        or inner.args.get("distinct")
+    ):
+        return ast
+    flattened = ast.copy()
+    flattened.set("from_", inner_from.copy())
+    outer_where = ast.args.get("where")
+    inner_where = inner.args.get("where")
+    if inner_where is not None:
+        combined = (
+            exp.and_(outer_where.this, inner_where.this)
+            if outer_where is not None
+            else inner_where.this
+        )
+        flattened.set("where", exp.Where(this=combined))
+    return flattened
+
+
 def _table_name(ast: exp.Select) -> str:
     """The single collection a ``SELECT`` reads from.
 
@@ -819,11 +874,22 @@ def _table_name(ast: exp.Select) -> str:
     first table, as if the ``JOIN`` had never been written), and a
     subquery in ``FROM`` produced an unclear ``AttributeError`` deep in
     ``pymilvus`` instead of a clean, actionable error at translate
-    time."""
+    time. ``_flatten_trivial_subquery`` (called before this, in
+    ``_build_select``) already unwraps the one shape of subquery that
+    is safe to allow through, so anything still a ``Subquery`` here is
+    genuinely unsupported."""
     if ast.args.get("joins"):
         msg = "JOIN is not supported: Milvus has no cross-collection join"
         raise errors.NotSupportedError(msg)
-    from_this = ast.args["from_"].this
+    from_node = ast.args.get("from_")
+    if from_node is None:
+        # A bare `SELECT EXISTS(...)`/`SELECT 1` with no FROM at all --
+        # every collection-reading builder needs one. Raising cleanly
+        # here beats the raw `KeyError` a bare `ast.args["from_"]`
+        # would otherwise surface.
+        msg = "SELECT with no FROM clause is not supported"
+        raise errors.NotSupportedError(msg)
+    from_this = from_node.this
     if not isinstance(from_this, exp.Table):
         msg = (
             "SELECT ... FROM <subquery> is not supported: FROM must "
@@ -1052,6 +1118,7 @@ def _build_hybrid_search(
 
 
 def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
+    ast = _flatten_trivial_subquery(ast)
     hybrid = ast.args.get(HYBRID_ARG)
     if hybrid:
         return _build_hybrid_search(hybrid, ast, parameters)

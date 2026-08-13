@@ -26,13 +26,43 @@ class TestJoinIsRejected:
 
 
 class TestSubqueryFromIsRejected:
-    def test_subquery_in_from_raises_not_supported_error(
+    def test_subquery_with_its_own_join_raises_not_supported_error(
         self, build_call_helper
     ):
-        """Milvus has no subquery-as-source. Left unchecked, reading
-        ``.name`` off a ``Subquery`` node does not fail cleanly."""
+        """Milvus has no subquery-as-source. A subquery whose own
+        ``FROM`` isn't a single plain table (here: it has a ``JOIN``
+        of its own) is not the trivial pass-through shape
+        ``_flatten_trivial_subquery`` unwraps, so this is still
+        genuinely unsupported -- left unchecked, reading ``.name`` off
+        a ``Subquery`` node would not fail cleanly."""
         with pytest.raises(milvusql.NotSupportedError, match="subquery"):
-            build_call_helper("SELECT id FROM (SELECT id FROM items) AS sub")
+            build_call_helper(
+                "SELECT id FROM (SELECT id FROM items "
+                "JOIN other ON items.id = other.item_id) AS sub"
+            )
+
+    def test_subquery_with_its_own_limit_raises_not_supported_error(
+        self, build_call_helper
+    ):
+        """A ``LIMIT`` inside the subquery genuinely changes which
+        rows reach the outer query -- flattening it away would be
+        silently wrong, not just permissive."""
+        with pytest.raises(milvusql.NotSupportedError, match="subquery"):
+            build_call_helper(
+                "SELECT id FROM (SELECT id FROM items LIMIT 1) AS sub"
+            )
+
+    def test_no_from_clause_at_all_raises_not_supported_error(
+        self, build_call_helper
+    ):
+        """A bare ``SELECT EXISTS(...)`` (SQLAlchemy's ``Query.exists()``)
+        has no ``FROM`` at all -- every collection-reading builder
+        needs one. Left unchecked, ``ast.args["from_"]`` raised a raw
+        ``KeyError`` instead of a DBAPI exception."""
+        with pytest.raises(milvusql.NotSupportedError, match="FROM"):
+            build_call_helper(
+                "SELECT EXISTS(SELECT 1 FROM items WHERE id = 1)"
+            )
 
 
 class TestIsComparisonIsRejectedForAnythingButNull:
