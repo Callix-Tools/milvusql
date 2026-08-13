@@ -34,13 +34,25 @@ class _FakeCursor:
         return "executed_many"
 
 
+class _FakeWrapper:
+    """Stands in for ``DatabaseWrapper`` -- ``CursorWrapper`` only
+    ever calls ``_table_needs_pad_vector`` on it (to decide whether an
+    ``INSERT`` needs ``schema.PAD_VECTOR_FIELD`` spliced in). None of
+    these tests target a padded table."""
+
+    def _table_needs_pad_vector(self, table: str) -> bool:
+        return False
+
+
 def _wrap(cursor: _FakeCursor) -> CursorWrapper:
     """``CursorWrapper`` only ever calls ``.execute``/``.executemany``
     on its wrapped cursor, or delegates an unknown attribute straight
     through -- ``_FakeCursor`` satisfies that shape without being a
     real ``milvusql.dbapi.Cursor``. Same kind of understood cast
     ``test_translate.py`` uses for ``MilvusClient``."""
-    return CursorWrapper(t.cast(Database.Cursor, cursor))
+    return CursorWrapper(
+        t.cast(Database.Cursor, cursor), t.cast("t.Any", _FakeWrapper())
+    )
 
 
 class TestConvert:

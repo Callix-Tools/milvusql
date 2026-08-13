@@ -10,11 +10,32 @@ from __future__ import annotations
 import typing as t
 
 import pytest
-from milvusql_django.expressions import vector_search
+from milvusql_django.expressions import hybrid_search, vector_search
 
 from tests.integration.django.search.conftest import EMB_BOOK, Item
 
 pytestmark = [pytest.mark.integration, pytest.mark.django]
+
+
+def test_hybrid_search_returns_model_instances():
+    results = t.cast(
+        "list[t.Any]",
+        hybrid_search(Item, [("embedding", "cosine", EMB_BOOK, 1.0)], k=5),
+    )
+    assert next(r.category for r in results) == "book"
+
+
+def test_hybrid_search_applies_the_shared_filter():
+    results = t.cast(
+        "list[t.Any]",
+        hybrid_search(
+            Item,
+            [("embedding", "cosine", EMB_BOOK, 1.0)],
+            k=5,
+            category="movie",
+        ),
+    )
+    assert [(r.category, r.rank) for r in results] == [("movie", 5)]
 
 
 def test_vector_search_returns_the_nearest_row_first():

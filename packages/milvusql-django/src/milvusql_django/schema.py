@@ -33,8 +33,32 @@ import typing as t
 
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 
+from milvusql_django.fields import VectorField
+
 if t.TYPE_CHECKING:
     from django.db.models import Field
+
+#: Milvus refuses `CREATE TABLE` outright for a schema with zero vector
+#: fields (confirmed directly: `code=6, "schema has no vector field
+#: (FLOAT_VECTOR or SPARSE_FLOAT_VECTOR)"`) -- a real, hard platform
+#: requirement, not a choice this backend gets to skip. Django's own
+#: internal bookkeeping models are exactly this shape: never a vector
+#: field among them, sharpest example being
+#: `django.db.migrations.recorder.MigrationRecorder.Migration`, which
+#: `migrate` itself creates before a single user migration runs.
+#: `create_model` splices in one hidden, always-populated 1-dimensional
+#: `VECTOR(1)` column for a model that has none, named unguessably
+#: enough that it can never collide with a real field, and Django's own
+#: ORM never sees or selects it -- only `CursorWrapper`'s `INSERT`
+#: padding (`base.py`) and this module ever touch it.
+PAD_VECTOR_FIELD = "_milvusql_pad_vector"
+PAD_VECTOR_VALUE: list[float] = [0.0]
+
+
+def _needs_pad_vector(model: type[t.Any]) -> bool:
+    return not any(
+        isinstance(field, VectorField) for field in model._meta.local_fields
+    )
 
 
 class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
@@ -55,6 +79,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             self._column_definition(model, field)
             for field in model._meta.local_fields
         ]
+        if _needs_pad_vector(model):
+            dim = len(PAD_VECTOR_VALUE)
+            columns.append(
+                f"{self.quote_name(PAD_VECTOR_FIELD)} VECTOR({dim})"
+            )
         sql = self.sql_create_table % {
             "table": self.quote_name(model._meta.db_table),
             "definition": ", ".join(columns),
