@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
+from testcontainers.community.milvus import MilvusContainer
 
 # Default super-user credential documented by pymilvus itself for a
 # freshly started standalone Milvus server (root user, password
@@ -61,8 +62,6 @@ def milvus_container(request: pytest.FixtureRequest):
         yield None  # env DSN wins, no container needed
         return
 
-    from testcontainers.community.milvus import MilvusContainer
-
     with MilvusContainer(image="milvusdb/milvus:v2.6.22") as container:
         yield container
 
@@ -74,6 +73,9 @@ def milvus_remote_target(milvus_container) -> tuple[str, int]:
     ``MILVUS_VALIDATION_URI`` or a freshly started container."""
     if uri := os.getenv("MILVUS_VALIDATION_URI"):
         parts = urlsplit(uri)
+        if parts.hostname is None:
+            msg = f"MILVUS_VALIDATION_URI is missing a host: {uri!r}"
+            raise ValueError(msg)
         return parts.hostname, parts.port or 19530
     host = milvus_container.get_container_host_ip()
     port = int(milvus_container.get_exposed_port(19530))
