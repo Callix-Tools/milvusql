@@ -67,18 +67,34 @@ def _has_integration_marker(request: pytest.FixtureRequest) -> bool:
 
 def _start_milvus_container() -> MilvusContainer:
     """Starts one ``MilvusContainer``, matching Milvus's own official
-    single-container startup script (``scripts/standalone_embed.sh``),
-    which additionally passes ``--security-opt seccomp:unconfined`` --
-    ``testcontainers``' ``MilvusContainer`` does not set this by
-    default, and a restrictive default seccomp profile (as some CI
-    runners use) can make Milvus's own process abort during startup
-    with no useful message. On any startup failure, re-raise with the
-    container's own stdout/stderr attached -- the bare
-    ``RuntimeError`` a failed wait strategy raises otherwise carries an
-    empty ``Container error: .``, which is not enough to diagnose a
-    real crash from."""
-    container = MilvusContainer(image=_IMAGE).with_kwargs(
-        security_opt=["seccomp:unconfined"]
+    single-container startup script (``scripts/standalone_embed.sh``).
+
+    Two real divergences from that script, both confirmed directly
+    against this exact image/environment combination (the first via
+    CI's own crash log, the second flagged during the original
+    testcontainers research as a plausible-but-unconfirmed risk):
+
+    1. ``testcontainers``' ``MilvusContainer`` sets ``ETCD_USE_EMBED``
+       but never ``DEPLOY_MODE=STANDALONE`` -- Milvus defaults to
+       distributed mode otherwise, and distributed mode + embedded
+       etcd is an explicit, hard panic in Milvus's own startup code:
+       ``panic: embedded etcd can not be used under distributed
+       mode`` (``EtcdConfig.Init``, confirmed verbatim from a real CI
+       failure's captured container stderr). Without
+       ``DEPLOY_MODE=STANDALONE``, this container can never start.
+    2. It also never passes ``--security-opt seccomp:unconfined``,
+       which the official script does -- a restrictive default
+       seccomp profile (as some CI runners use) can make Milvus's own
+       process abort during startup with no useful message.
+
+    On any startup failure, re-raise with the container's own
+    stdout/stderr attached -- the bare ``RuntimeError`` a failed wait
+    strategy raises otherwise carries an empty ``Container error: .``,
+    which is not enough to diagnose a real crash from."""
+    container = (
+        MilvusContainer(image=_IMAGE)
+        .with_env("DEPLOY_MODE", "STANDALONE")
+        .with_kwargs(security_opt=["seccomp:unconfined"])
     )
     try:
         container.start()
