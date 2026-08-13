@@ -75,8 +75,8 @@ class TestCreateTableDDL:
             "CREATE TABLE items ( "
             "id VARCHAR(36) NOT NULL PRIMARY KEY, "
             "val VARCHAR(8), "
-            "PRIMARY KEY (id), "
-            "_milvusql_pad_vector VECTOR(2) )"
+            "_milvusql_pad_vector VECTOR(2), "
+            "PRIMARY KEY (id) )"
         )
 
     def test_no_dialect_options_omits_the_with_clause(self, dialect):
@@ -90,8 +90,8 @@ class TestCreateTableDDL:
         assert sql == (
             "CREATE TABLE items ( "
             "id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, "
-            "PRIMARY KEY (id), "
-            "_milvusql_pad_vector VECTOR(2) )"
+            "_milvusql_pad_vector VECTOR(2), "
+            "PRIMARY KEY (id) )"
         )
 
 

@@ -11,11 +11,22 @@ without it, ``MigrationContext.configure()`` raises a bare
 from __future__ import annotations
 
 import pytest
-from milvusql_sqlalchemy.padding import table_needs_pad_vector
+from milvusql_sqlalchemy.dialect import MilvusDialect
+from milvusql_sqlalchemy.padding import (
+    PAD_VECTOR_FIELD,
+    ensure_pad_vector_column,
+    table_needs_pad_vector,
+)
 from milvusql_sqlalchemy.types import SPARSEVEC, VECTOR
-from sqlalchemy import BigInteger, Column, MetaData, String, Table
+from sqlalchemy import BigInteger, Column, MetaData, String, Table, insert
+from sqlalchemy.schema import CreateTable
 
 pytestmark = [pytest.mark.unit, pytest.mark.sqlalchemy]
+
+
+@pytest.fixture
+def dialect() -> MilvusDialect:
+    return MilvusDialect()
 
 
 def test_importing_the_dialect_registers_it_with_alembic():
@@ -64,3 +75,57 @@ class TestTableNeedsPadVector:
             Column("sparse", SPARSEVEC()),
         )
         assert table_needs_pad_vector(docs) is False
+
+
+class TestPadVectorInsertion:
+    def test_create_table_includes_the_pad_column(self, dialect):
+        """Regression coverage for the actual real-server bug this
+        whole module exists to fix: an earlier version of this
+        splicing appended the pad column onto the live ``Table``
+        object *after* ``CreateTable.__init__`` had already
+        snapshotted ``element.columns`` into its own ``create.columns``
+        list -- the column reached the ``Table`` but never the
+        rendered SQL text."""
+        metadata = MetaData()
+        alembic_version = Table(
+            "alembic_version",
+            metadata,
+            Column("version_num", String(32), primary_key=True),
+        )
+        sql = str(CreateTable(alembic_version).compile(dialect=dialect))
+        assert f"{PAD_VECTOR_FIELD} VECTOR(2)" in sql
+
+    def test_insert_includes_the_pad_column_even_without_create_table(
+        self, dialect
+    ):
+        """The other real-server bug: ``Table.create(checkfirst=True)``
+        (what ``alembic.runtime.migration.MigrationContext.configure()``
+        actually calls) skips ``CREATE TABLE`` entirely once the table
+        already exists server-side -- the common case after the first
+        ``alembic upgrade`` ever run. A later ``INSERT`` against that
+        same (fresh-process) ``Table`` object, with no ``CREATE TABLE``
+        ever compiled for it in this process, still needs the pad
+        column -- confirmed here without even compiling ``CREATE
+        TABLE`` first, unlike the previous test."""
+        metadata = MetaData()
+        alembic_version = Table(
+            "alembic_version",
+            metadata,
+            Column("version_num", String(32), primary_key=True),
+        )
+        stmt = insert(alembic_version).values(version_num="0001")
+        sql = str(stmt.compile(dialect=dialect))
+        assert PAD_VECTOR_FIELD in sql
+
+    def test_is_idempotent_across_repeated_calls(self):
+        metadata = MetaData()
+        alembic_version = Table(
+            "alembic_version",
+            metadata,
+            Column("version_num", String(32), primary_key=True),
+        )
+        first = ensure_pad_vector_column(alembic_version)
+        second = ensure_pad_vector_column(alembic_version)
+        assert first is not None
+        assert second is None
+        assert list(alembic_version.columns.keys()).count(PAD_VECTOR_FIELD) == 1

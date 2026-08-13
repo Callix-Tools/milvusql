@@ -19,13 +19,10 @@ from __future__ import annotations
 import typing as t
 
 from sqlalchemy.sql import compiler
+from sqlalchemy.sql.ddl import CreateColumn
 
 from milvusql_sqlalchemy.hybrid import HybridSearchClause
-from milvusql_sqlalchemy.padding import (
-    PAD_VECTOR_DIM,
-    PAD_VECTOR_FIELD,
-    table_needs_pad_vector,
-)
+from milvusql_sqlalchemy.padding import ensure_pad_vector_column
 
 if t.TYPE_CHECKING:
     from sqlalchemy.sql.schema import Table
@@ -87,27 +84,21 @@ class MilvusDDLCompiler(compiler.DDLCompiler):
         )
 
     def visit_create_table(self, create: t.Any, **kw: t.Any) -> str:
-        text = super().visit_create_table(create, **kw)
-        table = create.element
-        if not table_needs_pad_vector(table):
-            return text
         # Milvus refuses `CREATE TABLE`/`create_collection()` outright
         # for a schema with zero vector fields -- see `padding.py`'s
         # module docstring for why this table (chiefly Alembic's own
         # `alembic_version` bookkeeping table, which has none) needs a
-        # hidden pad column spliced in. The base compiler always closes
-        # the column list with the literal two-character sequence
-        # "\n)" immediately before its own `post_create_table()`
-        # suffix (verified directly against `DDLCompiler.
-        # visit_create_table`'s source: every column/constraint line
-        # it writes has no leading newline before its own trailing
-        # paren, e.g. `VECTOR(8)`, so that exact sequence appears
-        # nowhere earlier in the rendered text) -- splicing a new
-        # column in right there needs no column-list reimplementation.
-        quoted = self.preparer.quote(PAD_VECTOR_FIELD)
-        pad_column = f", \n\t{quoted} VECTOR({PAD_VECTOR_DIM})"
-        index = text.rindex("\n)")
-        return text[:index] + pad_column + text[index:]
+        # hidden pad column. `create.columns` (the `CreateColumn` list
+        # the base compiler actually iterates) was already snapshotted
+        # from `create.element.columns` when this `CreateTable`
+        # construct was built, before this ever runs -- appending onto
+        # the live `Table` alone wouldn't reach the rendered text, so
+        # the matching `CreateColumn` gets spliced into `create.columns`
+        # directly too.
+        pad_column = ensure_pad_vector_column(create.element)
+        if pad_column is not None:
+            create.columns.append(CreateColumn(pad_column))
+        return super().visit_create_table(create, **kw)
 
     def visit_create_index(
         self,
@@ -136,6 +127,32 @@ class MilvusSQLCompiler(compiler.SQLCompiler):
     MilvusQL untouched; the two overrides below exist only for
     ``hybrid.py``'s ``HYBRID SEARCH`` construct (D3), which has no
     equivalent in any base SQL dialect this compiler could inherit."""
+
+    def visit_insert(
+        self,
+        insert_stmt: t.Any,
+        visited_bindparam: t.Any = None,
+        visiting_cte: t.Any = None,
+        **kw: t.Any,
+    ) -> str:
+        # See `padding.py`'s module docstring for why this has to
+        # happen here too, not just in `MilvusDDLCompiler.
+        # visit_create_table`: `Table.create(checkfirst=True)` (what
+        # `alembic.runtime.migration.MigrationContext.configure()`
+        # actually calls) skips the `CREATE TABLE` compile entirely
+        # once the table already exists server-side -- the common case
+        # after the first `alembic upgrade` ever run against a given
+        # database -- so a later `INSERT` against that same table (a
+        # fresh Python `Table` object in a fresh process, e.g. every
+        # subsequent `alembic upgrade`'s own version-stamp insert)
+        # would otherwise never get the hidden pad column at all.
+        ensure_pad_vector_column(insert_stmt.table)
+        return super().visit_insert(
+            insert_stmt,
+            visited_bindparam=visited_bindparam,
+            visiting_cte=visiting_cte,
+            **kw,
+        )
 
     def visit_milvus_search_arm(self, arm: SearchArm, **kw: t.Any) -> str:
         return f"{self.process(arm.distance, **kw)} WEIGHT {arm.weight}"
