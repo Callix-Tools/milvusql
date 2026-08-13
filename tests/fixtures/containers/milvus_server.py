@@ -46,6 +46,11 @@ import pytest
 from filelock import FileLock
 from pymilvus import MilvusClient
 from testcontainers.community.milvus import MilvusContainer
+from testcontainers.core.wait_strategies import (
+    CompositeWaitStrategy,
+    HttpWaitStrategy,
+    LogMessageWaitStrategy,
+)
 
 # Default super-user credential documented by pymilvus itself for a
 # freshly started standalone Milvus server (root user, password
@@ -66,10 +71,9 @@ def _start_milvus_container() -> MilvusContainer:
     """Starts one ``MilvusContainer``, matching Milvus's own official
     single-container startup script (``scripts/standalone_embed.sh``).
 
-    Two real divergences from that script, both confirmed directly
-    against this exact image/environment combination (the first via
-    CI's own crash log, the second flagged during the original
-    testcontainers research as a plausible-but-unconfirmed risk):
+    Three real divergences from that script/from a normal dev machine,
+    each confirmed directly against this exact image/environment
+    combination via successive real CI failures:
 
     1. ``testcontainers``' ``MilvusContainer`` sets ``ETCD_USE_EMBED``
        but never ``DEPLOY_MODE=STANDALONE`` -- Milvus defaults to
@@ -83,6 +87,14 @@ def _start_milvus_container() -> MilvusContainer:
        which the official script does -- a restrictive default
        seccomp profile (as some CI runners use) can make Milvus's own
        process abort during startup with no useful message.
+    3. ``MilvusContainer``'s own default wait-strategy timeout
+       (``testcontainers_config.timeout``, 120s) is too short on a
+       CPU-constrained CI runner -- confirmed directly: a real CI run
+       took well over 120s to emit ``"Welcome to use Milvus!"`` even
+       after fixes 1-2 let the process actually start, timing out
+       repeatedly. Milvus's own compose healthcheck already budgets a
+       90s ``start_period``; 300s here is a deliberately generous
+       margin over that on top of a slower, shared CI CPU.
 
     On any startup failure, re-raise with the container's own
     stdout/stderr attached -- the bare ``RuntimeError`` a failed wait
@@ -92,6 +104,12 @@ def _start_milvus_container() -> MilvusContainer:
         MilvusContainer(image=_IMAGE)
         .with_env("DEPLOY_MODE", "STANDALONE")
         .with_kwargs(security_opt=["seccomp:unconfined"])
+    )
+    container.waiting_for(
+        CompositeWaitStrategy(
+            LogMessageWaitStrategy("Welcome to use Milvus!"),
+            HttpWaitStrategy(container.healthcheck_port, "/healthz"),
+        ).with_startup_timeout(300)
     )
     try:
         container.start()
