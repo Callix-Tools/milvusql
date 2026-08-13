@@ -37,6 +37,41 @@ class TestSelectFilterQuery:
         )
         assert call.kwargs["filter"] == 'not ((category == "book"))'
 
+    def test_in_renders_as_milvus_native_in_list_syntax(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            'SELECT id FROM items WHERE "id" IN (:a, :b, :c) LIMIT 5',
+            {"a": 1, "b": 2, "c": 3},
+        )
+        assert call.kwargs["filter"] == "id in [1, 2, 3]"
+
+    def test_not_in_renders_via_the_shared_not_wrapper(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            'SELECT id FROM items WHERE "id" NOT IN (:a, :b) LIMIT 5',
+            {"a": 1, "b": 2},
+        )
+        assert call.kwargs["filter"] == "not (id in [1, 2])"
+
+    def test_an_empty_in_list_matches_nothing(self, build_call_helper):
+        call = build_call_helper(
+            'SELECT id FROM items WHERE "id" IN () LIMIT 5'
+        )
+        assert call.kwargs["filter"] == "false"
+
+    def test_no_limit_clause_falls_back_to_milvus_own_ceiling(
+        self, build_call_helper
+    ):
+        """A bare ``Model.objects.all()`` compiles to no ``LIMIT`` at
+        all (confirmed against ``DatabaseOperations.no_limit_value()``
+        returning ``None``) -- this used to silently cap at an
+        arbitrary ``10``, now it falls back to Milvus's own per-call
+        ceiling instead."""
+        call = build_call_helper("SELECT id FROM items")
+        assert call.kwargs["limit"] == 16384
+
     def test_limit_resolves_a_bound_parameter_not_just_a_literal(
         self, build_call_helper
     ):

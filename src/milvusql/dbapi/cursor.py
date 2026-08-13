@@ -14,7 +14,7 @@ from sqlglot.errors import SqlglotError
 
 from milvusql._shared import CONSISTENCY_AWARE_METHODS, parse_cached
 from milvusql.dbapi import errors
-from milvusql.translate.ast_to_pymilvus import build_call
+from milvusql.translate.ast_to_pymilvus import Call, build_call
 
 if t.TYPE_CHECKING:
     from milvusql.dbapi.connection import Connection
@@ -45,6 +45,16 @@ class Cursor:
     def close(self) -> None:
         self.closed = True
 
+    def _invoke(self, call: Call) -> t.Any:  # noqa: ANN401 -- a raw pymilvus response is genuinely any shape
+        default_level = self.connection.consistency_level
+        if (
+            default_level is not None
+            and call.method in CONSISTENCY_AWARE_METHODS
+            and "consistency_level" not in call.kwargs
+        ):
+            call.kwargs["consistency_level"] = default_level
+        return getattr(self.connection._client, call.method)(**call.kwargs)
+
     def execute(
         self, operation: str, parameters: dict[str, t.Any] | None = None
     ) -> Cursor:
@@ -53,14 +63,17 @@ class Cursor:
         try:
             ast = parse_cached(operation)
             call = build_call(self.connection._client, ast, bound)
-            default_level = self.connection.consistency_level
-            if (
-                default_level is not None
-                and call.method in CONSISTENCY_AWARE_METHODS
-                and "consistency_level" not in call.kwargs
-            ):
-                call.kwargs["consistency_level"] = default_level
-            raw = getattr(self.connection._client, call.method)(**call.kwargs)
+            raw = self._invoke(call)
+            # `Call.then` drives a statement that needs a second RPC
+            # (UPDATE: read, then upsert -- see `Call`'s docstring).
+            # Most statements never set it, so this loop runs zero
+            # times for them.
+            while call.then is not None:
+                next_call = call.then(raw)
+                if next_call is None:
+                    break
+                call = next_call
+                raw = self._invoke(call)
             rows, description, rowcount, lastrowid = call.postprocess(raw)
         except (SqlglotError, MilvusException, grpc.RpcError) as exc:
             raise errors.translate(exc) from exc

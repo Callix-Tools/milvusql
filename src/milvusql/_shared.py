@@ -22,8 +22,8 @@ def parse_cached(sql: str) -> exp.Expression:
     return sqlglot.parse_one(sql, read="milvus")
 
 
-#: ``search``/``query`` are the only calls that read a request-level
-#: consistency level; DDL and mutations don't take one.
-CONSISTENCY_AWARE_METHODS = ("search", "query")
+#: ``search``/``query``/``hybrid_search`` are the only calls that read
+#: a request-level consistency level; DDL and mutations don't take one.
+CONSISTENCY_AWARE_METHODS = ("search", "query", "hybrid_search")
 
 __all__ = ["CONSISTENCY_AWARE_METHODS", "parse_cached"]

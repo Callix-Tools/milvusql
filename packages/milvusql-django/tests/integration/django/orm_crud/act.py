@@ -11,6 +11,7 @@ import typing as t
 
 import pytest
 from dj_app.models import Item as _Item
+from django.db.models import Sum
 
 pytestmark = [pytest.mark.integration, pytest.mark.django]
 
@@ -63,3 +64,48 @@ class TestFilterLookups:
     def test_lte(self):
         ranks = Item.objects.filter(rank__lte=5).values_list("rank", flat=True)
         assert sorted(ranks) == [1, 5]
+
+    def test_in(self):
+        ranks = Item.objects.filter(rank__in=[1, 10]).values_list(
+            "rank", flat=True
+        )
+        assert sorted(ranks) == [1, 10]
+
+    def test_order_by(self):
+        assert list(
+            Item.objects.order_by("-rank").values_list("rank", flat=True)
+        ) == [10, 5, 1]
+
+    def test_count(self):
+        assert Item.objects.count() == 3
+        assert Item.objects.filter(category="book").count() == 1
+
+    def test_aggregate_sum(self):
+        assert Item.objects.aggregate(total=Sum("rank")) == {"total": 16}
+
+
+class TestMutation:
+    @pytest.fixture(autouse=True)
+    def _seed(self, loaded_items):
+        self.book = Item.objects.create(
+            category="book", rank=1, embedding=[0.1] * 8
+        )
+        Item.objects.create(category="movie", rank=5, embedding=[0.9] * 8)
+
+    def test_instance_save_updates_an_existing_row(self):
+        self.book.rank = 99
+        self.book.save()
+        assert Item.objects.get(pk=self.book.pk).rank == 99
+        # The row wasn't duplicated -- an upsert-by-pk, not an insert.
+        assert Item.objects.count() == 2
+
+    def test_queryset_update_changes_only_matching_rows(self):
+        Item.objects.filter(category="book").update(rank=42)
+        assert Item.objects.get(pk=self.book.pk).rank == 42
+        assert Item.objects.filter(category="movie").get().rank == 5
+
+    def test_instance_delete_removes_only_that_row(self):
+        self.book.delete()
+        assert list(Item.objects.values_list("category", flat=True)) == [
+            "movie"
+        ]

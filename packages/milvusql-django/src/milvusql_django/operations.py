@@ -3,12 +3,31 @@ generation needs filled in to target MilvusQL text."""
 
 from __future__ import annotations
 
+import decimal
 import typing as t
 
 from django.db.backends.base.operations import BaseDatabaseOperations
+from django.db.backends.utils import format_number
 
 
 class DatabaseOperations(BaseDatabaseOperations):
+    def adapt_decimalfield_value(
+        self,
+        value: decimal.Decimal | float | str | None,
+        max_digits: int | None = None,
+        decimal_places: int | None = None,
+    ) -> str | None:
+        """The base implementation returns ``value`` unchanged -- fine
+        for a driver like psycopg2/mysqlclient that accepts a
+        ``decimal.Decimal`` natively, but ``milvusql``'s DBAPI binds
+        straight into a Milvus ``VARCHAR`` field (``DecimalField`` has
+        no native Milvus type -- see ``data_types``), which needs the
+        formatted string ``format_number`` produces, not a ``Decimal``
+        object Milvus's client can't serialize."""
+        if value is None:
+            return None
+        return format_number(value, max_digits, decimal_places)
+
     def quote_name(self, name: str) -> str:
         if name.startswith('"') and name.endswith('"'):
             return name

@@ -22,7 +22,7 @@ from sqlglot.errors import SqlglotError
 
 from milvusql._shared import CONSISTENCY_AWARE_METHODS, parse_cached
 from milvusql.dbapi import errors
-from milvusql.translate.ast_to_pymilvus import build_call
+from milvusql.translate.ast_to_pymilvus import Call, build_call
 
 
 class AsyncCursor:
@@ -57,6 +57,18 @@ class AsyncCursor:
     async def __aexit__(self, *exc_info: object) -> None:
         await self.close()
 
+    async def _invoke(self, call: Call) -> t.Any:  # noqa: ANN401 -- a raw pymilvus response is genuinely any shape
+        default_level = self.connection.consistency_level
+        if (
+            default_level is not None
+            and call.method in CONSISTENCY_AWARE_METHODS
+            and "consistency_level" not in call.kwargs
+        ):
+            call.kwargs["consistency_level"] = default_level
+        return await getattr(self.connection._client, call.method)(
+            **call.kwargs
+        )
+
     async def execute(
         self, operation: str, parameters: dict[str, t.Any] | None = None
     ) -> AsyncCursor:
@@ -65,16 +77,15 @@ class AsyncCursor:
         try:
             ast = parse_cached(operation)
             call = build_call(self.connection._client, ast, bound)
-            default_level = self.connection.consistency_level
-            if (
-                default_level is not None
-                and call.method in CONSISTENCY_AWARE_METHODS
-                and "consistency_level" not in call.kwargs
-            ):
-                call.kwargs["consistency_level"] = default_level
-            raw = await getattr(self.connection._client, call.method)(
-                **call.kwargs
-            )
+            raw = await self._invoke(call)
+            # See `Cursor.execute` (sync): `Call.then` drives UPDATE's
+            # second RPC. A no-op loop for every other statement.
+            while call.then is not None:
+                next_call = call.then(raw)
+                if next_call is None:
+                    break
+                call = next_call
+                raw = await self._invoke(call)
             rows, description, rowcount, lastrowid = call.postprocess(raw)
         except (SqlglotError, MilvusException, grpc.RpcError) as exc:
             raise errors.translate(exc) from exc
