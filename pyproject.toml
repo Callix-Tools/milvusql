@@ -82,6 +82,14 @@ lint = [
     "ty~=0.0.70",
 ]
 test = [
+    # Cross-process lock so only ONE pytest-xdist worker starts the
+    # shared Milvus testcontainer per session -- the standard pattern
+    # (see pytest-xdist's own docs) for a session fixture that must run
+    # exactly once across every worker, not once per worker. Without
+    # this, `-n auto`/`CONCURRENCY>1` starts one full Milvus standalone
+    # container (4 CPU/8GB recommended each) per worker concurrently,
+    # which reliably OOM-aborts on a normal CI runner.
+    "filelock>=3.15",
     "greenlet>=3.5.5",
     # Not used to back any *integration* test anymore (those all run
     # against a real, testcontainers-provisioned Milvus server) -- kept

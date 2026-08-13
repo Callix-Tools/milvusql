@@ -10,19 +10,26 @@ test body:
   is started. Expected shape: a full ``http://host:port`` URI (same
   shape ``milvusql.connect(uri=...)``/``MilvusClient(uri=...)``
   accept).
-* otherwise -> a ``testcontainers`` ``MilvusContainer`` is started,
-  scoped to the pytest session (so, under ``pytest-xdist``, each
-  worker gets its own container -- ``MilvusContainer`` binds to a
-  random free host port, so no manual per-worker port bookkeeping is
-  needed the way it would be for e.g. Postgres).
+* otherwise -> a ``testcontainers`` ``MilvusContainer`` is started --
+  exactly ONE for the whole test session, not one per pytest-xdist
+  worker: Milvus standalone's own recommended minimum is 4 CPU/8GB
+  RAM, so one container per worker (``-n auto``/``CONCURRENCY>1``)
+  starts several full Milvus instances competing for the same CI
+  runner's resources at once, which reliably OOM-aborts (confirmed
+  directly: ``exit code 134``/SIGABRT under `CONCURRENCY=4`). Only the
+  first worker to grab a ``filelock`` actually starts the container;
+  every other worker reads its host/port back from a small JSON file
+  in the base tmp dir all workers share (the standard pytest-xdist
+  "run a session fixture exactly once" recipe) -- see
+  ``milvus_container``/``_container_info_file``.
 
-The container (or env-provided server) is shared by every test in one
-worker process. Isolation across workers is a Milvus *database* named
-after the worker id (``test_gw0``, ``test_gw1``, ..., ``test_master``
-when not running under ``-n``); isolation across tests *within* one
-worker's database is a per-test collection-drop teardown, since
-Milvus Lite's old "fresh on-disk file per test" trick no longer
-applies to a real, shared server.
+The one container (or env-provided server) is shared by every worker.
+Isolation across workers is a Milvus *database* named after the worker
+id (``test_gw0``, ``test_gw1``, ..., ``test_master`` when not running
+under ``-n``); isolation across tests *within* one worker's database
+is a per-test collection-drop teardown, since Milvus Lite's old "fresh
+on-disk file per test" trick no longer applies to a real, shared
+server.
 
 Either way, the container is only ever started when a collected test
 actually carries ``@pytest.mark.integration`` -- a plain
@@ -31,10 +38,12 @@ actually carries ``@pytest.mark.integration`` -- a plain
 
 from __future__ import annotations
 
+import json
 import os
 from urllib.parse import urlsplit
 
 import pytest
+from filelock import FileLock
 from pymilvus import MilvusClient
 from testcontainers.community.milvus import MilvusContainer
 
@@ -42,6 +51,8 @@ from testcontainers.community.milvus import MilvusContainer
 # freshly started standalone Milvus server (root user, password
 # "Milvus") -- not a secret, just the well-known out-of-the-box login.
 _ROOT_TOKEN = "root:Milvus"  # nosec B105 -- well-known default, not a secret
+
+_IMAGE = "milvusdb/milvus:v2.6.22"
 
 
 def _has_integration_marker(request: pytest.FixtureRequest) -> bool:
@@ -51,13 +62,42 @@ def _has_integration_marker(request: pytest.FixtureRequest) -> bool:
     )
 
 
+def _container_info_file(tmp_path_factory: pytest.TempPathFactory):
+    """Path to the small JSON file every pytest-xdist worker shares
+    (``tmp_path_factory.getbasetemp().parent`` is the base tmp dir
+    common to all workers, unlike ``getbasetemp()`` itself, which is
+    already per-worker) -- whoever writes ``{"host":..., "port":...}``
+    here first is the one worker that actually started the container.
+    A plain function, not a fixture: it must be safe to call from
+    inside an already-gated branch (``MILVUS_TEST_URI`` set, or no
+    ``integration`` test collected) without ever touching Docker --
+    declaring it as a fixture dependency instead would make pytest
+    resolve it unconditionally, defeating that gating entirely."""
+    root_tmp_dir = tmp_path_factory.getbasetemp().parent
+    return root_tmp_dir / "milvus_container_target.json"
+
+
 @pytest.fixture(scope="session")
-def milvus_container(request: pytest.FixtureRequest):
-    """Starts a real Milvus server via ``testcontainers`` -- but only
-    when the collected run actually needs one. Yields ``None`` when no
-    ``integration`` test was collected, or when ``MILVUS_TEST_URI``
-    already points at a server to use instead: in both cases
-    ``milvus_uri`` below is what tests/fixtures actually consult."""
+def milvus_container(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+):
+    """Starts the ONE Milvus container for this whole test session --
+    not one per pytest-xdist worker: Milvus standalone's own
+    recommended minimum is 4 CPU/8GB RAM, so one container per worker
+    (``-n auto``/``CONCURRENCY>1``) starts several full Milvus
+    instances competing for the same CI runner's resources at once,
+    which reliably OOM-aborts (confirmed directly: ``exit code
+    134``/SIGABRT under `CONCURRENCY=4`). Only the first worker to grab
+    a ``filelock`` on ``_container_info_file`` actually starts it and
+    writes its host/port there (the standard pytest-xdist "run a
+    session fixture exactly once" recipe); every other worker just
+    reads that file back via ``milvus_uri`` below, without holding the
+    lock while waiting on the container's own ~90s startup.
+
+    Yields ``None`` when no ``integration`` test was collected, or
+    when ``MILVUS_TEST_URI`` already points at a server to use
+    instead -- in both cases nothing here ever touches Docker or
+    ``tmp_path_factory``'s shared file."""
     if not _has_integration_marker(request):
         yield None
         return
@@ -65,24 +105,47 @@ def milvus_container(request: pytest.FixtureRequest):
         yield None  # env DSN wins, no container needed
         return
 
-    with MilvusContainer(image="milvusdb/milvus:v2.6.22") as container:
-        yield container
+    info_file = _container_info_file(tmp_path_factory)
+    owned_container = None
+    with FileLock(str(info_file) + ".lock"):
+        if not info_file.is_file():
+            owned_container = MilvusContainer(image=_IMAGE)
+            owned_container.start()
+            info_file.write_text(
+                json.dumps(
+                    {
+                        "host": owned_container.get_container_host_ip(),
+                        "port": int(owned_container.get_exposed_port(19530)),
+                    }
+                )
+            )
+    try:
+        yield owned_container
+    finally:
+        if owned_container:
+            owned_container.stop()
 
 
 @pytest.fixture(scope="session")
-def milvus_uri(milvus_container) -> str:
+def milvus_uri(
+    milvus_container, tmp_path_factory: pytest.TempPathFactory
+) -> str:
     """Resolves to the ``http://host:port`` URI of the real Milvus
     server to test against, regardless of whether it came from
-    ``MILVUS_TEST_URI`` or a freshly started container."""
+    ``MILVUS_TEST_URI`` or the one shared container. Depends on
+    ``milvus_container`` (even though it doesn't use its value) purely
+    for fixture-resolution ordering -- the container must actually be
+    started before any URI pointing at it is handed out; by then,
+    ``_container_info_file`` is guaranteed to exist, whether this
+    worker wrote it or another one did."""
     if uri := os.getenv("MILVUS_TEST_URI"):
         parts = urlsplit(uri)
         if parts.hostname is None:
             msg = f"MILVUS_TEST_URI is missing a host: {uri!r}"
             raise ValueError(msg)
         return uri
-    host = milvus_container.get_container_host_ip()
-    port = milvus_container.get_exposed_port(19530)
-    return f"http://{host}:{port}"
+    data = json.loads(_container_info_file(tmp_path_factory).read_text())
+    return f"http://{data['host']}:{data['port']}"
 
 
 @pytest.fixture(scope="session")
