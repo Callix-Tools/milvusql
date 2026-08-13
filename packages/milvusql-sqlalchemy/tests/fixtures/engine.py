@@ -60,7 +60,16 @@ def seeded_engine(engine):
         Column("category", String(64)),
         Column("embedding", VECTOR(8)),
         milvusql_shards=1,
-        milvusql_consistency_level="Bounded",
+        # 'Strong', not the more realistic 'Bounded': against a real
+        # (non-Lite) server, 'Bounded' permits exactly the staleness
+        # window its name promises, so a query issued immediately
+        # after an insert in the same test can legitimately not see
+        # it yet -- confirmed directly, this collection used to say
+        # 'Bounded' and every test relying on read-your-writes
+        # intermittently got an empty/stale result against a real
+        # server (never observable against Milvus Lite, which has no
+        # replication lag to be inconsistent about).
+        milvusql_consistency_level="Strong",
     )
     metadata.create_all(engine)
     Index(

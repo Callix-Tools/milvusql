@@ -53,13 +53,19 @@ if t.TYPE_CHECKING:
 #: field among them, sharpest example being
 #: `django.db.migrations.recorder.MigrationRecorder.Migration`, which
 #: `migrate` itself creates before a single user migration runs.
-#: `create_model` splices in one hidden, always-populated 1-dimensional
-#: `VECTOR(1)` column for a model that has none, named unguessably
-#: enough that it can never collide with a real field, and Django's own
-#: ORM never sees or selects it -- only `CursorWrapper`'s `INSERT`
-#: padding (`base.py`) and this module ever touch it.
+#: `create_model` splices in one hidden, always-populated `VECTOR(2)`
+#: column for a model that has none, named unguessably enough that it
+#: can never collide with a real field, and Django's own ORM never
+#: sees or selects it -- only `CursorWrapper`'s `INSERT` padding
+#: (`base.py`) and this module ever touch it. Dimension 2, not 1: a
+#: real (non-Lite) Milvus server enforces its own documented minimum
+#: vector dimension of 2 and rejects `dim=1` with `code=1100,
+#: "invalid dimension: 1. should be in range 2 ~ 32768"` -- Milvus
+#: Lite silently accepted a 1-dimensional vector with no such
+#: validation, which is what let this go unnoticed until tested
+#: against a real server.
 PAD_VECTOR_FIELD = "_milvusql_pad_vector"
-PAD_VECTOR_VALUE: list[float] = [0.0]
+PAD_VECTOR_VALUE: list[float] = [0.0, 0.0]
 
 
 def _needs_pad_vector(model: type[t.Any]) -> bool:

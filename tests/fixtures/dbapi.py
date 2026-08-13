@@ -14,12 +14,22 @@ import pytest
 import milvusql
 from milvusql import aio
 
+#: ``consistency_level='Strong'``, not the more realistic 'Bounded':
+#: against a real (non-Lite) server, 'Bounded' permits exactly the
+#: staleness window its name promises, so a query issued immediately
+#: after an insert/update/delete in the same test can legitimately not
+#: see it yet -- confirmed directly, this collection used to say
+#: 'Bounded' and every test relying on read-your-writes intermittently
+#: got an empty/stale result against a real server (never observable
+#: against Milvus Lite, which has no replication lag to be inconsistent
+#: about). 'Strong' trades that latency for the read-your-writes
+#: guarantee these tests actually depend on.
 CREATE_ITEMS = (
     "CREATE TABLE items ("
     "id BIGINT PRIMARY KEY AUTO_INCREMENT, "
     "embedding VECTOR(8), "
     "category VARCHAR(64)"
-    ") WITH (shards=1, consistency_level='Bounded')"
+    ") WITH (shards=1, consistency_level='Strong')"
 )
 CREATE_ITEMS_INDEX = (
     "CREATE INDEX idx_emb ON items (embedding) USING HNSW "

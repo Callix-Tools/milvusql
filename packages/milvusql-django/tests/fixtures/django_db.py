@@ -37,6 +37,19 @@ def connection(milvus_server_target, milvus_db_name, _milvus_worker_cleanup):
     connections.databases["default"]["NAME"] = milvus_db_name
     connections.databases["default"]["USER"] = "root"
     connections.databases["default"]["PASSWORD"] = "Milvus"
+    # 'Strong', not Milvus's own 'Bounded' default: against a real
+    # (non-Lite) server, 'Bounded' permits exactly the staleness
+    # window its name promises, so an ORM query issued immediately
+    # after a create/update in the same test can legitimately not see
+    # it yet -- confirmed directly against a real server (never
+    # observable against Milvus Lite, which has no replication lag to
+    # be inconsistent about). `base.py`'s `get_connection_params`
+    # merges `OPTIONS` straight into `milvusql.dbapi.connect()`'s
+    # kwargs, so this becomes the connection-level consistency
+    # fallback every query without its own gets.
+    connections.databases["default"]["OPTIONS"] = {
+        "consistency_level": "Strong"
+    }
     return connections["default"]
 
 

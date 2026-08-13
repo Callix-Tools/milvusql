@@ -11,6 +11,7 @@ import typing as t
 
 import pytest
 from dj_app.models import Item as _Item
+from django.db import models
 from django.db.models import Sum
 
 pytestmark = [pytest.mark.integration, pytest.mark.django]
@@ -32,6 +33,29 @@ def test_vector_field_round_trips_through_the_orm(loaded_items):
     assert fetched.category == "book"
     assert fetched.rank == 1
     assert fetched.embedding == pytest.approx([0.1] * 8, abs=1e-6)
+
+
+def test_add_field_succeeds_against_a_real_collection(loaded_items):
+    """Against Milvus Lite, this always raised ``NotSupportedError``
+    -- ``add_collection_field`` returns ``UNIMPLEMENTED`` from Lite's
+    own gRPC server (a raw ``grpc.RpcError``, not even a
+    ``MilvusException``), which ``milvusql``'s error translation maps
+    to ``NotSupportedError``. A real Milvus server *does* implement
+    ``AddCollectionField`` -- confirmed directly: the identical
+    ``editor.add_field()`` call that always raised against Lite now
+    succeeds outright here, and the new field is immediately visible
+    through reflection."""
+    tag = models.CharField(max_length=16, null=True)
+    tag.set_attributes_from_name("tag")
+    with loaded_items.schema_editor() as editor:
+        editor.add_field(Item, tag)
+    columns = {
+        col.name
+        for col in loaded_items.introspection.get_table_description(
+            loaded_items.cursor(), Item._meta.db_table
+        )
+    }
+    assert "tag" in columns
 
 
 class TestFilterLookups:
