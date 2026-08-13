@@ -22,10 +22,6 @@ _client = t.cast("MilvusClient", MilvusClient)
 
 
 class TestUnsupportedStatements:
-    def test_alter_table_raises_not_supported_error(self, build_call_helper):
-        with pytest.raises(milvusql.NotSupportedError, match="ALTER"):
-            build_call_helper("ALTER TABLE items ADD FIELD extra INT")
-
     def test_statement_type_outside_the_dispatch_table_raises(self):
         """A synthetic AST node, not something the milvus grammar
         could ever parse to -- exercises ``build_call``'s final

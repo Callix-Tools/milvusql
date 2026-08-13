@@ -10,11 +10,18 @@ else -- so this hand-writes the small column-list builder it actually
 needs instead of fighting the generic one.
 
 **What works**: ``CreateModel`` (a model with scalar fields + one or
-more ``VectorField``s), ``AddField``. **What deliberately raises**:
-``RemoveField``, ``AlterField`` -- Milvus cannot do either (same
-reasoning as ``sqlglot-milvus``'s own ``ALTER TABLE`` rejection), so
-this fails loudly at migration time rather than silently producing a
-migration that doesn't match reality.
+more ``VectorField``s), ``AddField`` -- against a real Milvus server.
+Milvus Lite's gRPC server does not implement ``AddCollectionField``
+(confirmed directly: a raw ``grpc.RpcError`` with ``UNIMPLEMENTED``,
+not even a ``MilvusException``), so ``AddField`` still raises against
+the embedded server this workspace's integration suite runs on -- see
+``test_add_field_raises_not_supported_against_a_real_collection`` --
+even though ``milvusql`` core's ``ALTER TABLE`` dispatch now wires it
+through correctly. **What deliberately raises**: ``RemoveField``,
+``AlterField`` -- Milvus cannot do either (same reasoning as
+``sqlglot-milvus``'s own ``ALTER TABLE`` rejection), so this fails
+loudly at migration time rather than silently producing a migration
+that doesn't match reality.
 
 **What this does NOT do**: automatically create a vector index or
 ``LOAD`` the collection after ``CreateModel`` -- Milvus requires an
