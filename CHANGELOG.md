@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-08-14
+### Testing
+
+- test: migrate all integration tests to testcontainers Milvus; fix ADD COLUMN and reflected nullable by @Neko1313 in [#5](https://github.com/Callix-Tools/milvusql/pull/5)
+
+
+
+
+**Full Changelog**: https://github.com/Callix-Tools/milvusql/compare/v0.1.2...v0.1.3
 ## [0.1.2] - 2026-08-13
 ### Bug Fixes
 
