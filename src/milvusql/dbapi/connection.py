@@ -26,6 +26,19 @@ class Connection:
         self._client = MilvusClient(**client_kwargs)
         self.consistency_level = consistency_level
         self.closed = False
+        #: Collections this connection has already loaded, so
+        #: ``Cursor._invoke`` (D2 revised: auto-``LOAD``) only pays for
+        #: a real ``load_collection`` RPC once per collection instead
+        #: of once per ``search``/``query``/``hybrid_search`` call.
+        #: Deliberately connection-scoped, not process- or
+        #: server-scoped: Milvus's own load state lives on the server
+        #: (or, for Milvus Lite, in the embedded process), so a second
+        #: ``Connection`` -- another pooled DBAPI connection, another
+        #: process -- can't see this cache and will (harmlessly) issue
+        #: its own first ``load_collection``, which is why the RPC
+        #: itself still has to be idempotent and cheap on a hit,
+        #: confirmed directly (~1s cold, ~2ms once already loaded).
+        self._loaded_collections: set[str] = set()
 
     def cursor(self) -> Cursor:
         if self.closed:

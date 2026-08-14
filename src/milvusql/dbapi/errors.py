@@ -90,9 +90,22 @@ _PROGRAMMING_TYPES = (
 )
 
 #: Milvus reports "collection not loaded" as a plain ``MilvusException``
-#: with no dedicated subclass (see D2: no implicit ``LOAD TABLE``).
-#: Matched on message text since the server gives us nothing more
-#: specific to isinstance-check.
+#: with no dedicated subclass. Matched on message text since the
+#: server gives us nothing more specific to isinstance-check.
+#:
+#: D2 revised: ``Cursor``/``AsyncCursor`` now auto-``LOAD`` a
+#: collection the first time a connection runs
+#: ``search``/``query``/``hybrid_search`` against it (see
+#: ``_shared.CONSISTENCY_AWARE_METHODS`` and
+#: ``Connection._loaded_collections``), so this marker should be rare
+#: in practice. It still fires for real: a bare ``MilvusClient`` call
+#: that bypasses this DBAPI layer can release a collection out from
+#: under a connection's cache, and auto-LOAD itself can legitimately
+#: fail this way (no index yet, collection dropped concurrently) --
+#: this mapping is what turns that failure into a ``ProgrammingError``
+#: instead of a bare ``DatabaseError``. Explicit ``LOAD TABLE`` is
+#: still available for callers who want to control replica count or
+#: warm a collection up ahead of traffic.
 _NOT_LOADED_MARKER = "not loaded"
 
 #: Server-reported "doesn't exist" errors come back as a plain

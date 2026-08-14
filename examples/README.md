@@ -2,7 +2,10 @@
 
 Small, runnable programs showing how to use the `milvusql` DBAPI outside of
 the test suite. Each subdirectory is standalone: its own `README.md` and
-`requirements.txt`, no shared code to chase across directories.
+`pyproject.toml` (a `uv` workspace member — `uv run src/<script>.py` from
+inside it), no shared application code to chase across directories. The
+Milvus infra those that need a real server bring up via Docker Compose *is*
+shared, from [`example_infra/`](../example_infra).
 
 | Example | Shows |
 | --- | --- |

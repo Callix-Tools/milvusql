@@ -12,11 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from temporalio.client import Client
-from temporalio.worker import Worker
-
 from activities import insert_item
 from config import TASK_QUEUE, TEMPORAL_ADDRESS
+from temporalio.client import Client
+from temporalio.worker import Worker
 from workflows import IngestItemWorkflow
 
 logging.basicConfig(level=logging.INFO)

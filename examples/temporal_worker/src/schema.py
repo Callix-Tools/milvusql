@@ -6,8 +6,9 @@ example's workflow inserts into. Run once, before starting the worker:
 
 from __future__ import annotations
 
-import milvusql
 from config import MILVUS_TOKEN, MILVUS_URI
+
+import milvusql
 
 CREATE_TABLE = (
     "CREATE TABLE catalog_items ("
@@ -18,10 +19,10 @@ CREATE_TABLE = (
     "title VARCHAR(128)"
     ") WITH (shards=1, consistency_level='Strong')"
 )
-CREATE_INDEX = (
-    "CREATE INDEX idx_embedding ON catalog_items (embedding) "
-    "USING HNSW WITH (metric_type='COSINE', M=16, ef_construction=200)"
-)
+CREATE_INDEX = """
+CREATE INDEX idx_embedding ON catalog_items (embedding)
+USING HNSW WITH (metric_type='COSINE', M=16, efConstruction=200)
+"""
 
 
 def main() -> None:

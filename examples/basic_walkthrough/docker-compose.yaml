@@ -1,0 +1,4 @@
+name: milvus-examples
+
+include:
+  - ../../example_infra/milvus.compose.yml

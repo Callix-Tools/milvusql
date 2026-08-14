@@ -1,2 +1,0 @@
-milvusql
-temporalio>=1.9,<2

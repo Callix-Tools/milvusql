@@ -16,10 +16,9 @@ import argparse
 import asyncio
 import uuid
 
-from temporalio.client import Client
-
 from config import TASK_QUEUE, TEMPORAL_ADDRESS
 from models import IngestItemInput
+from temporalio.client import Client
 from workflows import IngestItemWorkflow
 
 

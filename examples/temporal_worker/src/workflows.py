@@ -6,10 +6,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from models import IngestItemInput, InsertItemInput
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-
-from models import IngestItemInput, InsertItemInput
 
 # `activities.py` imports `milvusql`, which is not workflow-sandbox-safe
 # to import directly at workflow module scope (it does real gRPC/network
