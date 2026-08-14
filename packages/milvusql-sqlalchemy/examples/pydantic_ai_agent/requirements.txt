@@ -1,0 +1,7 @@
+milvusql-sqlalchemy
+pydantic-ai
+sqlalchemy>=2.0
+# Real text embeddings (EMBEDDING_BACKEND=minilm, the default) --
+# omit this and run with EMBEDDING_BACKEND=deterministic to try the
+# agent without installing torch/downloading model weights.
+sentence-transformers

@@ -1,0 +1,10 @@
+milvusql-sqlalchemy
+fastapi
+uvicorn[standard]
+python-multipart
+sqlalchemy>=2.0
+# CLIP embeddings (EMBEDDING_BACKEND=clip, the default) -- omit these
+# two and run with EMBEDDING_BACKEND=deterministic to try the app
+# without installing torch/downloading model weights.
+sentence-transformers
+pillow

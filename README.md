@@ -21,6 +21,11 @@ This is the core of a `uv` workspace: [`milvusql-sqlalchemy`](packages/milvusql-
 [`milvusql-django`](packages/milvusql-django) depend on this package as their DBAPI layer, each
 installed separately.
 
+**Examples:** a guided DBAPI walkthrough and a Temporal ingestion worker live in
+[`examples/`](examples) — see also
+[`milvusql-sqlalchemy`'s own examples](packages/milvusql-sqlalchemy/examples) (a FastAPI image-search
+service, a pydantic-ai agent).
+
 **Full docs: https://Callix-Tools.github.io/milvusql-docs/**
 
 Status: early development, not yet published.
