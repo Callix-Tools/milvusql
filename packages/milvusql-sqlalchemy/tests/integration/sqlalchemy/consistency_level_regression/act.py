@@ -41,6 +41,7 @@ from milvusql_sqlalchemy.types import VECTOR
 from sqlalchemy import (
     BigInteger,
     Column,
+    Index,
     MetaData,
     Table,
     create_engine,
@@ -62,15 +63,49 @@ def test_engine_level_isolation_level_does_not_break_every_query(db_uri):
             Column("embedding", VECTOR(4)),
         )
         metadata.create_all(engine)
+        # LOAD requires an index on every vector field first -- Milvus
+        # Lite tolerated loading an unindexed collection (confirmed
+        # directly: this used to skip index creation entirely and
+        # passed against Lite regardless), a real server rejects it
+        # with "index not found".
+        Index(
+            "idx_items_embedding",
+            items.c.embedding,
+            milvusql_using="HNSW",
+            milvusql_with={
+                "metric_type": "COSINE",
+                "M": 16,
+                "ef_construction": 200,
+            },
+        ).create(engine)
         with engine.connect() as conn:
             dbapi_connection = conn.connection.dbapi_connection
             assert dbapi_connection is not None  # nosec B101
             dbapi_connection._client.load_collection("items")
-            conn.execute(insert(items), [{"embedding": [0.1] * 4}])
+            result = conn.execute(insert(items), [{"embedding": [0.1] * 4}])
+            assert result.inserted_primary_key is not None  # nosec B101
+            (generated_id,) = result.inserted_primary_key
             conn.commit()
-        with engine.connect() as conn:
+        with engine.connect() as raw_conn:
+            # This engine's own default is 'Bounded' (what's actually
+            # under test above -- that setting it doesn't break every
+            # later query), and 'Bounded' genuinely permits the read-
+            # your-writes staleness window its name promises against a
+            # real (non-Lite) server -- confirmed directly: this
+            # assertion intermittently saw an empty result with no
+            # override here. Overriding to 'Strong' just for this
+            # verification read makes the assertion deterministic
+            # without weakening what's actually being exercised (the
+            # insert above still ran, and committed, under the
+            # engine's own 'Bounded' default).
+            conn = raw_conn.execution_options(isolation_level="Strong")
             rows = conn.execute(select(items.c.id)).all()
-        assert rows == [(1,)]
+        # Milvus's real `auto_id` allocator assigns large,
+        # timestamp-derived ids -- not the small sequential ones
+        # Milvus Lite happened to hand out -- so this compares against
+        # whatever id the insert above actually got back, not a
+        # literal `1`.
+        assert rows == [(generated_id,)]
     finally:
         engine.dispose()
 
@@ -80,13 +115,18 @@ def test_execution_options_isolation_level_does_not_poison_the_pool(
 ):
     engine, items = seeded_engine
 
+    # `seeded_engine` holds exactly one row -- Milvus's real `auto_id`
+    # allocator assigns large, timestamp-derived ids (not the small
+    # sequential ones Milvus Lite happened to hand out), so this only
+    # asserts the row count and consistency between the two queries
+    # below, never a literal id.
     with engine.connect() as raw_conn:
         conn = raw_conn.execution_options(isolation_level="Strong")
         rows = conn.execute(select(items.c.id)).all()
-        assert rows == [(1,)]
+        assert len(rows) == 1
 
     # A later, unrelated connection pulled from the same pool must not
     # be affected by the isolation_level use above.
     with engine.connect() as conn:
-        rows = conn.execute(select(items.c.id)).all()
-        assert rows == [(1,)]
+        rows_again = conn.execute(select(items.c.id)).all()
+        assert rows_again == rows

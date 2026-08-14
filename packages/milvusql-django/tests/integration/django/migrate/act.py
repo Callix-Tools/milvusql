@@ -1,7 +1,7 @@
 """Integration coverage for Django's own migration bookkeeping
 (``django.db.migrations.recorder.MigrationRecorder``) against a real
-(embedded) Milvus Lite instance -- regression coverage for the bug its
-``django_migrations`` table used to crash on.
+Milvus server (via ``testcontainers``) -- regression coverage for the
+bug its ``django_migrations`` table used to crash on.
 
 Not exercised through ``call_command("migrate")`` directly: Django
 itself skips ``ensure_schema()`` whenever the computed migration plan

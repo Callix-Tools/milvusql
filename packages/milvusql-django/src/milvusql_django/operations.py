@@ -11,6 +11,38 @@ from django.db.backends.utils import format_number
 
 
 class DatabaseOperations(BaseDatabaseOperations):
+    #: Django's own default ranges (`BaseDatabaseOperations.
+    #: integer_field_ranges`) assume `AutoField`/`SmallAutoField` are
+    #: 32-/16-bit -- correct for a database that actually offers those
+    #: narrower integer column types, wrong for this one: Milvus's
+    #: primary key is always `INT64` (`base.py`'s `data_types` maps
+    #: every Auto* field to `"BIGINT"`; Milvus has no 16-/32-bit
+    #: auto-increment option to distinguish them by), and a real
+    #: server's `auto_id` allocator hands out large, snowflake-style
+    #: values (confirmed directly: routinely ~4x10^17) nowhere near
+    #: 32-bit range. Without this override, Django's own
+    #: `IntegerFieldOverflow` lookup optimization (`django.db.models.
+    #: lookups`) sees a `.filter(pk=X)`/`.get(pk=X)` value outside the
+    #: (wrong, narrower) assumed range and raises `EmptyResultSet`
+    #: *before ever issuing a query* -- silently, deterministically
+    #: turning every such lookup into a false "not found", confirmed
+    #: directly as the root cause of `Item.objects.get(pk=created.pk)`
+    #: failing immediately after `Item.objects.create()` even under
+    #: `consistency_level="Strong"`. `SmallAutoField`/`AutoField` get
+    #: `BigAutoField`'s own 64-bit range here rather than relying on
+    #: every model author remembering to declare `BigAutoField`
+    #: explicitly (or setting `DEFAULT_AUTO_FIELD` project-wide) --
+    #: this backend's own pk column is always 64-bit regardless of
+    #: which Auto* field Python-side code declares.
+    integer_field_ranges = {  # noqa: RUF012 -- ty rejects ClassVar: base
+        # `BaseDatabaseOperations.integer_field_ranges` is itself
+        # declared as an instance attribute, same situation as
+        # `base.py`'s `data_types`/`dialect.py`'s `construct_arguments`.
+        **BaseDatabaseOperations.integer_field_ranges,
+        "SmallAutoField": (-9223372036854775808, 9223372036854775807),
+        "AutoField": (-9223372036854775808, 9223372036854775807),
+    }
+
     def adapt_decimalfield_value(
         self,
         value: decimal.Decimal | float | str | None,

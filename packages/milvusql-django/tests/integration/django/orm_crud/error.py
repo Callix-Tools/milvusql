@@ -1,5 +1,18 @@
-"""Integration coverage for the ORM/schema-editor's one documented
-unsupported operation, against a real (embedded) Milvus Lite instance."""
+"""Integration coverage for the ORM/schema-editor's genuinely
+unsupported operations, against a real Milvus server (via
+``testcontainers``).
+
+``add_field`` used to live here too (Milvus Lite's gRPC server doesn't
+implement ``AddCollectionField``, so it always raised
+``NotSupportedError`` against Lite specifically) -- a real server
+*does* implement it, so that's now a happy-path test in ``act.py``
+instead (``test_add_field_succeeds_against_a_real_collection``).
+``remove_field``/``alter_field`` are different in kind: Milvus itself
+has no DROP FIELD or ALTER COLUMN capability at all (same restriction
+``sqlglot-milvus`` enforces at the SQL grammar level), so
+``DatabaseSchemaEditor`` raises ``NotImplementedError`` directly in
+Python, before any RPC -- true regardless of Lite vs. a real server,
+and exercised here without needing ``loaded_items`` at all."""
 
 from __future__ import annotations
 
@@ -7,7 +20,7 @@ import typing as t
 
 import pytest
 from dj_app.models import Item as _Item
-from django.db import NotSupportedError, models
+from django.db import models
 
 pytestmark = [pytest.mark.integration, pytest.mark.django]
 
@@ -18,24 +31,23 @@ pytestmark = [pytest.mark.integration, pytest.mark.django]
 Item: t.Any = _Item
 
 
-def test_add_field_raises_not_supported_against_a_real_collection(
-    loaded_items,
-):
-    """Documents current, real behavior rather than forcing a happy
-    path: ``milvusql`` core's ``ALTER TABLE`` dispatch
-    (``ast_to_pymilvus.build_call``) now wires ``ADD FIELD`` through to
-    ``MilvusClient.add_collection_field`` -- but that RPC returns
-    ``UNIMPLEMENTED`` against Milvus Lite (verified directly -- a raw
-    ``grpc.RpcError``, not even a ``MilvusException``), which
-    ``milvusql``'s error translation already maps to
-    ``NotSupportedError``. So ``add_field`` still always raises here,
-    just from the real RPC boundary now instead of a blanket
-    pre-emptive rejection -- a real Milvus server that *does*
-    implement ``AddCollectionField`` would succeed."""
+def test_remove_field_raises_not_implemented(connection):
     tag = models.CharField(max_length=16, null=True)
     tag.set_attributes_from_name("tag")
     with (
-        loaded_items.schema_editor() as editor,
-        pytest.raises(NotSupportedError, match="UNIMPLEMENTED"),
+        connection.schema_editor() as editor,
+        pytest.raises(NotImplementedError, match="cannot drop a field"),
     ):
-        editor.add_field(Item, tag)
+        editor.remove_field(Item, tag)
+
+
+def test_alter_field_raises_not_implemented(connection):
+    old = models.CharField(max_length=64)
+    old.set_attributes_from_name("category")
+    new = models.CharField(max_length=128)
+    new.set_attributes_from_name("category")
+    with (
+        connection.schema_editor() as editor,
+        pytest.raises(NotImplementedError, match="cannot change a field"),
+    ):
+        editor.alter_field(Item, old, new)

@@ -1,5 +1,5 @@
 """Error-path integration coverage for ``execute()``, sync and async,
-against a real (embedded) Milvus Lite instance."""
+against a real Milvus server (via ``testcontainers``)."""
 
 from __future__ import annotations
 

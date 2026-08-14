@@ -48,7 +48,6 @@ tasks:
           mkdir -p reports
           uv run pytest tests \
             -n {{.CONCURRENCY | default "auto"}} \
-            -m "not validation" \
             {{ if .SEED -}}
             --randomly-seed={{.SEED}} \
             {{ end -}}
@@ -63,7 +62,6 @@ tasks:
           echo "Running core tests for development..."
           uv run pytest tests \
             -n {{.CONCURRENCY | default "auto"}} \
-            -m "not validation" \
             {{ if .SEED -}}
             --randomly-seed={{.SEED}} \
             {{ end -}}

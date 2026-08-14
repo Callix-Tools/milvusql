@@ -50,7 +50,6 @@ addopts = "--tb=short -v --strict-markers"
 python_files = ["test_*.py", "*_test.py", "act.py", "error.py"]
 markers = [
     "unit: pure-logic test, no external process (Milvus, a real DB) started",
-    "integration: exercises a real (embedded) Milvus Lite instance",
-    "validation: opt-in test against a real, non-Lite Milvus server (excluded by default -- see taskfile's `-m \"not validation\"`)",
+    "integration: exercises a real Milvus server",
     "django: the milvusql-django backend package",
 ]

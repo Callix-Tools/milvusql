@@ -1,9 +1,10 @@
 """Integration coverage exercising ``MilvusDialect_aio`` end to end
-through a real ``sqlalchemy.ext.asyncio.AsyncEngine`` backed by an
-embedded Milvus Lite instance: vector search, a plain filter query,
-insert, delete, and reflection via ``sqlalchemy.inspect()`` (through
-``AsyncConnection.run_sync()``, the only supported way to call
-synchronous ``Dialect`` reflection methods against an async engine).
+through a real ``sqlalchemy.ext.asyncio.AsyncEngine`` backed by a real
+Milvus server (via ``testcontainers``): vector search, a plain filter
+query, insert, delete, and reflection via ``sqlalchemy.inspect()``
+(through ``AsyncConnection.run_sync()``, the only supported way to
+call synchronous ``Dialect`` reflection methods against an async
+engine).
 
 Reflection specifically exercises ``dialect.py``'s ``_reflect()``
 bridge: ``_raw_client()`` returns an ``AsyncMilvusClient`` under this
@@ -14,11 +15,16 @@ inside the greenlet ``run_sync()`` spawns, the same bridge primitive
 ``sqlalchemy.connectors.asyncio`` itself uses for the DML/DQL path.
 
 ``seeded_engine_aio`` builds and indexes the collection through the
-*sync* engine first (``CREATE INDEX`` cannot be exercised through
-``milvusql+aio`` against Milvus Lite -- see the fixture's own
-docstring), then reopens it async -- Milvus Lite is one on-disk server,
-so both clients see the same collection, same reasoning as the root
-package's own ``loaded_items`` fixture."""
+*sync* engine first, then reopens it async -- both clients see the
+same on-disk-per-worker database, same reasoning as the root package's
+own ``loaded_items`` fixture. Originally worked around a Milvus-Lite-
+specific gap (``CREATE INDEX`` couldn't run through ``milvusql+aio``
+against Milvus Lite's async gRPC server -- see
+``ast_to_pymilvus._build_create_index``'s docstring); kept as-is
+against a real server too since it hasn't been independently
+reverified here that a real server's async client handles ``CREATE
+INDEX`` directly, and the sync-then-reopen path is correct either
+way."""
 
 from __future__ import annotations
 
@@ -35,11 +41,23 @@ async def test_vector_search_returns_the_nearest_row(seeded_engine_aio):
         rows = (
             await conn.execute(
                 select(items.c.id, items.c.category)
-                .order_by(items.c.embedding.l2_distance([0.1] * 8))
+                # `seeded_engine`'s index is built with `metric_type=
+                # "COSINE"` -- a real (non-Lite) server rejects a
+                # search whose own metric doesn't match the index's
+                # (confirmed directly: "metric type not match:
+                # invalid parameter[expected=COSINE][actual=L2]"),
+                # so this has to ask for the same metric the index
+                # actually has, not `l2_distance`.
+                .order_by(items.c.embedding.cosine_distance([0.1] * 8))
                 .limit(5)
             )
         ).all()
-    assert rows == [(1, "book")]
+    # The seeded row's id is server-assigned (a real Milvus server's
+    # auto_id allocator, unlike Milvus Lite, does not hand out small
+    # sequential ids) -- only its non-id shape is asserted here.
+    assert len(rows) == 1
+    assert rows[0].category == "book"
+    assert rows[0].id is not None
 
 
 async def test_plain_filter_select_returns_the_matching_row(
@@ -54,7 +72,11 @@ async def test_plain_filter_select_returns_the_matching_row(
                 )
             )
         ).all()
-    assert rows == [(1, "book")]
+    # Same server-assigned-id caveat as
+    # ``test_vector_search_returns_the_nearest_row`` above.
+    assert len(rows) == 1
+    assert rows[0].category == "book"
+    assert rows[0].id is not None
 
 
 async def test_insert_is_visible_to_a_later_select(seeded_engine_aio):

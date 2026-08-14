@@ -53,13 +53,19 @@ if t.TYPE_CHECKING:
 #: field among them, sharpest example being
 #: `django.db.migrations.recorder.MigrationRecorder.Migration`, which
 #: `migrate` itself creates before a single user migration runs.
-#: `create_model` splices in one hidden, always-populated 1-dimensional
-#: `VECTOR(1)` column for a model that has none, named unguessably
-#: enough that it can never collide with a real field, and Django's own
-#: ORM never sees or selects it -- only `CursorWrapper`'s `INSERT`
-#: padding (`base.py`) and this module ever touch it.
+#: `create_model` splices in one hidden, always-populated `VECTOR(2)`
+#: column for a model that has none, named unguessably enough that it
+#: can never collide with a real field, and Django's own ORM never
+#: sees or selects it -- only `CursorWrapper`'s `INSERT` padding
+#: (`base.py`) and this module ever touch it. Dimension 2, not 1: a
+#: real (non-Lite) Milvus server enforces its own documented minimum
+#: vector dimension of 2 and rejects `dim=1` with `code=1100,
+#: "invalid dimension: 1. should be in range 2 ~ 32768"` -- Milvus
+#: Lite silently accepted a 1-dimensional vector with no such
+#: validation, which is what let this go unnoticed until tested
+#: against a real server.
 PAD_VECTOR_FIELD = "_milvusql_pad_vector"
-PAD_VECTOR_VALUE: list[float] = [0.0]
+PAD_VECTOR_VALUE: list[float] = [0.0, 0.0]
 
 
 def _needs_pad_vector(model: type[t.Any]) -> bool:
@@ -82,11 +88,12 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         return " ".join(parts)
 
     def create_model(self, model: type[t.Any]) -> None:
+        needs_pad = _needs_pad_vector(model)
         columns = [
             self._column_definition(model, field)
             for field in model._meta.local_fields
         ]
-        if _needs_pad_vector(model):
+        if needs_pad:
             dim = len(PAD_VECTOR_VALUE)
             columns.append(
                 f"{self.quote_name(PAD_VECTOR_FIELD)} VECTOR({dim})"
@@ -96,6 +103,29 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             "definition": ", ".join(columns),
         }
         self.execute(sql)
+        if needs_pad and not self.collect_sql:
+            # Milvus requires an index *and* a `LOAD` before a
+            # collection is queryable at all -- not just before vector
+            # search, confirmed directly: `django_migrations` (no real
+            # vector field, so the only column to index is the hidden
+            # pad column above) raised "collection not loaded" on a
+            # plain `SELECT` the moment `MigrationRecorder` queried it,
+            # with no vector search involved. A model *with* a real
+            # vector field is deliberately left unindexed here (see the
+            # module docstring: index/metric is a query-shape decision
+            # this generic hook shouldn't guess) -- but there's no
+            # equivalent user-code moment to call
+            # `create_index_and_load` for Django's own internal
+            # bookkeeping models, so this is the one case that has to
+            # index itself, on the one column it knows nothing else
+            # will ever configure. Skipped under `collect_sql=True`
+            # (``sqlmigrate``/dry runs) the same way `self.execute`
+            # itself is -- `create_index_and_load` has no SQL-collecting
+            # mode of its own and would otherwise execute for real
+            # against a run that promised not to.
+            create_index_and_load(
+                self.connection, model._meta.db_table, PAD_VECTOR_FIELD
+            )
 
     def delete_model(self, model: type[t.Any]) -> None:
         self.execute(

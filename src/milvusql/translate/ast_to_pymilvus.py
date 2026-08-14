@@ -393,13 +393,37 @@ def _build_create_table(
     table_name = schema_node.this.name
     props = _properties_to_dict(ast.args.get("properties"), parameters)
 
+    columns = [
+        c for c in schema_node.expressions if isinstance(c, exp.ColumnDef)
+    ]
+    if not any(
+        _map_datatype(c.kind)[0]
+        in (DataType.FLOAT_VECTOR, DataType.SPARSE_FLOAT_VECTOR)
+        for c in columns
+    ):
+        # Milvus refuses `create_collection()` outright for a schema
+        # with zero vector fields -- confirmed directly against a
+        # real, non-Lite server (Milvus Lite silently tolerates it,
+        # which is what let this go unnoticed for a while). Raised
+        # here, client-side, before `create_schema()`/any RPC even
+        # runs: the server's own rejection is a bare, unhelpful
+        # low-level gRPC error with no indication of *why*. This is a
+        # real, documented limitation, not a bug to paper over --
+        # notably, it means a tool that creates a table with no vector
+        # column of its own (e.g. Alembic's ``alembic_version``
+        # bookkeeping table) cannot be made to work against this
+        # backend.
+        msg = (
+            f"CREATE TABLE {table_name!r} has no VECTOR/SPARSEVEC "
+            "column -- Milvus requires at least one vector field per "
+            "collection."
+        )
+        raise errors.NotSupportedError(msg)
+
     milvus_schema = client.create_schema(
         enable_dynamic_field=False,
         partition_key_field=props.pop("partition_key", None),
     )
-    columns = [
-        c for c in schema_node.expressions if isinstance(c, exp.ColumnDef)
-    ]
     # A standalone `PRIMARY KEY (col)` table constraint -- standard SQL,
     # and what SQLAlchemy's own DDLCompiler emits by default instead of
     # an inline `PRIMARY KEY` on the column -- names the primary column
@@ -510,13 +534,18 @@ def _build_drop_table(ast: exp.Drop) -> Call:
 
 
 def _build_alter_add_field(ast: exp.Alter) -> Call:
-    """``ALTER TABLE items ADD FIELD tag VARCHAR(32)``.
+    """``ALTER TABLE items ADD FIELD tag VARCHAR(32)`` or the standard
+    SQL spelling ``ALTER TABLE items ADD COLUMN tag VARCHAR(32)``.
 
     sqlglot-milvus's own grammar rejects every other ``ALTER`` action
     (``DROP``/``ALTER COLUMN``/``MODIFY``) at *parse* time with a
     ``ParseError`` (Milvus can't perform them at all), so the single
-    action reaching here is always an ``AddField`` -- the ``isinstance``
-    check below is defense in depth against a synthetic or
+    action reaching here is always either an ``AddField`` (Milvus's own
+    ``ADD FIELD`` spelling, wrapping a ``ColumnDef``) or a bare
+    ``ColumnDef`` (standard SQL's ``ADD COLUMN`` spelling, e.g. as
+    rendered by Alembic's default ``add_column()``) -- both mean the
+    same thing and are unwrapped to the same ``ColumnDef`` below. The
+    ``else`` branch is defense in depth against a synthetic or
     foreign-dialect AST, not a real branch the grammar can produce.
 
     ``MilvusClient.add_collection_field`` returns ``UNIMPLEMENTED``
@@ -535,10 +564,17 @@ def _build_alter_add_field(ast: exp.Alter) -> Call:
     vectors.
     """
     actions = ast.args.get("actions") or []
-    if len(actions) != 1 or not isinstance(actions[0], AddField):
+    if len(actions) != 1:
         msg = "unsupported ALTER TABLE action"
         raise errors.NotSupportedError(msg)
-    column = actions[0].this
+    action = actions[0]
+    if isinstance(action, AddField):
+        column = action.this
+    elif isinstance(action, exp.ColumnDef):
+        column = action
+    else:
+        msg = "unsupported ALTER TABLE action"
+        raise errors.NotSupportedError(msg)
     milvus_type, extra = _map_datatype(column.kind)
     kwargs: dict[str, t.Any] = {
         "collection_name": ast.this.name,
@@ -638,7 +674,25 @@ def _build_delete(ast: exp.Delete, parameters: dict[str, t.Any]) -> Call:
 def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
     """``UPDATE table SET col = val[, ...] WHERE ...`` -- see
     :class:`Call`'s docstring for why this is a read (``query``) whose
-    ``then`` chains into a write (``upsert``), not one RPC."""
+    ``then`` chains into a write (``upsert``), not one RPC.
+
+    Known, confirmed limitation for an ``auto_id`` primary key (every
+    table this module's own ``AUTO_INCREMENT`` DDL creates): a real
+    (non-Lite) Milvus server's ``upsert()`` does **not** honor the
+    primary key value in ``merged`` below for an ``auto_id=True``
+    collection -- it silently mints a *new* server-assigned id for the
+    row regardless, even though the row's other columns are correctly
+    overwritten in place (confirmed directly: updating only a
+    non-primary-key column still changes the row's id; the total row
+    count is unaffected, so this is a rename in place, not a
+    duplicate). Milvus Lite was more lenient here and preserved the
+    given id, which is what let this go unnoticed until tested against
+    a real server. There is no workaround through any Milvus API: an
+    ``auto_id`` field categorically cannot be given an explicit value
+    on any write, upsert included, so an ``UPDATE`` can never guarantee
+    the row's id survives it. Callers that need a stable identity
+    across updates need a non-``auto_id`` (caller-assigned) primary
+    key instead."""
     table_name = ast.this.name
     # `UPDATE`'s `SET` list is always `col = <expr>` (`exp.EQ`) by
     # grammar -- `_resolve_value` is what actually rejects an

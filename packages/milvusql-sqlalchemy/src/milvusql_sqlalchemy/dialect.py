@@ -16,6 +16,7 @@ is unambiguous.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import typing as t
 
@@ -27,6 +28,16 @@ from sqlalchemy.util import await_only
 import milvusql.dbapi
 from milvusql_sqlalchemy import asyncio_dbapi, reflection
 from milvusql_sqlalchemy.compiler import MilvusDDLCompiler, MilvusSQLCompiler
+
+with contextlib.suppress(ImportError):
+    # Registers `MilvusImpl` with Alembic (see that module's own
+    # docstring for why importing it is what registers it) -- guarded
+    # so this package works without Alembic installed at all; only
+    # `MigrationContext.configure()` ever needs the registration to
+    # already have happened, and that can't run before this dialect
+    # module itself has been imported to resolve `create_engine(...)`
+    # in the first place.
+    from milvusql_sqlalchemy import alembic_impl as _alembic_impl  # noqa: F401
 
 if t.TYPE_CHECKING:
     from sqlalchemy.engine import Connection as SAConnection
@@ -344,6 +355,21 @@ class MilvusDialect_aio(MilvusDialect):  # noqa: N801 -- matches upstream's own
         # dependencies regardless of sync or async use, not an
         # optional third-party driver package.
         return t.cast("DBAPIModule", asyncio_dbapi.dbapi)
+
+    def get_driver_connection(self, connection: t.Any) -> t.Any:
+        """``DefaultDialect``'s own default (``return connection``) is
+        correct for a normal DBAPI, but leaves an async dialect's own
+        ``AdaptedConnection`` (``asyncio_dbapi.py``'s
+        ``AsyncAdapt_dbapi_connection`` wrapper) unopened for anyone
+        who calls ``AsyncConnection.get_raw_connection()`` and expects
+        back what the docstring promises: the real driver connection,
+        not the DBAPI-facing adapter -- confirmed directly (same
+        pattern ``aiosqlite``'s own dialect overrides this hook for):
+        without this, ``(await conn.get_raw_connection()).
+        driver_connection`` still returns an ``AsyncAdapt_dbapi_connection``,
+        not the ``milvusql.aio.AsyncConnection`` underneath it, and
+        ``._client`` raises ``AttributeError``."""
+        return connection._connection
 
 
 __all__ = ["MilvusDialect", "MilvusDialect_aio"]

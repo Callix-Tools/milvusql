@@ -53,7 +53,16 @@ class TestCreateTableDDL:
 
     def test_varchar_primary_key_without_autoincrement_keyword(self, dialect):
         """Only the ``Table``'s designated autoincrement column gets
-        ``AUTO_INCREMENT``; a ``VARCHAR`` primary key never does."""
+        ``AUTO_INCREMENT``; a ``VARCHAR`` primary key never does.
+
+        DDL *rendering* doesn't care that neither column here is a
+        ``VECTOR``/``SPARSEVEC`` -- Milvus's real "at least one vector
+        field" requirement is enforced server-side, in
+        ``ast_to_pymilvus._build_create_table`` (a client-side,
+        explicit ``NotSupportedError``, confirmed directly against a
+        real, non-Lite server: unenforced there any other way), not by
+        this compiler rejecting or altering the SQL text itself -- see
+        ``create_table/error.py``'s own coverage for that."""
         metadata = MetaData()
         items = Table(
             "items",

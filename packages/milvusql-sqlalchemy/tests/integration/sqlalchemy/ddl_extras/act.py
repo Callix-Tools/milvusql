@@ -77,7 +77,8 @@ def test_sparsevec_column_can_be_created_inserted_and_searched(engine):
         assert dbapi_connection is not None  # nosec B101
         dbapi_connection._client.load_collection("docs")
 
-        conn.execute(insert(docs), [{"sparse": {0: 0.5, 5: 0.2}}])
+        result = conn.execute(insert(docs), [{"sparse": {0: 0.5, 5: 0.2}}])
+        (generated_id,) = result.inserted_primary_key
         conn.commit()
 
         rows = conn.execute(
@@ -85,7 +86,10 @@ def test_sparsevec_column_can_be_created_inserted_and_searched(engine):
             .order_by(docs.c.sparse.max_inner_product({0: 0.5}))
             .limit(5)
         ).all()
-        assert rows == [(1,)]
+        # A real Milvus server's auto_id allocator assigns a large,
+        # timestamp-derived id, not a small sequential one -- compare
+        # against the actual generated id rather than a literal.
+        assert rows == [(generated_id,)]
 
 
 def test_sparsevec_column_reflects_back_as_sparsevec(engine):

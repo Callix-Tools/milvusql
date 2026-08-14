@@ -1,6 +1,11 @@
-"""Fixtures for the DBAPI test suite: every test gets its own Milvus
-Lite instance (via ``tmp_path``), so ``pytest-randomly`` can freely
-reorder tests without collection-name collisions."""
+"""Fixtures for the DBAPI test suite: all tests in one pytest-xdist
+worker share a single real Milvus server (started via
+``testcontainers``, see ``tests.fixtures.containers.milvus_server``)
+and a single database dedicated to that worker (``milvus_db_name``).
+Isolation across tests -- so ``pytest-randomly`` can freely reorder
+them without collection-name collisions -- comes from a per-test
+teardown that drops every collection in the worker's database after
+each test that requests ``conn``/``aconn`` (``_milvus_worker_cleanup``)."""
 
 from __future__ import annotations
 
@@ -9,12 +14,30 @@ import pytest
 import milvusql
 from milvusql import aio
 
+#: `consistency_level='Strong'` here is collection metadata only --
+#: confirmed directly against `pymilvus`'s own source
+#: (`milvus_client.py`/`prepare.py`): a `query()`/`search()` call that
+#: doesn't pass its own `consistency_level` falls back to a hardcoded
+#: `DEFAULT_CONSISTENCY_LEVEL` (`Bounded`) at the request-building
+#: layer, *not* to whatever the collection was created with. The
+#: connection-level default below (`conn`/`aconn`'s own
+#: `consistency_level="Strong"`) is what actually reaches every query
+#: -- see `milvusql.dbapi.Cursor._invoke`, which is the real fallback
+#: mechanism D6 relies on. Against a real (non-Lite) server, `Bounded`
+#: permits exactly the staleness window its name promises, so a query
+#: issued immediately after an insert/update/delete in the same test
+#: can legitimately not see it yet -- confirmed directly, this
+#: connection used to have no `consistency_level` override at all and
+#: every test relying on read-your-writes intermittently got an
+#: empty/stale result against a real server (never observable against
+#: Milvus Lite, which has no replication lag to be inconsistent
+#: about).
 CREATE_ITEMS = (
     "CREATE TABLE items ("
     "id BIGINT PRIMARY KEY AUTO_INCREMENT, "
     "embedding VECTOR(8), "
     "category VARCHAR(64)"
-    ") WITH (shards=1, consistency_level='Bounded')"
+    ") WITH (shards=1, consistency_level='Strong')"
 )
 CREATE_ITEMS_INDEX = (
     "CREATE INDEX idx_emb ON items (embedding) USING HNSW "
@@ -23,13 +46,18 @@ CREATE_ITEMS_INDEX = (
 
 
 @pytest.fixture
-def db_uri(tmp_path) -> str:
-    return str(tmp_path / "milvus.db")
+def db_uri(milvus_uri: str) -> str:
+    return milvus_uri
 
 
 @pytest.fixture
-def conn(db_uri):
-    connection = milvusql.connect(uri=db_uri)
+def conn(db_uri, milvus_db_name, _milvus_worker_cleanup):
+    connection = milvusql.connect(
+        uri=db_uri,
+        token="root:Milvus",  # noqa: S106 -- well-known Milvus default, not a secret
+        db_name=milvus_db_name,
+        consistency_level="Strong",
+    )
     yield connection
     connection.close()
 
@@ -43,8 +71,8 @@ def cur(conn):
 def loaded_items(conn, cur):
     """A collection with an index, loaded and ready to search --
     everything CREATE INDEX needs, built through the sync client
-    regardless of which client the test itself exercises (Milvus Lite
-    is one on-disk server; both clients see the same collection)."""
+    regardless of which client the test itself exercises (both
+    clients point at the same real server and database)."""
     cur.execute(CREATE_ITEMS)
     cur.execute(CREATE_ITEMS_INDEX)
     cur.execute("LOAD TABLE items")
@@ -52,8 +80,13 @@ def loaded_items(conn, cur):
 
 
 @pytest.fixture
-async def aconn(db_uri, loaded_items):
-    connection = aio.connect(uri=db_uri)
+async def aconn(db_uri, milvus_db_name, loaded_items):
+    connection = aio.connect(
+        uri=db_uri,
+        token="root:Milvus",  # noqa: S106 -- well-known Milvus default, not a secret
+        db_name=milvus_db_name,
+        consistency_level="Strong",
+    )
     yield connection
     await connection.close()
 
