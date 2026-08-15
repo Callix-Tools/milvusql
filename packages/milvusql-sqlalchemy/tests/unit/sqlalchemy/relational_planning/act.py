@@ -15,6 +15,7 @@ import typing as t
 import pytest
 import sqlglot
 from milvusql_sqlalchemy.dialect import MilvusDialect
+from milvusql_sqlalchemy.types import SPARSEVEC
 from pymilvus import MilvusClient
 from sqlalchemy import (
     BigInteger,
@@ -237,3 +238,33 @@ class TestExists:
             ],
         )
         assert rows == [(2,)]
+
+
+class TestFullText:
+    """BM25 retrieval through the standard SQLAlchemy surface: a
+    generic ``func.BM25_SCORE(...)`` in ``ORDER BY`` compiles to text
+    the DBAPI plans as a ``metric_type='BM25'`` search -- no dialect
+    code involved, which is the point."""
+
+    def test_order_by_bm25_score_plans_a_bm25_search(self):
+        docs = Table(
+            "docs",
+            MetaData(),
+            Column("id", BigInteger, primary_key=True),
+            Column("content_sparse", SPARSEVEC()),
+        )
+        statement = (
+            select(docs.c.id)
+            .order_by(
+                func.BM25_SCORE(
+                    docs.c.content_sparse, "how do i tune hnsw"
+                ).desc()
+            )
+            .limit(10)
+        )
+        _sql, call = _plan(statement)
+        assert call.method == "search"
+        assert call.kwargs["anns_field"] == "content_sparse"
+        assert call.kwargs["data"] == ["how do i tune hnsw"]
+        assert call.kwargs["search_params"]["metric_type"] == "BM25"
+        assert call.kwargs["limit"] == 10

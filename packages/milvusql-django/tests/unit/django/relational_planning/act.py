@@ -227,3 +227,28 @@ class TestUnsupported:
                     )
                 ).values("id", "title")
             )
+
+
+class TestFullText:
+    def test_order_by_a_bm25_score_func_plans_a_bm25_search(self, related):
+        """BM25 retrieval through the standard ORM surface: a generic
+        ``Func(..., function="BM25_SCORE")`` ordering compiles to text
+        the DBAPI plans as a ``metric_type='BM25'`` search."""
+        queryset = (
+            related.item.objects.annotate(
+                score=models.Func(
+                    models.F("rank"),
+                    models.Value("how do i tune hnsw"),
+                    function="BM25_SCORE",
+                    output_field=models.TextField(),
+                )
+            )
+            .order_by("-score")
+            .values("id")[:10]
+        )
+        _sql, call = _plan(queryset)
+        assert call.method == "search"
+        assert call.kwargs["anns_field"] == "rank"
+        assert call.kwargs["data"] == ["how do i tune hnsw"]
+        assert call.kwargs["search_params"]["metric_type"] == "BM25"
+        assert call.kwargs["limit"] == 10
