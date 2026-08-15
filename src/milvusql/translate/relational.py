@@ -203,7 +203,25 @@ def _source_name(node: exp.Expression) -> str:
 
 
 def _columns_of(node: exp.Expression) -> list[exp.Column]:
-    return list(node.find_all(exp.Column))
+    """Every column reference in ``node`` belonging to *this* query.
+
+    Deliberately does not descend into a nested ``SELECT``. Those columns
+    belong to the subquery's own collections, and with a single source in
+    scope :func:`_qualified` attaches any bare name to it -- so
+    ``WHERE cat_id IN (SELECT id FROM categories WHERE title = :t)`` used
+    to ask the *outer* collection for a ``title`` field it has never
+    heard of. Milvus Lite quietly omits an unknown output field; a real
+    server rejects the whole call with "field title not exist"."""
+    if isinstance(node, exp.Column):
+        return [node]
+    if isinstance(node, exp.Select):
+        return []
+    found: list[exp.Column] = []
+    for value in node.args.values():
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, exp.Expression):
+                found.extend(_columns_of(item))
+    return found
 
 
 def _split_conjuncts(node: exp.Expression | None) -> list[exp.Expression]:

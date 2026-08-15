@@ -145,3 +145,51 @@ class TestDerivedTable:
         )
         rows, _desc, _rowcount, _lastrowid = call.postprocess(ITEMS)
         assert rows == [(10, 1), (11, 1)]
+
+
+class TestSubqueryColumnsStayInTheSubquery:
+    """A subquery's columns belong to the subquery's collection.
+
+    With one source in scope every bare column resolves to it, so the
+    inner ``title``/``id`` used to be added to the *outer* collection's
+    ``output_fields`` -- which Milvus Lite quietly ignores and a real
+    server rejects outright ("field title not exist")."""
+
+    SQL = (
+        "SELECT price FROM joined_items WHERE cat_id IN "
+        "(SELECT id FROM categories WHERE title = :t)"
+    )
+
+    def test_the_outer_read_asks_only_for_its_own_fields(
+        self, build_call_helper, drive_chain
+    ):
+        calls, _result = drive_chain(
+            build_call_helper(self.SQL, {"t": "book"}),
+            [[{"id": 10}], [{"price": 1.0, "cat_id": 10}]],
+        )
+        outer = next(
+            call
+            for call in calls
+            if call.kwargs["collection_name"] == "joined_items"
+        )
+        assert sorted(outer.kwargs["output_fields"]) == ["cat_id", "price"]
+
+    def test_the_inner_read_asks_only_for_its_own_fields(
+        self, build_call_helper
+    ):
+        call = build_call_helper(self.SQL, {"t": "book"})
+        assert call.kwargs["collection_name"] == "categories"
+        assert call.kwargs["output_fields"] == ["id"]
+        assert call.kwargs["filter"] == 'title == "book"'
+
+    def test_the_rows_still_come_out_right(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(self.SQL, {"t": "book"}),
+            [
+                [{"id": 10}],
+                [{"price": 1.0, "cat_id": 10}, {"price": 2.0, "cat_id": 99}],
+            ],
+        )
+        assert rows == [(1.0,)]
