@@ -26,6 +26,12 @@ classifiers = [
 dependencies = [
     "pymilvus>=2.6,<3",
     "sqlglot-milvus>=0.1.0,<0.2",
+    # JOIN/GROUP BY/subquery: Milvus reads one collection per RPC and
+    # reduces nothing, so those are planned into several fetches plus a
+    # client-side evaluation -- `translate/relational.py` runs that on
+    # Polars. Imported eagerly, which costs ~140ms next to pymilvus's
+    # own ~10s import (measured), so there is nothing to defer.
+    "polars>=1.30,<2",
 ]
 
 [project.urls]
