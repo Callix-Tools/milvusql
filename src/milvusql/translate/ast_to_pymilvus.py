@@ -511,6 +511,22 @@ def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
     def _then(raw: list[dict[str, t.Any]]) -> Call | None:
         if not raw:
             return None
+        if len(raw) >= DEFAULT_QUERY_LIMIT:
+            # The read that feeds the upsert is subject to Milvus's own
+            # per-call ceiling like any other. Writing back only the
+            # rows that fit would leave the rest untouched and report a
+            # `rowcount` that looks like the whole thing -- the same
+            # silent-truncation trap the aggregate, ORDER BY and
+            # join/grouping paths all refuse to fall into. Nothing has
+            # been written at this point: this is the read step.
+            msg = (
+                "UPDATE cannot be honored: the WHERE filter matches at "
+                f"least Milvus's own per-call row ceiling "
+                f"({DEFAULT_QUERY_LIMIT}), so only part of the matching "
+                "rows would be updated. Narrow the WHERE filter and run "
+                "it in batches."
+            )
+            raise errors.NotSupportedError(msg)
         merged = [{**row, **set_values} for row in raw]
         return Call(
             "upsert",

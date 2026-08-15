@@ -279,9 +279,7 @@ class TestUsing:
     implicit -- resolvable here because exactly one source precedes the
     join."""
 
-    SQL = (
-        "SELECT i.id, c.title FROM items AS i JOIN cats AS c USING (cat_id)"
-    )
+    SQL = "SELECT i.id, c.title FROM items AS i JOIN cats AS c USING (cat_id)"
 
     def test_the_key_is_fetched_from_both_sides(
         self, build_call_helper, drive_chain
@@ -413,3 +411,178 @@ class TestSelectStar:
         )
         assert [column[0] for column in desc] == ["id", "cat_id"]
         assert rows == [(1, 10)]
+
+
+# The regressions below join two collections whose only columns are a
+# key and one payload field, which keeps their expected rows readable.
+PAIR_ITEMS = [{"id": 1, "cid": 10}, {"id": 2, "cid": 99}]
+PAIR_CATS = [{"id": 10, "t": "x"}]
+
+
+class TestOuterJoinKeepsItsRows:
+    """An ``ON`` condition that is not an equality has to be evaluated
+    over the paired rows. Doing that as a filter after the join is right
+    for an inner join and wrong for an outer one: it deletes the
+    null-extended rows the outer join exists to keep."""
+
+    def test_a_left_join_with_an_extra_on_condition(
+        self, build_call_helper, drive_chain
+    ):
+        """Nothing satisfies ``c.t = 'y'``, so every left row survives
+        unmatched. This used to return no rows at all."""
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id, c.t FROM items AS i LEFT JOIN cats AS c "
+                "ON i.cid = c.id AND c.t = 'y'"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert rows == [(1, None), (2, None)]
+
+    def test_a_left_join_where_some_rows_do_match(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id, c.t FROM items AS i LEFT JOIN cats AS c "
+                "ON i.cid = c.id AND c.t = 'x'"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert sorted(rows) == [(1, "x"), (2, None)]
+
+    def test_a_non_equi_left_join(self, build_call_helper, drive_chain):
+        """No equality to hash on at all -- the pairing is every
+        combination, narrowed by the condition, and the unmatched left
+        rows still come back."""
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id, c.t FROM items AS i LEFT JOIN cats AS c "
+                "ON i.cid > c.id"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert sorted(rows, key=lambda row: row[0]) == [(1, None), (2, "x")]
+
+    def test_an_inner_join_still_filters(self, build_call_helper, drive_chain):
+        """Nothing is null-extended by an inner join, so the condition
+        is still just a filter there."""
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id FROM items AS i JOIN cats AS c "
+                "ON i.cid = c.id AND c.t = 'y'"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert rows == []
+
+
+class TestVectorSearchOrderSurvivesAJoin:
+    """Milvus returns hits already ranked. A join reorders rows freely,
+    so the rank rides along as a column and leads the sort afterwards --
+    otherwise the result took the *other* frame's arbitrary order."""
+
+    HITS = [
+        [
+            {"id": 20, "distance": 0.9, "entity": {"cid": 2}},
+            {"id": 21, "distance": 0.5, "entity": {"cid": 1}},
+        ]
+    ]
+    KEYS = [{"id": 1}, {"id": 2}]
+
+    def test_the_hits_keep_milvus_order(self, build_call_helper, drive_chain):
+        """The search is on the *joined* side here, and the driving
+        frame's order (1, 2) is the opposite of the hit order."""
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id FROM cats AS c JOIN items AS i ON c.id = i.cid "
+                "ORDER BY i.embedding <=> :q LIMIT 2",
+                {"q": [0.1, 0.2]},
+            ),
+            [self.HITS, self.KEYS],
+        )
+        assert rows == [(20,), (21,)]
+
+    def test_a_secondary_key_only_breaks_ties(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id FROM cats AS c JOIN items AS i ON c.id = i.cid "
+                "ORDER BY i.embedding <=> :q, c.id DESC LIMIT 2",
+                {"q": [0.1, 0.2]},
+            ),
+            [self.HITS, self.KEYS],
+        )
+        assert rows == [(20,), (21,)]
+
+    def test_the_rank_column_is_not_returned(
+        self, build_call_helper, drive_chain
+    ):
+        """It is bookkeeping, not a column the caller asked for -- so it
+        must not appear even under ``SELECT *``."""
+        _calls, (rows, desc, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT * FROM items ORDER BY embedding <=> :q LIMIT 1",
+                {"q": [0.1, 0.2]},
+            ),
+            [[[{"id": 20, "distance": 0.9, "entity": {"cid": 2}}]]],
+        )
+        assert [column[0] for column in desc] == ["cid", "id", "distance"]
+        assert len(rows[0]) == 3
+
+
+class TestStarSpellings:
+    def test_a_qualified_star_expands_to_its_own_source(
+        self, build_call_helper, drive_chain
+    ):
+        """``i.*`` parses as a ``Column`` whose ``this`` is the star, not
+        as a ``Star`` -- missing that asked Milvus for a field named
+        ``*`` and handed back a column of ``None``."""
+        _calls, (rows, desc, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.* FROM items AS i JOIN cats AS c ON i.cid = c.id"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert [column[0] for column in desc] == ["id", "cid"]
+        assert rows == [(1, 10)]
+
+    def test_a_qualified_star_mixed_with_a_named_column(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, desc, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.*, c.t FROM items AS i JOIN cats AS c "
+                "ON i.cid = c.id"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert [column[0] for column in desc] == ["id", "cid", "t"]
+        assert rows == [(1, 10, "x")]
+
+    def test_a_starred_derived_table_keeps_its_alias(
+        self, build_call_helper, drive_chain
+    ):
+        """The outer query addresses it as ``s.cid``; leaving the inner
+        columns bare made that a raw ``KeyError`` out of the join."""
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT s.id FROM (SELECT * FROM items) AS s "
+                "JOIN cats AS c ON s.cid = c.id"
+            ),
+            [PAIR_ITEMS, PAIR_CATS],
+        )
+        assert rows == [(1,)]
+
+    def test_a_starred_set_operation_names_every_column(
+        self, build_call_helper, drive_chain
+    ):
+        """The description used to carry one entry called ``*`` for a
+        two-column result."""
+        _calls, (rows, desc, _rc, _l) = drive_chain(
+            build_call_helper("SELECT * FROM items UNION SELECT * FROM cats"),
+            [PAIR_ITEMS, [{"id": 10, "cid": 1}]],
+        )
+        assert [column[0] for column in desc] == ["id", "cid"]
+        assert len(rows[0]) == 2

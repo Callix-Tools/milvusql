@@ -81,6 +81,15 @@ _AGGREGATES: dict[type[exp.Expression], str] = {
     exp.Max: "max",
 }
 
+#: Prefix for a projected column's positional name. Star-expanded
+#: columns keep their `source.column` name instead, which is how
+#: :func:`_result_names` tells the two apart.
+_OUTPUT_PREFIX = "_out"
+
+#: The hit order Milvus returned for an ANN search, carried alongside
+#: the row so a join cannot lose it.
+_RANK_COLUMN = "__rank"
+
 _ARITHMETIC: dict[type[exp.Expression], str] = {
     exp.Add: "__add__",
     exp.Sub: "__sub__",
@@ -163,6 +172,9 @@ class _Select:
     limit: int | None
     offset: int | None
     distinct: bool
+    #: ``<frame>.__rank`` when a vector search fed this query -- the
+    #: leading sort key, so Milvus's ranking survives a join.
+    search_rank: str | None = None
     #: Frames that only the predicates reference, keyed by the id of the
     #: ``exp.Subquery``/``exp.Select`` node that produced them.
     subqueries: dict[int, _Select] = field(default_factory=dict)
@@ -218,6 +230,19 @@ def needs_relational_engine(ast: exp.Select) -> bool:
         ast.args.get("joins")
         or ast.args.get("group") is not None
         or ast.args.get("with_") is not None
+        # `DISTINCT` and `OFFSET` have no Milvus-side equivalent either:
+        # `query()` takes a filter and a row cap, nothing else. The
+        # single-call path drops both silently, so anything carrying one
+        # belongs here, where they are actually applied.
+        or ast.args.get("distinct") is not None
+        or ast.args.get("offset") is not None
+        # `*` needs expanding against the fetched rows, which only this
+        # engine does: the single-call path asked Milvus for a field
+        # literally named `*` and returned one column of `None`.
+        or any(
+            _star_source(projection) is not _NOT_A_STAR
+            for projection in ast.expressions
+        )
     ):
         return True
     from_node = ast.args.get("from_")
@@ -239,8 +264,7 @@ def needs_relational_engine(ast: exp.Select) -> bool:
         *ast.expressions,
     ]
     return any(
-        scope is not None
-        and scope.find(exp.Select, exp.Window) is not None
+        scope is not None and scope.find(exp.Select, exp.Window) is not None
         for scope in scopes
     )
 
@@ -273,7 +297,10 @@ def _columns_of(node: exp.Expression) -> list[exp.Column]:
     heard of. Milvus Lite quietly omits an unknown output field; a real
     server rejects the whole call with "field title not exist"."""
     if isinstance(node, exp.Column):
-        return [node]
+        # `t.*` is a Column too, but it names no field -- the expansion
+        # happens against the fetched frame, and asking Milvus for a
+        # field called `*` returns a column of nulls.
+        return [] if isinstance(node.this, exp.Star) else [node]
     if isinstance(node, exp.Select):
         return []
     found: list[exp.Column] = []
@@ -362,7 +389,14 @@ def _plan_select(
         for key in (ast.args.get("group") or exp.Group()).expressions
     ]
 
-    wants_star = any(isinstance(p, exp.Star) for p in projections)
+    # `None` in here means an unqualified `*`: every source. A `t.*`
+    # contributes just that source's name, so only it is asked for
+    # every field.
+    star_sources = {
+        _star_source(projection)
+        for projection in projections
+        if _star_source(projection) is not _NOT_A_STAR
+    }
 
     # Pushed-down conjuncts are deliberately absent: Milvus applies
     # those server-side, so the columns they name need not come back.
@@ -400,7 +434,7 @@ def _plan_select(
         if not isinstance(source, _Scan):
             continue
         source.fields = needed[name]
-        source.star = wants_star
+        source.star = None in star_sources or name in star_sources
         source.filter_text = _conjunct_filter(pushable[name], parameters)
         if search is not None and name == search_frame:
             source.search = search
@@ -427,13 +461,14 @@ def _plan_select(
             else None
         ),
         distinct=ast.args.get("distinct") is not None,
+        search_rank=(
+            f"{search_frame}.{_RANK_COLUMN}" if search is not None else None
+        ),
         subqueries=subqueries,
     )
 
 
-def _names_an_output(
-    node: exp.Expression, output_names: list[str]
-) -> bool:
+def _names_an_output(node: exp.Expression, output_names: list[str]) -> bool:
     return (
         isinstance(node, exp.Column)
         and not node.table
@@ -771,9 +806,7 @@ def _plan_joins(
     return planned
 
 
-def _plan_join(
-    join: exp.Join, known: set[str], preceding: list[str]
-) -> _Join:
+def _plan_join(join: exp.Join, known: set[str], preceding: list[str]) -> _Join:
     frame = _source_name(join.this)
     side = (join.side or "").upper()
     kind = (join.kind or "").upper()
@@ -816,12 +849,14 @@ def _plan_join(
         left_keys.append(left)
         right_keys.append(right)
     if not left_keys:
-        # No equality to hash on -- Polars still answers it as a cross
-        # join filtered by the condition, which is what a SQL engine
-        # falls back to as well. Small inputs only; the row ceiling
-        # keeps that honest.
+        # No equality to hash on -- the pairing is every combination,
+        # narrowed by the condition, which is what a SQL engine falls
+        # back to as well. `how` is kept rather than degraded to a cross
+        # join: an outer join still has to preserve its side, which
+        # `_join` handles. Small inputs only; the row ceiling keeps that
+        # honest.
         return _Join(
-            frame, "cross", [], [], _conjunct_expression(_split_conjuncts(on))
+            frame, how, [], [], _conjunct_expression(_split_conjuncts(on))
         )
     return _Join(
         frame, how, left_keys, right_keys, _conjunct_expression(residual)
@@ -1038,6 +1073,9 @@ def build_set_operation_call(
     scans: list[_Scan] = []
     plan = _plan_set_operation(ast, parameters, scans, _Scope())
     scans = _order_scans(scans)
+    # A branch can join, and its joins deserve the same key pushdown
+    # every other query gets.
+    _plan_pushdown(plan, scans)
     return _scan_call(0, scans, {}, plan)
 
 
@@ -1103,10 +1141,7 @@ def _plan_branch(
         return _plan_branch(node.this, parameters, scans, scope)
     if isinstance(node, exp.Select):
         return _plan_select(node, parameters, scans, scope)
-    msg = (
-        "unsupported set-operation branch: "
-        f"{node.__class__.__name__}"
-    )
+    msg = f"unsupported set-operation branch: {node.__class__.__name__}"
     raise errors.NotSupportedError(msg)
 
 
@@ -1215,8 +1250,16 @@ def _frame(scan: _Scan, raw: t.Any) -> pl.DataFrame:  # noqa: ANN401
                 **hit.get("entity", {}),
                 "id": hit.get("id"),
                 "distance": hit.get("distance"),
+                # Milvus returned these already ranked. A join reorders
+                # rows freely, so the position is carried as a column
+                # rather than trusted to survive -- `_sort` restores it
+                # afterwards. Not a metric comparison: whether nearer
+                # means a larger or a smaller `distance` depends on the
+                # index's metric type, but the order Milvus sent is the
+                # order it means.
+                f"{_RANK_COLUMN}": rank,
             }
-            for hit in hits
+            for rank, hit in enumerate(hits)
         ]
     else:
         rows = list(raw or [])
@@ -1232,6 +1275,8 @@ def _frame(scan: _Scan, raw: t.Any) -> pl.DataFrame:  # noqa: ANN401
             raise errors.NotSupportedError(msg)
 
     columns = list(scan.fields)
+    if scan.search is not None:
+        columns = [*columns, _RANK_COLUMN]
     if scan.star or not columns:
         seen: list[str] = []
         for row in rows:
@@ -1284,17 +1329,55 @@ def _finish(
     rows = [tuple(row) for row in frame.rows()]
     # `SELECT *` learns its column names from the data, so the
     # description comes off the evaluated frame rather than the plan.
-    starred = isinstance(plan, _Select) and _has_star(plan)
-    names = (
-        [column.split(".", 1)[-1] for column in frame.columns]
-        if starred
-        else plan.output_names
-    )
-    return rows, description(names), len(rows), None
+    return rows, description(_result_names(plan, frame)), len(rows), None
+
+
+def _result_names(plan: _Select | _SetOp, frame: pl.DataFrame) -> list[str]:
+    """What ``cursor.description`` calls each column.
+
+    A projected column carries its position (``_out3``) and looks its
+    label up in the plan; a star-expanded one carries its source
+    qualifier (``items.id``) and drops it here, where SQL is happy to
+    repeat a name that a DataFrame cannot."""
+    labels = _leftmost(plan).output_names
+    names = []
+    for column in frame.columns:
+        if column.startswith(_OUTPUT_PREFIX):
+            index = int(column[len(_OUTPUT_PREFIX) :])
+            names.append(labels[index] if index < len(labels) else column)
+        else:
+            names.append(column.split(".", 1)[-1])
+    return names
+
+
+def _leftmost(plan: _Select | _SetOp) -> _Select:
+    """A set operation takes its column names from its first branch,
+    which may itself be one."""
+    while isinstance(plan, _SetOp):
+        plan = plan.left
+    return plan
 
 
 def _has_star(plan: _Select) -> bool:
-    return any(isinstance(p, exp.Star) for p in plan.projections)
+    return any(_star_source(p) is not _NOT_A_STAR for p in plan.projections)
+
+
+#: Distinguishes "not a star" from "an unqualified star", which is
+#: itself a meaningful value (every source).
+_NOT_A_STAR = object()
+
+
+def _star_source(node: exp.Expression) -> t.Any:  # noqa: ANN401
+    """``*`` -> ``None`` (every source), ``t.*`` -> ``"t"``, anything
+    else -> :data:`_NOT_A_STAR`. A qualified star parses as a ``Column``
+    whose own ``this`` is the ``Star``, not as a ``Star`` -- missing
+    that made ``SELECT i.*`` ask Milvus for a field named ``*`` and hand
+    back a column of ``None``."""
+    if isinstance(node, exp.Star):
+        return None
+    if isinstance(node, exp.Column) and isinstance(node.this, exp.Star):
+        return node.table or None
+    return _NOT_A_STAR
 
 
 def _evaluate(
@@ -1327,7 +1410,7 @@ def _evaluate(
     if plan.group or _has_aggregate(plan):
         frame = _aggregate(frame, ctx)
     else:
-        if plan.order:
+        if plan.order or plan.search_rank:
             frame = _sort(frame, ctx.against(frame))
             ctx = ctx.against(frame)
         frame = _project(frame, ctx)
@@ -1422,29 +1505,42 @@ def _project(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
     names, and SQL happily labels two columns the same (``SELECT i.id,
     c.id``) where a DataFrame cannot."""
     plan = ctx.plan
-    if _has_star(plan):
-        # `SELECT *` means every field of every source, in source order
-        # -- which is what the joined frame already holds. The qualifier
-        # this engine added stays on the DataFrame (two collections can
-        # both have an `id`, and a frame cannot); `_finish` strips it
-        # when naming the columns for `cursor.description`, where SQL
-        # does allow the repeat.
-        if len(plan.sources) == 1:
-            return frame.rename(
-                {name: name.split(".", 1)[-1] for name in frame.columns}
+    selected: list[pl.Expr] = []
+    for index, projection in enumerate(plan.projections):
+        source = _star_source(projection)
+        if source is _NOT_A_STAR:
+            selected.append(
+                _expression(projection, ctx).alias(f"{_OUTPUT_PREFIX}{index}")
             )
-        return frame
-    return frame.select(
-        [
-            _expression(projection, ctx).alias(f"_out{index}")
-            for index, projection in enumerate(plan.projections)
+            continue
+        # A star expands to the columns of the frame it names -- every
+        # source for `*`, one for `t.*`. They keep their qualifier: two
+        # collections can both have an `id`, and a DataFrame cannot hold
+        # that name twice. `_result_names` strips it for the caller,
+        # where SQL does allow the repeat.
+        prefix = None if source is None else f"{source}."
+        expanded = [
+            column
+            for column in frame.columns
+            if not column.endswith(f".{_RANK_COLUMN}")
+            and (prefix is None or column.startswith(prefix))
         ]
-    )
+        if not expanded:
+            msg = f"unknown table qualifier {source!r} in {source!r}.*"
+            raise errors.ProgrammingError(msg)
+        selected.extend(pl.col(column) for column in expanded)
+    return frame.select(selected)
 
 
 def _sort(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
     by: list[pl.Expr] = []
     descending: list[bool] = []
+    rank = getattr(ctx.plan, "search_rank", None)
+    if rank is not None and rank in frame.columns:
+        # `ORDER BY <vector> <=> :q` is the first key it was written as,
+        # so it stays the first key here; anything after it breaks ties.
+        by.append(pl.col(rank))
+        descending.append(False)
     for expression, desc in ctx.plan.order:
         by.append(_expression(_order_node(expression, ctx), ctx))
         descending.append(desc)
@@ -1508,11 +1604,18 @@ def _source_frame(
     # the *label* the inner SELECT gave it -- `_project` names its
     # output positionally (see there for why), so the labels are put
     # back on here, in order, before the alias is applied.
-    labels = (
-        inner.columns
-        if isinstance(source, _Select) and _has_star(source)
-        else [f"{name}.{label}" for label in source.output_names]
+    # A starred inner query names its columns from the data, so its
+    # labels come off the frame; anything else uses the labels it
+    # planned. Either way they are re-qualified under this alias --
+    # leaving a starred subquery's columns bare made the outer query's
+    # `s.cid` a `KeyError` out of the join.
+    bare = (
+        [column.split(".", 1)[-1] for column in inner.columns]
+        if len(source.output_names) != inner.width
+        or (isinstance(source, _Select) and _has_star(source))
+        else source.output_names
     )
+    labels = [f"{name}.{label}" for label in bare]
     return inner.rename(dict(zip(inner.columns, labels, strict=True)))
 
 
@@ -1523,29 +1626,111 @@ def _join(
     plan: _Select,
     frames: dict[str, pl.DataFrame],
 ) -> pl.DataFrame:
-    if join.how == "cross":
-        joined = left.join(right, how="cross")
-    else:
-        left, right = _align(left, right, join.left_keys, join.right_keys)
-        joined = left.join(
-            right,
-            left_on=join.left_keys,
-            right_on=join.right_keys,
-            how=t.cast("t.Any", join.how),
-            # SQL's equi-join never matches NULL to NULL. Polars agrees
-            # by default; spelled out because it is load-bearing.
-            nulls_equal=False,
-            # Both sides' keys are already uniquely named (`a.k` vs
-            # `b.k`), so there is nothing to coalesce and both stay
-            # addressable afterwards.
-            coalesce=False,
-            maintain_order="left",
-        )
-    if join.condition is not None:
-        joined = joined.filter(
+    if join.condition is None:
+        return _pair(left, right, join, how=join.how)
+    if join.how in {"inner", "cross"}:
+        # Nothing is null-extended by an inner join, so narrowing the
+        # paired rows afterwards is the same thing SQL means.
+        joined = _pair(left, right, join, how="inner")
+        return joined.filter(
             _expression(join.condition, _Ctx(plan, frames, joined))
         )
-    return joined
+    return _outer_join_with_condition(left, right, join, plan, frames)
+
+
+def _pair(
+    left: pl.DataFrame, right: pl.DataFrame, join: _Join, how: str
+) -> pl.DataFrame:
+    if how == "cross" or not join.left_keys:
+        # No equality to hash on: the pairing is every combination, and
+        # whatever condition came with it narrows them afterwards.
+        return left.join(right, how="cross")
+    left, right = _align(left, right, join.left_keys, join.right_keys)
+    return left.join(
+        right,
+        left_on=join.left_keys,
+        right_on=join.right_keys,
+        how=t.cast("t.Any", how),
+        # SQL's equi-join never matches NULL to NULL. Polars agrees
+        # by default; spelled out because it is load-bearing.
+        nulls_equal=False,
+        # Both sides' keys are already uniquely named (`a.k` vs
+        # `b.k`), so there is nothing to coalesce and both stay
+        # addressable afterwards.
+        coalesce=False,
+        maintain_order="left",
+    )
+
+
+#: Row identity, added just long enough to work out which rows of an
+#: outer join's preserved side found no partner.
+_LEFT_TAG = "__left_row"
+_RIGHT_TAG = "__right_row"
+
+
+def _outer_join_with_condition(
+    left: pl.DataFrame,
+    right: pl.DataFrame,
+    join: _Join,
+    plan: _Select,
+    frames: dict[str, pl.DataFrame],
+) -> pl.DataFrame:
+    """``LEFT``/``RIGHT``/``FULL JOIN ... ON <equality> AND <more>``, or
+    an outer join whose ``ON`` is not an equality at all.
+
+    Such a condition cannot be a hash-join key, so it has to be
+    evaluated over the paired rows. Doing that as a plain filter is
+    right for an inner join and wrong for this one: it deletes the
+    null-extended rows the outer join exists to keep, quietly turning
+    `LEFT JOIN ... ON a.k = b.k AND b.active` into an inner join. So the
+    rows are paired and narrowed first, then every unpaired row of the
+    preserved side is put back, null-extended."""
+    condition = join.condition
+    if condition is None:  # pragma: no cover -- guarded by the caller
+        msg = "an outer join with no condition needs no restoration"
+        raise errors.InternalError(msg)
+    tagged_left = left.with_row_index(_LEFT_TAG)
+    tagged_right = right.with_row_index(_RIGHT_TAG)
+    matched = _pair(tagged_left, tagged_right, join, how="inner")
+    matched = matched.filter(
+        _expression(condition, _Ctx(plan, frames, matched))
+    )
+    columns = matched.columns
+
+    parts = [matched]
+    if join.how in {"left", "full"}:
+        parts.append(_unmatched(tagged_left, matched, _LEFT_TAG, columns))
+    if join.how in {"right", "full"}:
+        parts.append(_unmatched(tagged_right, matched, _RIGHT_TAG, columns))
+    combined = pl.concat(parts, how="vertical_relaxed")
+    return combined.drop(_LEFT_TAG, _RIGHT_TAG)
+
+
+def _unmatched(
+    preserved: pl.DataFrame,
+    matched: pl.DataFrame,
+    tag: str,
+    columns: list[str],
+) -> pl.DataFrame:
+    """The preserved side's rows that no match kept, with the other
+    side's columns filled in as nulls."""
+    paired = matched[tag].unique().to_list() if matched.height else []
+    # `is_in([])` is not a dependable "matches nothing" in Polars -- it
+    # can yield nulls, and `filter` then drops the very rows this exists
+    # to keep.
+    survivors = (
+        preserved
+        if not paired
+        else preserved.filter(~pl.col(tag).is_in(paired))
+    )
+    missing = [column for column in columns if column not in survivors.columns]
+    filled = survivors.with_columns(
+        [
+            pl.lit(None, dtype=matched.schema[column]).alias(column)
+            for column in missing
+        ]
+    )
+    return filled.select(columns)
 
 
 def _align(
