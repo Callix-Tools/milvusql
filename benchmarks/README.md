@@ -34,21 +34,22 @@ under Milvus's 16384-row per-call ceiling so the run also works against
 Milvus Lite, which cannot serve the ordered pages the unbounded reads
 use past it.
 
-## Illustrative result (Milvus Lite, 10k items x 1k cats, dim=64)
+## Illustrative result (Milvus Lite, 20k items x 2k cats, dim=64)
 
 Milvus Lite is an embedded dev server — treat these as shape, not
 absolute performance. `example_infra/milvus.compose.yml` starts a real
 standalone server to measure against.
 
 ```
-1. ANN top-50 (no join, baseline)                p50=  15.6ms  rows=50
-2. ANN top-50 JOIN cats (key pushdown)           p50=  80.0ms  rows=50
-3. selective WHERE JOIN (predicate pushdown)     p50=  16.4ms  rows=60
-4. GROUP BY over the join (broad read)           p50= 142.5ms  rows=10
+1. ANN top-50 (no join, baseline)                p50=  44.6ms  rows=50
+2. ANN top-50 JOIN cats (key pushdown)           p50=  25.1ms  rows=50
+3. selective WHERE JOIN (predicate pushdown)     p50=  32.8ms  rows=89
+4. GROUP BY over the join (broad read)           p50= 278.5ms  rows=10
 ```
 
-The load-bearing observation is row counts, not milliseconds: query 2
-reads 50 rows from `bench_cats` (not 1 000), query 3 reads ~60 rows
-from `bench_items` (not 10 000) — both scale with the *result*, not
-the collection. Query 4 reads every matching row by design; that is
-what a grouped aggregate means.
+The load-bearing observation is row counts, not milliseconds (Lite's
+per-query jitter is large — that is why the p50 of 7 runs is reported):
+query 2 reads at most 50 rows from `bench_cats` (not 2 000), query 3
+reads ~89 rows from `bench_items` (not 20 000) — both scale with the
+*result*, not the collection. Query 4 reads every matching row (~10k
+here) by design; that is what a grouped aggregate means.
