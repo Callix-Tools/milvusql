@@ -39,10 +39,15 @@ def family(connection):
             class Meta:
                 app_label = "dj_app"
 
+        # The casts up front: no django-stubs in this workspace, so
+        # `ty` can't see the metaclass-injected `_meta`/`objects` --
+        # same understood cast the rest of the suite uses.
+        parent_model: t.Any = Parent
+        child_model: t.Any = Child
         with connection.schema_editor() as editor:
-            editor.create_model(Parent)
-            editor.create_model(Child)
-        for model in (Parent, Child):
+            editor.create_model(parent_model)
+            editor.create_model(child_model)
+        for model in (parent_model, child_model):
             create_index_and_load(
                 connection,
                 model._meta.db_table,
@@ -51,8 +56,6 @@ def family(connection):
                 metric_type="L2",
             )
 
-        parent_model: t.Any = Parent
-        child_model: t.Any = Child
         with_active = parent_model.objects.create(
             name="with-active", embedding=[0.1, 0.1]
         )

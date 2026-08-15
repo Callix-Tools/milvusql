@@ -247,3 +247,45 @@ class TestJsonAndArrayFilters:
                 "SELECT id FROM t WHERE MYSTERY_FN(name) = :v LIMIT 5",
                 {"v": "x"},
             )
+
+
+class TestBareBooleanPredicates:
+    """Django compiles ``.filter(active=True)`` to the bare column
+    (``WHERE "active"``), and Milvus rejects a bare field reference as
+    a predicate -- confirmed against a real server: "predicate is not a
+    boolean expression". Boolean positions get the explicit
+    comparison; value positions stay untouched."""
+
+    def test_a_bare_boolean_column_becomes_an_explicit_comparison(
+        self, build_call_helper
+    ):
+        call = build_call_helper("SELECT id FROM t WHERE active LIMIT 5")
+        assert call.kwargs["filter"] == "active == true"
+
+    def test_inside_and_or_not(self, build_call_helper):
+        call = build_call_helper(
+            "SELECT id FROM t WHERE active AND (deleted OR id > 5) LIMIT 5"
+        )
+        assert call.kwargs["filter"] == (
+            "(active == true and ((deleted == true or id > 5)))"
+        )
+        call = build_call_helper("SELECT id FROM t WHERE NOT active LIMIT 5")
+        assert call.kwargs["filter"] == "not (active == true)"
+
+    def test_value_positions_are_not_wrapped(self, build_call_helper):
+        call = build_call_helper(
+            "SELECT id FROM t WHERE flag = other_flag LIMIT 5"
+        )
+        assert call.kwargs["filter"] == "flag == other_flag"
+
+    def test_array_length_parses_to_its_own_node_and_still_renders(
+        self, build_call_helper
+    ):
+        """``ARRAY_LENGTH(x)`` parses to ``exp.ArraySize``, not an
+        ``Anonymous`` call -- caught by a real CI failure against a
+        real server."""
+        call = build_call_helper(
+            "SELECT id FROM t WHERE ARRAY_LENGTH(nums) = :n LIMIT 5",
+            {"n": 3},
+        )
+        assert call.kwargs["filter"] == "array_length(nums) == 3"

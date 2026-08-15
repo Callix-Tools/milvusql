@@ -178,6 +178,28 @@ def _render_filter_argument(
     return render_filter_value(resolve_value(node, parameters))
 
 
+def render_predicate(
+    node: exp.Expression, parameters: dict[str, t.Any]
+) -> str:
+    """A node in *boolean position* (a WHERE tree, an AND/OR/NOT
+    operand) -> filter text Milvus accepts as a predicate.
+
+    The one thing this adds over :func:`render_filter` is the bare
+    boolean column: Django compiles ``.filter(active=True)`` to just
+    ``"active"`` (confirmed directly against its compiler output), and
+    Milvus's filter parser rejects a bare field reference as a
+    predicate outright -- "predicate is not a boolean expression:
+    active, data type: Bool", confirmed against a real server -- so it
+    becomes the explicit ``active == true`` here. Only boolean
+    positions get this treatment: a column on either side of ``=`` is
+    a value, and wrapping it would be wrong."""
+    if isinstance(node, exp.Paren):
+        return f"({render_predicate(node.this, parameters)})"
+    if isinstance(node, (exp.Column, exp.Bracket)):
+        return f"{render_filter(node, parameters)} == true"
+    return render_filter(node, parameters)
+
+
 def render_filter(  # noqa: PLR0911, PLR0912, PLR0915 -- one return per AST node case, clearer flat than nested
     node: exp.Expression, parameters: dict[str, t.Any]
 ) -> str:
@@ -194,19 +216,19 @@ def render_filter(  # noqa: PLR0911, PLR0912, PLR0915 -- one return per AST node
     inline here, via :func:`render_filter_value`, is the fallback that
     is verified to actually work."""
     if isinstance(node, exp.Where):
-        return render_filter(node.this, parameters)
+        return render_predicate(node.this, parameters)
     if isinstance(node, exp.Paren):
         return f"({render_filter(node.this, parameters)})"
     if isinstance(node, exp.And):
-        left = render_filter(node.this, parameters)
-        right = render_filter(node.expression, parameters)
+        left = render_predicate(node.this, parameters)
+        right = render_predicate(node.expression, parameters)
         return f"({left} and {right})"
     if isinstance(node, exp.Or):
-        left = render_filter(node.this, parameters)
-        right = render_filter(node.expression, parameters)
+        left = render_predicate(node.this, parameters)
+        right = render_predicate(node.expression, parameters)
         return f"({left} or {right})"
     if isinstance(node, exp.Not):
-        return f"not ({render_filter(node.this, parameters)})"
+        return f"not ({render_predicate(node.this, parameters)})"
     op = COMPARISON_OPS.get(type(node))
     if op is not None:
         left = render_filter(node.this, parameters)
@@ -298,6 +320,13 @@ def render_filter(  # noqa: PLR0911, PLR0912, PLR0915 -- one return per AST node
         column = _render_filter_argument(node.this, parameters)
         value = _render_filter_argument(node.expression, parameters)
         return f"array_contains({column}, {value})"
+    if isinstance(node, exp.ArraySize):
+        # `ARRAY_LENGTH(tags)` also parses into a dedicated node
+        # (`ArraySize`), not an `Anonymous` call -- confirmed against a
+        # real CI failure where only the Anonymous roster below was
+        # consulted and the spelling fell through to the rejection.
+        column = _render_filter_argument(node.this, parameters)
+        return f"array_length({column})"
     if isinstance(node, exp.Anonymous):
         rendered_name = _FILTER_FUNCTIONS.get(str(node.this).upper())
         if rendered_name is None:
@@ -476,6 +505,7 @@ __all__ = [
     "filter_text",
     "render_filter",
     "render_filter_value",
+    "render_predicate",
     "resolve_value",
     "unbounded_query_call",
 ]

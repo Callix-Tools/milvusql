@@ -103,3 +103,24 @@ class TestSemiJoin:
             [CATS, ITEMS],
         )
         assert rows == [(1,), (2,), (3,)]
+
+
+def test_a_bare_boolean_inner_filter_pushes_as_an_explicit_comparison(
+    build_call_helper, drive_chain
+):
+    """Django spells the inner ``active=True`` as the bare column
+    (``U0."active" AND ...``); the pushed-down Milvus filter must be
+    the explicit comparison a real server accepts."""
+    sql = (
+        'SELECT "items"."id" FROM "items" WHERE EXISTS '
+        '(SELECT 1 AS "a" FROM "cats" U0 WHERE '
+        '(U0."active" AND U0."item_id" = ("items"."id")) LIMIT 1)'
+    )
+    calls, (rows, _d, _rc, _l) = drive_chain(
+        build_call_helper(sql), [CATS, ITEMS]
+    )
+    cats_scan = next(
+        c for c in calls if c.kwargs.get("collection_name") == "cats"
+    )
+    assert cats_scan.kwargs["filter"] == "active == true"
+    assert rows == [(1,), (3,)]

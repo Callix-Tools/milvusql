@@ -24,7 +24,9 @@ class TestCountStar:
         assert call.kwargs == {
             "collection_name": "items",
             "output_fields": ["count(*)"],
-            "filter": "active",
+            # The bare boolean column becomes an explicit comparison --
+            # Milvus rejects a bare field reference as a predicate.
+            "filter": "active == true",
         }
 
     def test_postprocess_reads_the_native_count(self, build_call_helper):

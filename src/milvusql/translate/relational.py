@@ -57,8 +57,8 @@ from milvusql.translate._common import (
     RowsAndDescription,
     ann_metric,
     description,
-    render_filter,
     render_filter_value,
+    render_predicate,
     resolve_value,
     unbounded_query_call,
 )
@@ -1137,7 +1137,10 @@ def _conjunct_filter(
     combined = stripped[0]
     for conjunct in stripped[1:]:
         combined = exp.and_(combined, conjunct)
-    return render_filter(combined, parameters)
+    # Predicate position: a single pushed-down conjunct can be a bare
+    # boolean column (Django's `.filter(active=True)`), which Milvus
+    # only accepts as an explicit comparison.
+    return render_predicate(combined, parameters)
 
 
 def _nested_plans(plan: _Select | _SetOp) -> list[_Select | _SetOp]:

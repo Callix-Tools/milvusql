@@ -35,16 +35,13 @@ def note_model(connection):
             class Meta:
                 app_label = "dj_app"
 
+        # The cast up front: no django-stubs in this workspace, so `ty`
+        # can't see the metaclass-injected `_meta`/`objects` -- same
+        # understood cast the rest of the suite uses.
+        note_model: t.Any = Note
         with connection.schema_editor() as editor:
-            editor.create_model(Note)
-        create_index_and_load(
-            connection,
-            Note._meta.db_table,
-            "embedding",
-            using="FLAT",
-            metric_type="L2",
-        )
-        yield t.cast("t.Any", Note)
+            editor.create_model(note_model)
+        yield note_model
 
 
 def test_textfield_is_full_text_searchable(note_model, connection):
@@ -58,7 +55,19 @@ def test_textfield_is_full_text_searchable(note_model, connection):
     note_model.objects.create(
         body="postgres is a relational database", embedding=[0.9, 0.9]
     )
+    # Index + load AFTER the inserts: the keyword-match index over a
+    # collection loaded *before* its rows arrive lags behind them
+    # (confirmed against a real server in CI -- the same query matched
+    # nothing), while loading after insert is deterministic. Same order
+    # the core fulltext suite uses.
     table = note_model._meta.db_table
+    create_index_and_load(
+        connection,
+        table,
+        "embedding",
+        using="FLAT",
+        metric_type="L2",
+    )
     with connection.cursor() as cursor:
         cursor.execute(
             f'SELECT body FROM "{table}" WHERE MATCH(body) AGAINST (%(q)s)',
