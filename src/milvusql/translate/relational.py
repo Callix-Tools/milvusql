@@ -181,8 +181,20 @@ def needs_relational_engine(ast: exp.Select) -> bool:
         # `ast_to_pymilvus._flatten_trivial_subquery`), so anything
         # still wrapped here genuinely needs evaluating in two steps.
         return True
-    where = ast.args.get("where")
-    return where is not None and bool(list(where.find_all(exp.Select)))
+    # A subquery anywhere a value is expected counts, not just in
+    # WHERE: Django's `annotate(Subquery(...))` puts one in the SELECT
+    # list, and the single-call path would ask Milvus for an output
+    # field named after it and hand back a column of `None`.
+    scopes = [
+        ast.args.get("where"),
+        ast.args.get("having"),
+        ast.args.get("order"),
+        *ast.expressions,
+    ]
+    return any(
+        scope is not None and scope.find(exp.Select) is not None
+        for scope in scopes
+    )
 
 
 # -----------------------------------------------------------------------
@@ -256,7 +268,10 @@ def _referenced_frames(node: exp.Expression, known: set[str]) -> set[str]:
 
 
 def _plan_select(
-    ast: exp.Select, parameters: dict[str, t.Any], scans: list[_Scan]
+    ast: exp.Select,
+    parameters: dict[str, t.Any],
+    scans: list[_Scan],
+    outer: frozenset[str] = frozenset(),
 ) -> _Select:
     """Walk one ``SELECT`` into a :class:`_Select`, appending every
     collection read it needs to ``scans`` -- one list shared by the whole
@@ -267,8 +282,11 @@ def _plan_select(
         raise errors.NotSupportedError(msg)
 
     join_nodes = list(ast.args.get("joins") or [])
-    sources = _plan_sources(ast, join_nodes, parameters, scans)
+    sources = _plan_sources(ast, join_nodes, parameters, scans, outer)
     known = {name for name, _ in sources}
+    # Everything an inner SELECT could correlate against: this query's
+    # sources plus whatever the enclosing ones brought.
+    enclosing = outer | known
     scan_frames = {
         name for name, source in sources if isinstance(source, _Scan)
     }
@@ -279,15 +297,22 @@ def _plan_select(
         scan_frames - _null_supplying(ast, join_nodes),
         parameters,
         scans,
+        enclosing,
+    )
+    subqueries.update(
+        _plan_value_subqueries(ast, parameters, scans, enclosing)
     )
     order, search_frame, search = _plan_order(ast, parameters, known)
 
-    group = list((ast.args.get("group") or exp.Group()).expressions)
     having = ast.args.get("having")
     projections = list(ast.expressions)
     output_names = [
         projection.output_name or f"_col{index}"
         for index, projection in enumerate(projections)
+    ]
+    group = [
+        _group_key(key, projections)
+        for key in (ast.args.get("group") or exp.Group()).expressions
     ]
 
     wants_star = any(isinstance(p, exp.Star) for p in projections)
@@ -307,7 +332,7 @@ def _plan_select(
     consumers.extend(
         join.args["on"] for join in join_nodes if join.args.get("on")
     )
-    needed = _needed_columns(consumers, known)
+    needed = _needed_columns(consumers, known, outer)
 
     consistency = ast.args.get(CONSISTENCY_ARG)
     for name, source in sources:
@@ -344,11 +369,38 @@ def _plan_select(
     )
 
 
+def _group_key(
+    node: exp.Expression, projections: list[exp.Expression]
+) -> exp.Expression:
+    """A ``GROUP BY`` key -> the expression to group on.
+
+    An ordinal position addresses the SELECT list, and Django's SQL
+    compiler emits nothing else: every ``.values(...).annotate(...)``
+    query groups by ``GROUP BY 1`` (confirmed directly against its
+    compiler output), never by naming the column. Left unresolved that
+    groups by the constant ``1`` -- one group for the whole
+    collection -- so the projected column is then neither grouped nor
+    aggregated and the query fails."""
+    if isinstance(node, exp.Literal) and not node.is_string:
+        index = int(node.this) - 1
+        if not 0 <= index < len(projections):
+            msg = f"GROUP BY position {node.this} is out of range"
+            raise errors.ProgrammingError(msg)
+        projection = projections[index]
+        return (
+            projection.this
+            if isinstance(projection, exp.Alias)
+            else projection
+        )
+    return node
+
+
 def _plan_sources(
     ast: exp.Select,
     join_nodes: list[exp.Join],
     parameters: dict[str, t.Any],
     scans: list[_Scan],
+    outer: frozenset[str],
 ) -> list[tuple[str, _Scan | _Select]]:
     """``FROM``/``JOIN`` -> one source per name. A table becomes a scan;
     an aliased subquery becomes a nested plan whose own scans are
@@ -372,7 +424,9 @@ def _plan_sources(
                     f"{inner.__class__.__name__}"
                 )
                 raise errors.NotSupportedError(msg)
-            sources.append((name, _plan_select(inner, parameters, scans)))
+            sources.append(
+                (name, _plan_select(inner, parameters, scans, outer))
+            )
         else:
             msg = (
                 f"unsupported FROM source: {node.__class__.__name__}; FROM "
@@ -411,12 +465,13 @@ def _null_supplying(ast: exp.Select, join_nodes: list[exp.Join]) -> set[str]:
     return null_supplying
 
 
-def _plan_predicates(
+def _plan_predicates(  # noqa: PLR0913, PLR0917 -- one argument per planning input, all needed
     ast: exp.Select,
     known: set[str],
     pushable_frames: set[str],
     parameters: dict[str, t.Any],
     scans: list[_Scan],
+    enclosing: frozenset[str],
 ) -> tuple[
     dict[str, list[exp.Expression]],
     list[exp.Expression],
@@ -437,7 +492,9 @@ def _plan_predicates(
         nested = _outermost_selects(conjunct)
         if nested:
             for inner in nested:
-                subqueries[id(inner)] = _plan_select(inner, parameters, scans)
+                subqueries[id(inner)] = _plan_select(
+                    inner, parameters, scans, enclosing
+                )
             residual.append(conjunct)
             continue
         frames = _referenced_frames(conjunct, known)
@@ -446,6 +503,28 @@ def _plan_predicates(
         else:
             residual.append(conjunct)
     return pushable, residual, subqueries
+
+
+def _plan_value_subqueries(
+    ast: exp.Select,
+    parameters: dict[str, t.Any],
+    scans: list[_Scan],
+    enclosing: frozenset[str],
+) -> dict[int, _Select]:
+    """Subqueries outside ``WHERE`` -- in the SELECT list, ``HAVING`` or
+    ``ORDER BY`` -- each planned as one more read in the same chain."""
+    planned: dict[int, _Select] = {}
+    hosts: list[exp.Expression] = [*ast.expressions]
+    for key in ("having", "order"):
+        node = ast.args.get(key)
+        if node is not None:
+            hosts.append(node)
+    for host in hosts:
+        for inner in _outermost_selects(host):
+            planned[id(inner)] = _plan_select(
+                inner, parameters, scans, enclosing
+            )
+    return planned
 
 
 def _outermost_selects(node: exp.Expression) -> list[exp.Select]:
@@ -490,14 +569,14 @@ def _plan_order(
 
 
 def _needed_columns(
-    consumers: list[exp.Expression], known: set[str]
+    consumers: list[exp.Expression], known: set[str], outer: frozenset[str]
 ) -> dict[str, list[str]]:
     """Projection pushdown: the fields each collection is asked for are
     exactly the ones the statement mentions."""
     needed: dict[str, list[str]] = {name: [] for name in known}
     for consumer in consumers:
         for column in _columns_of(consumer):
-            frame, name = _qualified(column, known)
+            frame, name = _qualified(column, known, outer)
             if name not in needed[frame]:
                 needed[frame].append(name)
     return needed
@@ -612,7 +691,9 @@ def _equi_key_pair(
     return None
 
 
-def _qualified(column: exp.Column, known: set[str]) -> tuple[str, str]:
+def _qualified(
+    column: exp.Column, known: set[str], outer: frozenset[str] = frozenset()
+) -> tuple[str, str]:
     """``t.col`` -> ``("t", "col")``, and a bare ``col`` -> the only
     source in scope.
 
@@ -623,6 +704,21 @@ def _qualified(column: exp.Column, known: set[str]) -> tuple[str, str]:
     to the wrong collection, so this asks for the qualification
     instead."""
     if column.table:
+        if column.table in outer and column.table not in known:
+            # A correlated subquery: it names a table from the query
+            # that encloses it, so its result depends on the row being
+            # evaluated. Answering that needs either one Milvus read per
+            # outer row or a rewrite into a semi-join -- neither exists
+            # here yet, and the ORMs that emit this shape
+            # (SQLAlchemy's `.any()`/`.has()`, Django's `Exists()` with
+            # `OuterRef`) deserve to be told which construct is missing.
+            msg = (
+                "correlated subqueries are not supported: this one "
+                f"references {column.table!r} from the enclosing query. "
+                "Rewrite it as a JOIN, or as an uncorrelated "
+                "IN (SELECT ...)"
+            )
+            raise errors.NotSupportedError(msg)
         if column.table not in known:
             msg = (
                 f"unknown table qualifier {column.table!r} on column "
@@ -1120,10 +1216,32 @@ def _align(
 
 
 def _has_aggregate(plan: _Select) -> bool:
+    """Does this query reduce? A subquery's own aggregate does not count
+    -- ``SELECT id, (SELECT MAX(c.id) FROM cats c) FROM items`` reduces
+    nothing in the outer query, and treating it as an aggregate made the
+    outer reduction look for the subquery's columns in the outer
+    frame."""
     consumers = list(plan.projections)
     if plan.having is not None:
         consumers.append(plan.having)
-    return any(node.find(exp.AggFunc) is not None for node in consumers)
+    return any(_top_level_aggregates(node) for node in consumers)
+
+
+def _match_key(node: exp.Expression) -> str:
+    """A comparison key for "is this the same expression?".
+
+    Generated SQL is not consistent about quoting -- Django writes the
+    SELECT list as ``"cat" AS "cat"`` but the grouping as an ordinal,
+    and hand-written MilvusQL mixes ``GROUP BY cat`` with a quoted
+    projection. Matching on the rendered SQL alone made ``"cat"`` and
+    ``cat`` two different expressions, so the projected column looked
+    ungrouped. Quoting is stripped for the comparison only; the
+    identifiers themselves stay untouched, and case still matters --
+    Milvus field names are case-sensitive."""
+    copied = node.copy()
+    for identifier in copied.find_all(exp.Identifier):
+        identifier.set("quoted", False)
+    return copied.sql()
 
 
 def _aggregate(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
@@ -1138,9 +1256,12 @@ def _aggregate(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
     and ``HAVING COUNT(*) > 2`` work -- neither is expressible inside a
     single ``agg``."""
     plan = ctx.plan
-    group_names = {key.sql(): f"_group{i}" for i, key in enumerate(plan.group)}
+    group_names = {
+        _match_key(key): f"_group{index}"
+        for index, key in enumerate(plan.group)
+    }
     keys = [
-        _expression(key, ctx).alias(group_names[key.sql()])
+        _expression(key, ctx).alias(group_names[_match_key(key)])
         for key in plan.group
     ]
 
@@ -1152,7 +1273,7 @@ def _aggregate(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
     for consumer in consumers:
         for node in _top_level_aggregates(consumer):
             aggregate_names.setdefault(
-                node.sql(), f"_agg{len(aggregate_names)}"
+                _match_key(node), f"_agg{len(aggregate_names)}"
             )
 
     reductions = [
@@ -1166,7 +1287,8 @@ def _aggregate(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
         reduced = frame.select(reductions)
 
     def substitute(node: exp.Expression) -> pl.Expr | None:
-        name = group_names.get(node.sql()) or aggregate_names.get(node.sql())
+        key = _match_key(node)
+        name = group_names.get(key) or aggregate_names.get(key)
         return pl.col(name) if name is not None else None
 
     post = _Ctx(plan, ctx.frames, reduced).with_substitution(substitute)
@@ -1181,9 +1303,13 @@ def _aggregate(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
 
 def _top_level_aggregates(node: exp.Expression) -> list[exp.Expression]:
     """Every aggregate call in ``node`` that is not itself nested inside
-    another aggregate -- the ones that become ``agg`` outputs."""
+    another aggregate -- the ones that become ``agg`` outputs. Stops at a
+    nested ``SELECT`` for the same reason :func:`_columns_of` does: that
+    reduction belongs to the subquery, which evaluates on its own."""
     if isinstance(node, exp.AggFunc):
         return [node]
+    if isinstance(node, exp.Select):
+        return []
     found: list[exp.Expression] = []
     for child in node.args.values():
         for item in child if isinstance(child, list) else [child]:
@@ -1198,7 +1324,7 @@ def _unique_aggregates(
     seen: dict[str, exp.Expression] = {}
     for consumer in consumers:
         for node in _top_level_aggregates(consumer):
-            seen.setdefault(node.sql(), node)
+            seen.setdefault(_match_key(node), node)
     return [(node, names[key]) for key, node in seen.items()]
 
 

@@ -140,9 +140,29 @@ Three behaviours worth knowing before you rely on them:
   are requested from Milvus before any row comes back, and no collection
   schema is available at that point to resolve the name against.
 
-Not supported yet, and rejected explicitly rather than mistranslated: `WITH`
-(CTEs), set operations (`UNION`/`INTERSECT`/`EXCEPT`), `JOIN ... USING`,
-`SELECT *` across a join, and window functions.
+### Through the ORMs
+
+Both packages inherit this at the DBAPI level — no ORM-side change was
+needed — so the ordinary constructs compile and run:
+
+| SQLAlchemy | Django |
+|---|---|
+| `select(...).join(...)` / `.outerjoin(...)` | `filter(related__field=...)`, `select_related(...)` |
+| `.group_by(...)` / `.having(...)` | `.values(...).annotate(Count(...))`, then `.filter(n__gt=...)` |
+| `col.in_(select(...))` | `filter(fk__in=Model.objects.values("id"))` |
+| `Query.count()` (still a server-side `count(*)`, no rows fetched) | `.count()` |
+
+Django's compiler groups and orders by *ordinal position* (`GROUP BY 1`,
+`ORDER BY 2 DESC`) rather than by name, and both ORMs quote every
+identifier; the planner resolves both spellings.
+
+Not supported yet, and rejected explicitly rather than mistranslated:
+**correlated** subqueries (SQLAlchemy's `.any()`/`.has()`, Django's
+`Exists(... OuterRef(...))` and `Subquery(...)` annotations — their result
+depends on the outer row, which needs either one read per row or a
+semi-join rewrite), `WITH` (CTEs), set operations
+(`UNION`/`INTERSECT`/`EXCEPT`), `JOIN ... USING`, `SELECT *` across a join,
+and window functions.
 
 Anything that *doesn't* need this path — a filter `SELECT`, a vector search, a
 hybrid search, a bare `COUNT(*)` — is still exactly one RPC and never builds a

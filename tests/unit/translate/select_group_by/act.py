@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import pytest
 
+import milvusql
+
 pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 ROWS = [
@@ -139,3 +141,50 @@ class TestReduction:
         rows, _desc, rowcount, _lastrowid = call.postprocess([])
         assert rows == []
         assert rowcount == 0
+
+
+class TestOrdinalAndQuotedKeys:
+    """The spellings real ORMs emit, which are not the ones a person
+    writes by hand."""
+
+    def test_group_by_an_ordinal_position(self, build_call_helper):
+        """Django's SQL compiler groups by position for *every*
+        ``.values(...).annotate(...)`` query -- it never names the
+        column. Left unresolved, ``GROUP BY 1`` grouped by the constant
+        1: one group for the whole collection."""
+        call = build_call_helper(
+            'SELECT "category" AS "category", COUNT("price") AS "n" '
+            "FROM items GROUP BY 1"
+        )
+        rows, _desc, _rowcount, _lastrowid = call.postprocess(ROWS)
+        assert rows == [("book", 2), ("film", 1)]
+
+    def test_order_by_an_ordinal_position(self, build_call_helper):
+        call = build_call_helper(
+            'SELECT "category" AS "category", AVG("price") AS "a" '
+            "FROM items GROUP BY 1 ORDER BY 2 DESC"
+        )
+        rows, _desc, _rowcount, _lastrowid = call.postprocess(ROWS)
+        assert rows == [("film", 30.0), ("book", 15.0)]
+
+    def test_a_quoted_projection_matches_an_unquoted_group_key(
+        self, build_call_helper
+    ):
+        """Generated SQL is not consistent about quoting. Matching
+        expressions on their rendered SQL made ``"category"`` and
+        ``category`` two different things, so the projected column
+        looked ungrouped and the query failed."""
+        call = build_call_helper(
+            'SELECT "category" AS "category", COUNT(*) AS "n" '
+            "FROM items GROUP BY category"
+        )
+        rows, _desc, _rowcount, _lastrowid = call.postprocess(ROWS)
+        assert rows == [("book", 2), ("film", 1)]
+
+    def test_group_by_position_out_of_range_is_rejected(
+        self, build_call_helper
+    ):
+        with pytest.raises(milvusql.ProgrammingError, match="out of range"):
+            build_call_helper(
+                "SELECT category FROM items GROUP BY 5"
+            )
