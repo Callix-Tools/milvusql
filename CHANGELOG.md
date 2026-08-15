@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-08-15
+### Documentation
+
+- Add production-ready usage examples for core and sqlalchemy packages by @Neko1313 in [#6](https://github.com/Callix-Tools/milvusql/pull/6)
+- docs: refresh package READMEs (badges, API reference, logo) by @Neko1313 in [#7](https://github.com/Callix-Tools/milvusql/pull/7)
+
+
+
+
+**Full Changelog**: https://github.com/Callix-Tools/milvusql/compare/v0.1.3...v0.1.4
 ## [0.1.3] - 2026-08-14
 ### Testing
 
