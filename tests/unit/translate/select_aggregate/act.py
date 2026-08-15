@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pytest
 
+import milvusql
+
 pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 
@@ -94,3 +96,50 @@ class TestGenericAggregates:
             [{"stock": 5, "id": 1}, {"stock": 10, "id": 2}]
         )
         assert rows == [(15, 2)]
+
+
+class TestCountDistinct:
+    def test_count_distinct_requests_the_real_column(
+        self, build_call_helper, drive_chain
+    ):
+        """`COUNT(DISTINCT x)` wraps the column in `exp.Distinct` whose
+        own `.name` is "" -- reading it directly asked Milvus for a
+        field named "" and the count was always 0 (confirmed by direct
+        execution)."""
+        call = build_call_helper("SELECT COUNT(DISTINCT category) FROM items")
+        assert call.kwargs["output_fields"] == ["category"]
+        raw = [
+            {"category": "a"},
+            {"category": "a"},
+            {"category": "b"},
+            {"category": None},
+        ]
+        _calls, (rows, _d, _rc, _l) = drive_chain(call, [raw])
+        assert rows == [(2,)]
+
+
+class TestUngroupedHaving:
+    def test_having_on_a_bare_aggregate_filters_the_one_row(
+        self, build_call_helper, drive_chain
+    ):
+        """SQL's HAVING without GROUP BY treats the whole result as one
+        group. The single-call path silently dropped the clause
+        (confirmed by direct execution: the count row came back
+        regardless) -- it routes through the relational engine now, and
+        binds resolve in that client-side position too."""
+        call = build_call_helper(
+            "SELECT COUNT(*) AS n FROM items HAVING COUNT(*) > :n", {"n": 100}
+        )
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            call, [[{"id": index} for index in range(5)]]
+        )
+        assert rows == []
+
+    def test_having_without_any_aggregate_is_rejected(
+        self, build_call_helper, drive_chain
+    ):
+        with pytest.raises(milvusql.ProgrammingError, match="HAVING"):
+            drive_chain(
+                build_call_helper("SELECT id FROM items HAVING id > 5"),
+                [[{"id": 1}]],
+            )

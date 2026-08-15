@@ -235,6 +235,26 @@ def render_filter(  # noqa: PLR0911, PLR0912, PLR0915 -- one return per AST node
         right = render_filter(node.expression, parameters)
         return f"{left} {op} {right}"
     if isinstance(node, exp.In):
+        if (
+            node.args.get("query") is not None
+            or node.args.get("unnest") is not None
+        ):
+            # `IN (SELECT ...)` carries the subquery in `query`, not in
+            # `expressions` -- falling through to the empty-list branch
+            # below rendered it as the constant `false`, which made
+            # `DELETE ... WHERE id NOT IN (SELECT ...)` delete every
+            # row (`not (false)`), confirmed by direct execution. A
+            # SELECT never reaches here (the relational engine plans
+            # its subqueries as reads); DELETE/UPDATE and search
+            # filters have no second read to answer it with, so the
+            # honest response is a named rejection.
+            msg = (
+                "IN (SELECT ...) cannot be pushed into a Milvus "
+                "filter: it is supported in SELECT (planned as its own "
+                "read), not in DELETE/UPDATE or search filters. "
+                "Materialize the subquery's values first."
+            )
+            raise errors.NotSupportedError(msg)
         # Milvus's filter DSL has its own native `field in [...]`
         # syntax (confirmed directly against Milvus Lite) -- no
         # transpiling needed, just render the column and each

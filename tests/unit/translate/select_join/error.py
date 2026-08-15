@@ -180,3 +180,34 @@ class TestRowCeilingIsPagedPast:
             ]
         ]
         assert call.then(hits).kwargs["collection_name"] == "cats"
+
+
+class TestQuadraticJoinBound:
+    def test_a_no_key_join_past_the_bound_raises(
+        self, build_call_helper, drive_chain
+    ):
+        """The cross-join fallback pairs every row combination; the
+        per-call row ceiling used to bound its inputs implicitly, and
+        paged reads removed that, so the quadratic path re-imposes the
+        same bound explicitly."""
+        big = [{"a": index} for index in range(DEFAULT_QUERY_LIMIT)]
+        describe = {"fields": [{"name": "a", "is_primary": True}]}
+        remainder = [{"a": DEFAULT_QUERY_LIMIT}]
+        with pytest.raises(milvusql.NotSupportedError, match="quadratic"):
+            drive_chain(
+                build_call_helper(
+                    "SELECT x.a, y.b FROM xs AS x CROSS JOIN ys AS y"
+                ),
+                [big, describe, big, remainder, [{"b": 1}]],
+            )
+
+    def test_a_small_cross_join_still_works(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT x.a, y.b FROM xs AS x CROSS JOIN ys AS y"
+            ),
+            [[{"a": 1}, {"a": 2}], [{"b": 9}]],
+        )
+        assert sorted(rows) == [(1, 9), (2, 9)]

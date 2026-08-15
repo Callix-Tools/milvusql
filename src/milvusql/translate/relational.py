@@ -183,6 +183,11 @@ class _Select:
     #: Correlated ``[NOT] EXISTS`` conjuncts, decorrelated into
     #: semi/anti joins -- see :class:`_SemiJoin`.
     semi_joins: list[_SemiJoin] = field(default_factory=list)
+    #: The statement's bind parameters, kept so client-side evaluation
+    #: (residual predicates, HAVING) can resolve a ``:name`` the same
+    #: way pushed-down filters do -- refusing them was an artifact of
+    #: not threading this through, not a real limitation.
+    parameters: dict[str, t.Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -257,6 +262,12 @@ def needs_relational_engine(ast: exp.Select) -> bool:
     if (
         ast.args.get("joins")
         or ast.args.get("group") is not None
+        # HAVING without GROUP BY is SQL's "treat the whole result as
+        # one group" -- only this engine applies `having` at all, so
+        # the single-call aggregate path would silently drop it
+        # (confirmed by direct execution: `SELECT COUNT(*) ... HAVING
+        # COUNT(*) > 100` returned the count row regardless).
+        or ast.args.get("having") is not None
         or ast.args.get("with_") is not None
         # `DISTINCT` and `OFFSET` have no Milvus-side equivalent either:
         # `query()` takes a filter and a row cap, nothing else. The
@@ -498,6 +509,7 @@ def _plan_select(
         ),
         subqueries=subqueries,
         semi_joins=semi_joins,
+        parameters=parameters,
     )
 
 
@@ -1616,6 +1628,17 @@ def _evaluate(
     if plan.group or _has_aggregate(plan):
         frame = _aggregate(frame, ctx)
     else:
+        if plan.having is not None:
+            # Reaching here means no GROUP BY and no aggregate anywhere
+            # (a HAVING containing one routes through `_aggregate`
+            # above) -- SQL has no meaning for that HAVING, and this
+            # engine is the only place `having` is ever applied, so
+            # dropping it silently would be a wrong answer.
+            msg = (
+                "HAVING without GROUP BY needs an aggregate to filter "
+                "on; use WHERE for row-level conditions"
+            )
+            raise errors.ProgrammingError(msg)
         if plan.order or plan.search_rank:
             frame = _sort(frame, ctx.against(frame))
             ctx = ctx.against(frame)
@@ -1868,12 +1891,36 @@ def _join(
     return _outer_join_with_condition(left, right, join, plan, frames)
 
 
+#: The most rows either side of a *quadratic* (no-equi-key) join may
+#: carry. This is the bound Milvus's own per-call row ceiling used to
+#: impose on every scan before reads learned to page past it -- the
+#: "small inputs only; the row ceiling keeps that honest" guarantee the
+#: cross-join fallback was written against. Pagination removed that
+#: implicit guard, so the quadratic path re-imposes it explicitly:
+#: 16384 x 16384 pairings is the accepted worst case, anything larger
+#: raises rather than materializing an unbounded row product.
+_QUADRATIC_JOIN_MAX_SIDE = DEFAULT_QUERY_LIMIT
+
+
 def _pair(
     left: pl.DataFrame, right: pl.DataFrame, join: _Join, how: str
 ) -> pl.DataFrame:
     if how == "cross" or not join.left_keys:
         # No equality to hash on: the pairing is every combination, and
         # whatever condition came with it narrows them afterwards.
+        if (
+            left.height > _QUADRATIC_JOIN_MAX_SIDE
+            or right.height > _QUADRATIC_JOIN_MAX_SIDE
+        ):
+            msg = (
+                "cannot be answered: a JOIN with no equality condition "
+                "pairs every row combination, and one side has "
+                f"{max(left.height, right.height)} rows (over the "
+                f"{_QUADRATIC_JOIN_MAX_SIDE}-row bound for the "
+                "quadratic fallback). Add an equi-join key, or narrow "
+                "the sides with WHERE."
+            )
+            raise errors.NotSupportedError(msg)
         return left.join(right, how="cross")
     left, right = _align(left, right, join.left_keys, join.right_keys)
     return left.join(
@@ -2199,12 +2246,12 @@ def _expression(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clea
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null)):
         return pl.lit(resolve_value(node, {}))
     if isinstance(node, (exp.Placeholder, exp.Parameter)):
-        msg = (
-            f"bind parameter {node.this!r} is used in a position this "
-            "engine evaluates client-side; only WHERE comparisons "
-            "pushed to Milvus can bind there"
-        )
-        raise errors.NotSupportedError(msg)
+        # Client-side positions bind too: the plan carries the
+        # statement's parameters, so `HAVING COUNT(*) > :n` and a
+        # residual `LIKE :pat` resolve exactly like a pushed-down
+        # comparison (a genuinely missing name still raises
+        # ProgrammingError inside resolve_value).
+        return pl.lit(resolve_value(node, ctx.plan.parameters))
     if isinstance(node, exp.Is):
         if isinstance(node.expression, exp.Null):
             return _expression(node.this, ctx).is_null()
@@ -2212,7 +2259,9 @@ def _expression(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clea
         raise errors.NotSupportedError(msg)
     if isinstance(node, exp.Like):
         matched = _expression(node.this, ctx).str.contains(
-            _like_to_regex(str(resolve_value(node.expression, {})))
+            _like_to_regex(
+                str(resolve_value(node.expression, ctx.plan.parameters))
+            )
         )
         return ~matched if node.args.get("negate") else matched
     if isinstance(node, exp.Between):
@@ -2351,7 +2400,7 @@ def _in_expression(node: exp.In, ctx: _Ctx) -> pl.Expr:
         # semantics and as the Milvus-side renderer's `false`.
         return pl.lit(value=False)
     return _expression(node.this, ctx).is_in(
-        [resolve_value(e, {}) for e in node.expressions]
+        [resolve_value(e, ctx.plan.parameters) for e in node.expressions]
     )
 
 

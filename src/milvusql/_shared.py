@@ -23,9 +23,16 @@ class _CommandFallbackIsFine(logging.Filter):
     signal; the log line never was one."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return "Falling back to parsing as a 'Command'" not in (
-            record.getMessage()
-        )
+        message = record.getMessage()
+        if "Falling back to parsing as a 'Command'" not in message:
+            return True
+        # Only OUR supported Command-fallback statements are silenced
+        # (the message opens with the SQL text). A host application
+        # that uses sqlglot for its own parsing keeps the warning for
+        # everything else -- this filter is installed process-wide on
+        # the shared 'sqlglot' logger, so it must not eat diagnostics
+        # that are not ours.
+        return not message.lstrip("'\"").upper().startswith("SHOW")
 
 
 logging.getLogger("sqlglot").addFilter(_CommandFallbackIsFine())
@@ -72,6 +79,13 @@ def note_load_state(
     from both ``_invoke``s after every RPC, not just the auto-``LOAD``
     path, so an explicit ``LOAD TABLE``/``RELEASE TABLE``/``DROP
     TABLE`` the caller issues by hand keeps the cache honest too."""
+    if method == "use_database":
+        # The cache is keyed by bare collection name, and names are
+        # database-scoped: carrying it across `USE` would treat the new
+        # database's same-named collection as already loaded and skip
+        # the auto-LOAD it actually needs.
+        loaded.clear()
+        return
     effect = LOAD_STATE_EFFECTS.get(method)
     if effect is None:
         return

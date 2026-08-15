@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import pytest
 
+from milvusql._shared import note_load_state
+
 pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 
@@ -34,3 +36,12 @@ def test_drop_index_names_collection_and_index(build_call_helper):
         "collection_name": "items",
         "index_name": "idx_embedding",
     }
+
+
+def test_use_clears_the_auto_load_cache():
+    """Collection names are database-scoped: a cache carried across
+    ``USE`` would treat the new database's same-named collection as
+    already loaded and skip the auto-LOAD it needs."""
+    loaded = {"items", "cats"}
+    note_load_state(loaded, "use_database", {"db_name": "other"})
+    assert loaded == set()

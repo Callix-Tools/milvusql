@@ -648,7 +648,13 @@ def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
 
     # The read pages past Milvus's per-call row ceiling (it used to
     # raise there), so a broad UPDATE now reads everything it matches
-    # and writes it back in bounded chunks.
+    # and writes it back in bounded chunks. The full read deliberately
+    # completes BEFORE the first upsert goes out -- interleaving pages
+    # with writes would be cheaper on memory, but on an auto_id table
+    # every upsert mints a new primary key (see the docstring above),
+    # and a newly minted key can land past the read's pk cursor: the
+    # same logical row would then be read again, still match the
+    # filter, and be updated forever.
     return unbounded_query_call(query_kwargs, _write_back, _update_zero)
 
 
@@ -918,38 +924,39 @@ def _count_star_rows(count: int, output_names: list[str]) -> Postprocess:
 
 
 def _reduce_aggregate_rows(
-    specs: list[tuple[str, str | None]], output_names: list[str]
+    specs: list[tuple[str, str | None, bool]], output_names: list[str]
 ) -> Postprocess:
     """``SUM``/``AVG``/``MIN``/``MAX``/``COUNT(<column>)`` (everything
     but a pure ``COUNT(*)``, which the server-side fast path above
     handles instead): Milvus computes none of these itself, so every
     matching row is fetched -- paging past the per-call row ceiling
     where needed (see :func:`unbounded_query_call`) -- and reduced here
-    in Python, over the complete set of matching rows."""
+    in Python, over the complete set of matching rows. A ``DISTINCT``
+    inside the aggregate dedupes the values before reducing, SQL's own
+    semantics for ``COUNT(DISTINCT x)``/``SUM(DISTINCT x)``."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
         values: list[t.Any] = []
-        for func, column in specs:
-            if func == "count":
-                values.append(
-                    len(raw)
-                    if column is None
-                    else sum(1 for row in raw if row.get(column) is not None)
-                )
-                continue
-            numbers = [
+        for func, column, distinct in specs:
+            collected = [
                 row[column]
                 for row in raw
                 if column is not None and row.get(column) is not None
             ]
-            if func == "sum":
-                values.append(sum(numbers) if numbers else 0)
+            if distinct:
+                collected = list(dict.fromkeys(collected))
+            if func == "count":
+                values.append(len(raw) if column is None else len(collected))
+            elif func == "sum":
+                values.append(sum(collected) if collected else 0)
             elif func == "avg":
-                values.append(sum(numbers) / len(numbers) if numbers else None)
+                values.append(
+                    sum(collected) / len(collected) if collected else None
+                )
             elif func == "min":
-                values.append(min(numbers) if numbers else None)
+                values.append(min(collected) if collected else None)
             elif func == "max":
-                values.append(max(numbers) if numbers else None)
+                values.append(max(collected) if collected else None)
         return [tuple(values)], description(output_names), 1, None
 
     return postprocess
@@ -960,14 +967,26 @@ def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     filter_expr = filter_text(ast.args.get("where"), parameters)
     output_names = _select_output_names(ast)
 
-    specs: list[tuple[str, str | None]] = []
+    specs: list[tuple[str, str | None, bool]] = []
     for e in ast.expressions:
         inner = _unwrap_alias(e)
         func = _AGG_FUNCS[type(inner)]
-        column = None if isinstance(inner.this, exp.Star) else inner.this.name
-        specs.append((func, column))
+        target = inner.this
+        distinct = isinstance(target, exp.Distinct)
+        if distinct:
+            # `COUNT(DISTINCT x)` wraps the column in an `exp.Distinct`
+            # whose own `.name` is the empty string -- reading it
+            # directly asked Milvus for a field named "" (confirmed by
+            # direct execution), which a real server rejects and Lite
+            # silently omits, making the count always 0.
+            target = target.expressions[0]
+        column = None if isinstance(target, exp.Star) else target.name
+        specs.append((func, column, distinct))
 
-    if all(func == "count" and column is None for func, column in specs):
+    if all(
+        func == "count" and column is None and not distinct
+        for func, column, distinct in specs
+    ):
         # Milvus computes `count(*)` server-side -- no row fetch
         # needed at all, and no ceiling to worry about either
         # (confirmed directly against Milvus Lite: `query(...,
@@ -983,7 +1002,9 @@ def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
             "query", kwargs, _count_star_rows(len(specs), output_names)
         )
 
-    columns = sorted({column for _, column in specs if column is not None})
+    columns = sorted(
+        {column for _, column, _distinct in specs if column is not None}
+    )
     kwargs = {
         "collection_name": table_name,
         "output_fields": columns or ["count(*)"],
@@ -1305,7 +1326,19 @@ def _build_show(ast: exp.Command) -> Call:
     answer."""
     argument = ast.args.get("expression")
     text = (argument.this if isinstance(argument, exp.Literal) else "").strip()
-    keyword = text.split()[0].upper() if text.split() else ""
+    words = text.split()
+    keyword = words[0].upper() if words else ""
+    if len(words) > 1:
+        # `SHOW TABLES LIKE 'x%'` / `SHOW TABLES FROM other` -- matching
+        # on the keyword alone would silently drop the qualifier and
+        # return the full, unfiltered listing of the *current*
+        # database: a plausible wrong answer, which is worse than a
+        # named rejection.
+        msg = (
+            f"unsupported SHOW qualifier: SHOW {text} -- only bare "
+            "SHOW TABLES and SHOW DATABASES are supported"
+        )
+        raise errors.NotSupportedError(msg)
     if keyword == "TABLES":
         return Call("list_collections", {}, _name_list_rows("table_name"))
     if keyword == "DATABASES":

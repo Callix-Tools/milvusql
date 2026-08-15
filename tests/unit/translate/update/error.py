@@ -52,3 +52,12 @@ class TestUpdateTruncation:
         assert follow_up is not None
         assert follow_up.method == "upsert"
         assert follow_up.kwargs["data"] == [{"id": 1, "cid": 1}]
+
+
+def test_in_subquery_is_rejected_not_rendered_false(build_call_helper):
+    """Same trap as DELETE's: rendering the subquery as `false` made
+    the UPDATE silently match nothing."""
+    with pytest.raises(milvusql.NotSupportedError, match="IN \\(SELECT"):
+        build_call_helper(
+            "UPDATE items SET cid = 1 WHERE id IN (SELECT id FROM s)"
+        )
