@@ -57,3 +57,7 @@ select = [
 # upstream-matching signatures.
 "packages/milvusql-sqlalchemy/src/**" = ["ARG002", "ANN401"]
 "packages/milvusql-django/src/**" = ["ARG002", "ANN401"]
+# A benchmark prints its results (that IS its output channel), seeds a
+# non-cryptographic RNG for reproducible data, and interpolates its own
+# constant table/limit values into DDL/DQL text.
+"benchmarks/**" = ["T20", "S311", "S608", "ANN"]
