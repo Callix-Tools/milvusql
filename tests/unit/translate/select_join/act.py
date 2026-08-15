@@ -272,3 +272,90 @@ class TestOuterJoinPredicates:
             [CATS, ITEMS],
         )
         assert calls[0].kwargs["filter"] == 'title == "books"'
+
+
+class TestUsing:
+    """``USING (k)`` is ``ON left.k = right.k`` with the left side left
+    implicit -- resolvable here because exactly one source precedes the
+    join."""
+
+    SQL = (
+        "SELECT i.id, c.title FROM items AS i JOIN cats AS c USING (cat_id)"
+    )
+
+    def test_the_key_is_fetched_from_both_sides(
+        self, build_call_helper, drive_chain
+    ):
+        """Neither side mentions ``cat_id`` in any expression, so the
+        planned join keys are what put it in ``output_fields``."""
+        calls, _result = drive_chain(
+            build_call_helper(self.SQL),
+            [
+                [{"id": 1, "cat_id": 10}],
+                [{"cat_id": 10, "title": "books"}],
+            ],
+        )
+        assert "cat_id" in calls[0].kwargs["output_fields"]
+        assert "cat_id" in calls[1].kwargs["output_fields"]
+
+    def test_it_joins_on_that_key(self, build_call_helper, drive_chain):
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(self.SQL),
+            [
+                [{"id": 1, "cat_id": 10}, {"id": 2, "cat_id": 11}],
+                [{"cat_id": 10, "title": "books"}],
+            ],
+        )
+        assert rows == [(1, "books")]
+
+
+class TestCommonTableExpressions:
+    """A CTE is a derived table that happens to be named up front, so it
+    plans exactly like a subquery in ``FROM``."""
+
+    SQL = (
+        "WITH hot AS (SELECT id, cat_id FROM items WHERE price > 40) "
+        "SELECT h.id, c.title FROM hot AS h "
+        "JOIN cats AS c ON h.cat_id = c.id"
+    )
+
+    def test_the_cte_filter_is_pushed_to_milvus(self, build_call_helper):
+        call = build_call_helper(self.SQL)
+        assert call.kwargs["collection_name"] == "items"
+        assert call.kwargs["filter"] == "price > 40"
+
+    def test_the_outer_query_joins_the_cte_result(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, _d, _rc, _l) = drive_chain(
+            build_call_helper(self.SQL),
+            [[{"id": 1, "cat_id": 10}], [{"id": 10, "title": "books"}]],
+        )
+        assert rows == [(1, "books")]
+
+    def test_referencing_one_twice_reads_it_once(
+        self, build_call_helper, drive_chain
+    ):
+        """The CTE's collection is read once; both references evaluate
+        against the same fetched frame."""
+        calls, _result = drive_chain(
+            build_call_helper(
+                "WITH hot AS (SELECT id, cat_id FROM items WHERE price > 40) "
+                "SELECT a.id FROM hot AS a JOIN hot AS b ON a.cat_id = b.cat_id"
+            ),
+            [[{"id": 1, "cat_id": 10}]],
+        )
+        assert len(calls) == 1
+
+    def test_a_cte_used_without_a_join_still_reaches_the_engine(
+        self, build_call_helper
+    ):
+        """Nothing else about this statement needs the engine, so the
+        `WITH` itself has to be what routes it there -- otherwise the
+        single-call path asks Milvus for a collection named after the
+        CTE."""
+        call = build_call_helper(
+            "WITH hot AS (SELECT id FROM items WHERE price > 40) "
+            "SELECT h.id FROM hot AS h"
+        )
+        assert call.kwargs["collection_name"] == "items"

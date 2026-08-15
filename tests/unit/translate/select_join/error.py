@@ -58,10 +58,17 @@ class TestUnsupportedShapes:
                 "SELECT * FROM items AS i JOIN cats AS c ON i.cat_id = c.id"
             )
 
-    def test_join_using_is_rejected(self, build_call_helper):
+    def test_join_using_across_three_sources_is_rejected(
+        self, build_call_helper
+    ):
+        """``USING (k)`` leaves the left side implicit. With one source
+        before the join there is only one frame it can mean; with
+        several there is no schema here to say which of them owns
+        ``k``."""
         with pytest.raises(milvusql.NotSupportedError, match="USING"):
             build_call_helper(
-                "SELECT i.id FROM items AS i JOIN cats AS c USING (cat_id)"
+                "SELECT i.id FROM items AS i "
+                "JOIN cats AS c ON i.cat_id = c.id JOIN tags AS t USING (id)"
             )
 
     def test_an_unaliased_subquery_in_from_is_rejected(
@@ -73,13 +80,13 @@ class TestUnsupportedShapes:
                 "(SELECT cat_id FROM items) GROUP BY cat_id"
             )
 
-    def test_a_cte_is_rejected(self, build_call_helper):
-        """``WITH`` parses, but nothing here plans it yet -- saying so
-        beats silently reading the wrong collection."""
-        with pytest.raises(milvusql.NotSupportedError, match="WITH"):
+    def test_a_recursive_cte_is_rejected(self, build_call_helper):
+        """A recursive query re-reads until a fixpoint; a plan here
+        reads Milvus a fixed number of times."""
+        with pytest.raises(milvusql.NotSupportedError, match="RECURSIVE"):
             build_call_helper(
-                "WITH hot AS (SELECT id FROM items) "
-                "SELECT h.id FROM hot AS h JOIN cats AS c ON h.id = c.id"
+                "WITH RECURSIVE r AS (SELECT id FROM items) "
+                "SELECT r.id FROM r"
             )
 
     def test_a_vector_search_without_a_limit_is_rejected(

@@ -111,16 +111,26 @@ class _Scan:
     :attr:`key_pushdown` in during a second pass, once the final scan
     order is known, and the executor fills the fetched rows in."""
 
+    #: How the query refers to this source (its alias, or the table
+    #: name) -- the prefix every column of this scan carries.
     frame: str
-    collection: str
-    fields: list[str]
+    #: Where this read's rows live once fetched. Distinct from
+    #: :attr:`frame` because a name is only unique within one query
+    #: scope: ``SELECT id FROM items UNION SELECT id FROM items`` reads
+    #: ``items`` twice, with different filters, and keying the results
+    #: by table name made the second read overwrite the first -- both
+    #: branches then answered from the same rows.
+    key: str = ""
+    collection: str = ""
+    fields: list[str] = field(default_factory=list)
     filter_text: str = ""
     limit: int = DEFAULT_QUERY_LIMIT
     search: _Search | None = None
     consistency: str | None = None
     star: bool = False
-    #: ``(source frame, source column, own column)`` -- restrict this
-    #: scan to the join-key values an earlier scan actually returned.
+    #: ``(source scan key, that scan's qualified column, own column)``
+    #: -- restrict this scan to the join-key values an earlier read
+    #: actually returned.
     key_pushdown: tuple[str, str, str] | None = None
 
 
@@ -142,7 +152,7 @@ class _Select:
     and what comes out. Nested in ``sources`` for a ``FROM (SELECT ...)``
     and in ``subqueries`` for a ``WHERE ... IN (SELECT ...)``."""
 
-    sources: list[tuple[str, _Scan | _Select]]
+    sources: list[tuple[str, _Scan | _Select | _SetOp]]
     joins: list[_Join]
     where: exp.Expression | None
     group: list[exp.Expression]
@@ -156,6 +166,38 @@ class _Select:
     #: Frames that only the predicates reference, keyed by the id of the
     #: ``exp.Subquery``/``exp.Select`` node that produced them.
     subqueries: dict[int, _Select] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _SetOp:
+    """``UNION``/``INTERSECT``/``EXCEPT``: two planned queries and the
+    rule for combining their rows. Either side may itself be a set
+    operation -- ``a UNION b UNION c`` nests to the left."""
+
+    kind: str
+    distinct: bool
+    left: _Select | _SetOp
+    right: _Select | _SetOp
+    output_names: list[str]
+    order: list[tuple[exp.Expression, bool]]
+    limit: int | None
+    offset: int | None
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """What a nested ``SELECT`` inherits from the one around it: the
+    frames it could correlate against (rejected, but by name -- see
+    :func:`_qualified`) and the CTEs it can read from."""
+
+    outer: frozenset[str] = frozenset()
+    ctes: dict[str, _Select | _SetOp] = field(default_factory=dict)
+
+    def inside(self, known: set[str]) -> _Scope:
+        return _Scope(self.outer | known, self.ctes)
+
+    def adding(self, ctes: dict[str, _Select | _SetOp]) -> _Scope:
+        return _Scope(self.outer, {**self.ctes, **ctes})
 
 
 # -----------------------------------------------------------------------
@@ -172,7 +214,11 @@ def needs_relational_engine(ast: exp.Select) -> bool:
     single-call path unchanged: a plain filter ``SELECT``, a vector
     search, a hybrid search and a bare aggregate all stay exactly one
     RPC with no DataFrame anywhere near them."""
-    if ast.args.get("joins") or ast.args.get("group") is not None:
+    if (
+        ast.args.get("joins")
+        or ast.args.get("group") is not None
+        or ast.args.get("with_") is not None
+    ):
         return True
     from_node = ast.args.get("from_")
     if from_node is not None and isinstance(from_node.this, exp.Subquery):
@@ -181,10 +227,11 @@ def needs_relational_engine(ast: exp.Select) -> bool:
         # `ast_to_pymilvus._flatten_trivial_subquery`), so anything
         # still wrapped here genuinely needs evaluating in two steps.
         return True
-    # A subquery anywhere a value is expected counts, not just in
-    # WHERE: Django's `annotate(Subquery(...))` puts one in the SELECT
-    # list, and the single-call path would ask Milvus for an output
-    # field named after it and hand back a column of `None`.
+    # A subquery or a window function anywhere a value is expected
+    # counts, not just in WHERE: Django's `annotate(Subquery(...))` puts
+    # one in the SELECT list, and `ROW_NUMBER() OVER (...)` lives there
+    # too. The single-call path would ask Milvus for an output field
+    # named after either and hand back a column of `None`.
     scopes = [
         ast.args.get("where"),
         ast.args.get("having"),
@@ -192,7 +239,8 @@ def needs_relational_engine(ast: exp.Select) -> bool:
         *ast.expressions,
     ]
     return any(
-        scope is not None and scope.find(exp.Select) is not None
+        scope is not None
+        and scope.find(exp.Select, exp.Window) is not None
         for scope in scopes
     )
 
@@ -271,22 +319,21 @@ def _plan_select(
     ast: exp.Select,
     parameters: dict[str, t.Any],
     scans: list[_Scan],
-    outer: frozenset[str] = frozenset(),
+    scope: _Scope | None = None,
 ) -> _Select:
     """Walk one ``SELECT`` into a :class:`_Select`, appending every
     collection read it needs to ``scans`` -- one list shared by the whole
     statement, so a subquery's reads join the same chain rather than
     starting a second one."""
-    if ast.args.get("with_"):
-        msg = "WITH (common table expressions) is not supported"
-        raise errors.NotSupportedError(msg)
+    scope = scope or _Scope()
+    scope = scope.adding(_plan_ctes(ast, parameters, scans, scope))
 
     join_nodes = list(ast.args.get("joins") or [])
-    sources = _plan_sources(ast, join_nodes, parameters, scans, outer)
+    sources = _plan_sources(ast, join_nodes, parameters, scans, scope)
     known = {name for name, _ in sources}
     # Everything an inner SELECT could correlate against: this query's
     # sources plus whatever the enclosing ones brought.
-    enclosing = outer | known
+    inner_scope = scope.inside(known)
     scan_frames = {
         name for name, source in sources if isinstance(source, _Scan)
     }
@@ -297,10 +344,10 @@ def _plan_select(
         scan_frames - _null_supplying(ast, join_nodes),
         parameters,
         scans,
-        enclosing,
+        inner_scope,
     )
     subqueries.update(
-        _plan_value_subqueries(ast, parameters, scans, enclosing)
+        _plan_value_subqueries(ast, parameters, scans, inner_scope)
     )
     order, search_frame, search = _plan_order(ast, parameters, known)
 
@@ -326,13 +373,33 @@ def _plan_select(
     # Pushed-down conjuncts are deliberately absent: Milvus applies
     # those server-side, so the columns they name need not come back.
     consumers: list[exp.Expression] = [*projections, *residual, *group]
-    consumers.extend(expression for expression, _ in order)
+    # An ORDER BY key that names an output label (`ORDER BY r`, for
+    # `ROW_NUMBER() ... AS r`) is not a source column -- the projection
+    # it refers to is already in this list, and asking Milvus for a
+    # field called `r` would fail or, worse, resolve to the wrong
+    # collection.
+    consumers.extend(
+        expression
+        for expression, _ in order
+        if not _names_an_output(expression, output_names)
+    )
     if having is not None:
         consumers.append(having)
     consumers.extend(
         join.args["on"] for join in join_nodes if join.args.get("on")
     )
-    needed = _needed_columns(consumers, known, outer)
+    needed = _needed_columns(consumers, known, scope.outer)
+
+    joins = _plan_joins(ast, join_nodes, known)
+    for join in joins:
+        # A `USING (k)` join names no column node anywhere, and even an
+        # `ON` key is only in `needed` because the condition mentions it
+        # -- adding the planned keys covers both without depending on
+        # how the condition was spelled.
+        for key in (*join.left_keys, *join.right_keys):
+            frame, column = key.split(".", 1)
+            if frame in needed and column not in needed[frame]:
+                needed[frame].append(column)
 
     consistency = ast.args.get(CONSISTENCY_ARG)
     for name, source in sources:
@@ -346,12 +413,13 @@ def _plan_select(
             source.limit = search.limit
         if consistency is not None:
             source.consistency = consistency.this.name
+        source.key = f"{source.frame}#{len(scans)}"
         scans.append(source)
 
     offset_node = ast.args.get("offset")
     return _Select(
         sources=sources,
-        joins=[_plan_join(join, known) for join in join_nodes],
+        joins=joins,
         where=_conjunct_expression(residual),
         group=group,
         having=having.this if having is not None else None,
@@ -366,6 +434,16 @@ def _plan_select(
         ),
         distinct=ast.args.get("distinct") is not None,
         subqueries=subqueries,
+    )
+
+
+def _names_an_output(
+    node: exp.Expression, output_names: list[str]
+) -> bool:
+    return (
+        isinstance(node, exp.Column)
+        and not node.table
+        and node.name in output_names
     )
 
 
@@ -395,25 +473,59 @@ def _group_key(
     return node
 
 
+def _plan_ctes(
+    ast: exp.Select,
+    parameters: dict[str, t.Any],
+    scans: list[_Scan],
+    scope: _Scope,
+) -> dict[str, _Select | _SetOp]:
+    """``WITH name AS (SELECT ...)`` -> a planned query per name.
+
+    A CTE is a derived table that happens to be named up front, so it
+    plans exactly like a subquery in ``FROM``: its collection is read
+    once, into the same chain, and the outer query reads the result.
+    Referencing one twice re-uses that single read -- the frames are
+    already fetched by the time anything is evaluated."""
+    with_node = ast.args.get("with_")
+    if with_node is None:
+        return {}
+    if with_node.args.get("recursive"):
+        msg = (
+            "WITH RECURSIVE is not supported: a recursive query needs to "
+            "re-read until a fixpoint, and Milvus is read once per plan"
+        )
+        raise errors.NotSupportedError(msg)
+    planned: dict[str, _Select | _SetOp] = {}
+    for cte in with_node.expressions:
+        # Each CTE can see the ones declared before it, same as SQL.
+        planned[cte.alias] = _plan_branch(
+            cte.this, parameters, scans, scope.adding(planned)
+        )
+    return planned
+
+
 def _plan_sources(
     ast: exp.Select,
     join_nodes: list[exp.Join],
     parameters: dict[str, t.Any],
     scans: list[_Scan],
-    outer: frozenset[str],
-) -> list[tuple[str, _Scan | _Select]]:
-    """``FROM``/``JOIN`` -> one source per name. A table becomes a scan;
-    an aliased subquery becomes a nested plan whose own scans are
-    appended to the same chain."""
+    scope: _Scope,
+) -> list[tuple[str, _Scan | _Select | _SetOp]]:
+    """``FROM``/``JOIN`` -> one source per name. A table becomes a scan
+    (or the CTE of that name, if one is in scope); an aliased subquery
+    becomes a nested plan whose own scans are appended to the same
+    chain."""
     from_node = ast.args.get("from_")
     if from_node is None:
         msg = "SELECT with no FROM clause is not supported"
         raise errors.NotSupportedError(msg)
 
-    sources: list[tuple[str, _Scan | _Select]] = []
+    sources: list[tuple[str, _Scan | _Select | _SetOp]] = []
     for node in [from_node.this, *(join.this for join in join_nodes)]:
         name = _source_name(node)
-        if isinstance(node, exp.Table):
+        if isinstance(node, exp.Table) and node.name in scope.ctes:
+            sources.append((name, scope.ctes[node.name]))
+        elif isinstance(node, exp.Table):
             scan = _Scan(frame=name, collection=node.name, fields=[])
             sources.append((name, scan))
         elif isinstance(node, exp.Subquery):
@@ -425,7 +537,7 @@ def _plan_sources(
                 )
                 raise errors.NotSupportedError(msg)
             sources.append(
-                (name, _plan_select(inner, parameters, scans, outer))
+                (name, _plan_select(inner, parameters, scans, scope))
             )
         else:
             msg = (
@@ -471,7 +583,7 @@ def _plan_predicates(  # noqa: PLR0913, PLR0917 -- one argument per planning inp
     pushable_frames: set[str],
     parameters: dict[str, t.Any],
     scans: list[_Scan],
-    enclosing: frozenset[str],
+    scope: _Scope,
 ) -> tuple[
     dict[str, list[exp.Expression]],
     list[exp.Expression],
@@ -493,7 +605,7 @@ def _plan_predicates(  # noqa: PLR0913, PLR0917 -- one argument per planning inp
         if nested:
             for inner in nested:
                 subqueries[id(inner)] = _plan_select(
-                    inner, parameters, scans, enclosing
+                    inner, parameters, scans, scope
                 )
             residual.append(conjunct)
             continue
@@ -509,7 +621,7 @@ def _plan_value_subqueries(
     ast: exp.Select,
     parameters: dict[str, t.Any],
     scans: list[_Scan],
-    enclosing: frozenset[str],
+    scope: _Scope,
 ) -> dict[int, _Select]:
     """Subqueries outside ``WHERE`` -- in the SELECT list, ``HAVING`` or
     ``ORDER BY`` -- each planned as one more read in the same chain."""
@@ -521,9 +633,7 @@ def _plan_value_subqueries(
             hosts.append(node)
     for host in hosts:
         for inner in _outermost_selects(host):
-            planned[id(inner)] = _plan_select(
-                inner, parameters, scans, enclosing
-            )
+            planned[id(inner)] = _plan_select(inner, parameters, scans, scope)
     return planned
 
 
@@ -569,7 +679,9 @@ def _plan_order(
 
 
 def _needed_columns(
-    consumers: list[exp.Expression], known: set[str], outer: frozenset[str]
+    consumers: list[exp.Expression],
+    known: set[str],
+    outer: frozenset[str],
 ) -> dict[str, list[str]]:
     """Projection pushdown: the fields each collection is asked for are
     exactly the ones the statement mentions."""
@@ -636,17 +748,52 @@ def _plan_search(
     )
 
 
-def _plan_join(join: exp.Join, known: set[str]) -> _Join:
+def _plan_joins(
+    ast: exp.Select, join_nodes: list[exp.Join], known: set[str]
+) -> list[_Join]:
+    """Plan each ``JOIN`` in order, telling it which sources precede it
+    -- ``USING`` needs that to know which frame owns the left key."""
+    from_node = ast.args.get("from_")
+    preceding = [_source_name(from_node.this)] if from_node else []
+    planned = []
+    for join in join_nodes:
+        planned.append(_plan_join(join, known, preceding))
+        preceding.append(_source_name(join.this))
+    return planned
+
+
+def _plan_join(
+    join: exp.Join, known: set[str], preceding: list[str]
+) -> _Join:
     frame = _source_name(join.this)
     side = (join.side or "").upper()
     kind = (join.kind or "").upper()
     on = join.args.get("on")
-    if join.args.get("using"):
-        msg = "JOIN ... USING is not supported: spell the condition as ON"
-        raise errors.NotSupportedError(msg)
+    how = {"LEFT": "left", "RIGHT": "right", "FULL": "full"}.get(side, "inner")
+    using = join.args.get("using")
+    if using:
+        # `USING (k)` is `ON left.k = right.k` with the left side left
+        # implicit. With one source before this join there is only one
+        # frame it can mean; with several there is no schema here to say
+        # which of them owns `k`, and guessing would join on the wrong
+        # collection's column.
+        if len(preceding) != 1:
+            msg = (
+                "JOIN ... USING is supported for two sources only -- with "
+                f"{len(preceding)} already joined there is no schema here "
+                "to say which one owns the key. Spell it as ON"
+            )
+            raise errors.NotSupportedError(msg)
+        names = [identifier.name for identifier in using]
+        return _Join(
+            frame,
+            how,
+            [f"{preceding[0]}.{name}" for name in names],
+            [f"{frame}.{name}" for name in names],
+            None,
+        )
     if kind == "CROSS" or on is None:
         return _Join(frame, "cross", [], [], None)
-    how = {"LEFT": "left", "RIGHT": "right", "FULL": "full"}.get(side, "inner")
 
     left_keys: list[str] = []
     right_keys: list[str] = []
@@ -768,6 +915,21 @@ def _conjunct_filter(
     return render_filter(combined, parameters)
 
 
+def _nested_plans(plan: _Select | _SetOp) -> list[_Select | _SetOp]:
+    """Every planned query one level inside this one: derived tables,
+    CTEs used as sources, predicate subqueries, set-operation
+    branches."""
+    if isinstance(plan, _SetOp):
+        return [plan.left, plan.right]
+    nested: list[_Select | _SetOp] = [
+        source
+        for _name, source in plan.sources
+        if not isinstance(source, _Scan)
+    ]
+    nested.extend(plan.subqueries.values())
+    return nested
+
+
 def _order_scans(scans: list[_Scan]) -> list[_Scan]:
     """Run the most selective scans first: an ANN search (bounded by its
     own top-k) before a filtered scan, a filtered scan before an
@@ -782,7 +944,7 @@ def _order_scans(scans: list[_Scan]) -> list[_Scan]:
     return sorted(scans, key=rank)
 
 
-def _plan_pushdown(plan: _Select, scans: list[_Scan]) -> None:
+def _plan_pushdown(plan: _Select | _SetOp, scans: list[_Scan]) -> None:
     """Fill in :attr:`_Scan.key_pushdown` wherever a scan's equi-join
     key is already known from a scan that runs before it.
 
@@ -791,8 +953,18 @@ def _plan_pushdown(plan: _Select, scans: list[_Scan]) -> None:
     ``LEFT`` join, the left side of a ``RIGHT`` join. A ``FULL`` join
     keeps unmatched rows from both sides, so restricting either one
     would delete rows the query asked for."""
-    position = {scan.frame: index for index, scan in enumerate(scans)}
-    by_frame = {scan.frame: scan for scan in scans}
+    for nested in _nested_plans(plan):
+        _plan_pushdown(nested, scans)
+    if not isinstance(plan, _Select):
+        return
+    position = {scan.key: index for index, scan in enumerate(scans)}
+    # Only this query's own sources: a name means nothing outside the
+    # scope that declared it.
+    by_frame = {
+        name: source
+        for name, source in plan.sources
+        if isinstance(source, _Scan)
+    }
 
     for join in plan.joins:
         for left, right in zip(join.left_keys, join.right_keys, strict=True):
@@ -808,19 +980,25 @@ def _plan_pushdown(plan: _Select, scans: list[_Scan]) -> None:
                     (right_frame, right_column, left_frame, left_column)
                 )
             for src_frame, src_col, dst_frame, dst_col in candidates:
+                source = by_frame.get(src_frame)
                 target = by_frame.get(dst_frame)
-                source_at = position.get(src_frame)
-                target_at = position.get(dst_frame)
+                if source is None or target is None:
+                    continue
+                source_at = position.get(source.key)
+                target_at = position.get(target.key)
                 if (
-                    target is None
-                    or source_at is None
+                    source_at is None
                     or target_at is None
                     or source_at >= target_at
                     or target.search is not None
                     or target.key_pushdown is not None
                 ):
                     continue
-                target.key_pushdown = (src_frame, src_col, dst_col)
+                target.key_pushdown = (
+                    source.key,
+                    f"{source.frame}.{src_col}",
+                    dst_col,
+                )
 
 
 # -----------------------------------------------------------------------
@@ -840,11 +1018,94 @@ def build_relational_call(
     return _scan_call(0, scans, {}, plan)
 
 
+def build_set_operation_call(
+    ast: exp.SetOperation, parameters: dict[str, t.Any]
+) -> Call:
+    """``SELECT ... UNION SELECT ...`` -> the chain that answers it.
+
+    Each branch is planned like any other query -- its reads join the
+    same chain -- and the combination happens once both frames are in
+    hand."""
+    scans: list[_Scan] = []
+    plan = _plan_set_operation(ast, parameters, scans, _Scope())
+    scans = _order_scans(scans)
+    return _scan_call(0, scans, {}, plan)
+
+
+_SET_OPERATIONS: dict[type[exp.Expression], str] = {
+    exp.Union: "union",
+    exp.Intersect: "intersect",
+    exp.Except: "except",
+}
+
+
+def _plan_set_operation(
+    ast: exp.SetOperation,
+    parameters: dict[str, t.Any],
+    scans: list[_Scan],
+    scope: _Scope,
+) -> _SetOp:
+    kind = _SET_OPERATIONS[type(ast)]
+    distinct = bool(ast.args.get("distinct"))
+    if kind != "union" and not distinct:
+        # `INTERSECT ALL`/`EXCEPT ALL` are multiset operations -- they
+        # keep min/difference *counts* of duplicate rows, which a
+        # semi/anti join cannot express. Saying so beats quietly
+        # answering the DISTINCT version.
+        msg = (
+            f"{kind.upper()} ALL is not supported: its duplicate-count "
+            f"semantics need a multiset operation, not a filter. Use "
+            f"{kind.upper()} (distinct)"
+        )
+        raise errors.NotSupportedError(msg)
+    left = _plan_branch(ast.this, parameters, scans, scope)
+    right = _plan_branch(ast.expression, parameters, scans, scope)
+    order_node = ast.args.get("order")
+    offset_node = ast.args.get("offset")
+    return _SetOp(
+        kind=kind,
+        distinct=distinct,
+        left=left,
+        right=right,
+        # SQL takes the result's column names from the first branch.
+        output_names=left.output_names,
+        order=[
+            (key.this, bool(key.args.get("desc")))
+            for key in (order_node.expressions if order_node else [])
+        ],
+        limit=_limit_of(ast, parameters),
+        offset=(
+            int(resolve_value(offset_node.expression, parameters))
+            if offset_node is not None
+            else None
+        ),
+    )
+
+
+def _plan_branch(
+    node: exp.Expression,
+    parameters: dict[str, t.Any],
+    scans: list[_Scan],
+    scope: _Scope,
+) -> _Select | _SetOp:
+    if isinstance(node, exp.SetOperation):
+        return _plan_set_operation(node, parameters, scans, scope)
+    if isinstance(node, exp.Subquery):
+        return _plan_branch(node.this, parameters, scans, scope)
+    if isinstance(node, exp.Select):
+        return _plan_select(node, parameters, scans, scope)
+    msg = (
+        "unsupported set-operation branch: "
+        f"{node.__class__.__name__}"
+    )
+    raise errors.NotSupportedError(msg)
+
+
 def _scan_call(
     index: int,
     scans: list[_Scan],
     frames: dict[str, pl.DataFrame],
-    plan: _Select,
+    plan: _Select | _SetOp,
 ) -> Call:
     """The ``Call`` for ``scans[index]``, chained to the next one.
 
@@ -859,13 +1120,13 @@ def _scan_call(
     if index == len(scans) - 1:
 
         def postprocess(raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
-            frames[scan.frame] = _frame(scan, raw)
+            frames[scan.key] = _frame(scan, raw)
             return _finish(plan, frames)
 
         return Call(method, kwargs, postprocess)
 
     def then(raw: t.Any) -> Call:  # noqa: ANN401
-        frames[scan.frame] = _frame(scan, raw)
+        frames[scan.key] = _frame(scan, raw)
         return _scan_call(index + 1, scans, frames, plan)
 
     return Call(method, kwargs, then=then)
@@ -912,9 +1173,8 @@ def _apply_pushdown(scan: _Scan, frames: dict[str, pl.DataFrame]) -> None:
     the ceiling guard instead."""
     if scan.key_pushdown is None:
         return
-    source_frame, source_column, own_column = scan.key_pushdown
-    frame = frames.get(source_frame)
-    column = f"{source_frame}.{source_column}"
+    source_key, column, own_column = scan.key_pushdown
+    frame = frames.get(source_key)
     if frame is None or column not in frame.columns:
         return
     keys = frame[column].drop_nulls().unique().to_list()
@@ -1009,13 +1269,14 @@ class _Ctx:
 
 
 def _finish(
-    plan: _Select, frames: dict[str, pl.DataFrame]
+    plan: _Select | _SetOp, frames: dict[str, pl.DataFrame]
 ) -> RowsAndDescription:
     frame = _evaluate(plan, frames)
     rows = [tuple(row) for row in frame.rows()]
     # `SELECT *` learns its column names from the data, so the
     # description comes off the evaluated frame rather than the plan.
-    names = plan.output_names if not _has_star(plan) else list(frame.columns)
+    starred = isinstance(plan, _Select) and _has_star(plan)
+    names = list(frame.columns) if starred else plan.output_names
     return rows, description(names), len(rows), None
 
 
@@ -1023,7 +1284,9 @@ def _has_star(plan: _Select) -> bool:
     return any(isinstance(p, exp.Star) for p in plan.projections)
 
 
-def _evaluate(plan: _Select, frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
+def _evaluate(
+    plan: _Select | _SetOp, frames: dict[str, pl.DataFrame]
+) -> pl.DataFrame:
     """The relational algebra, in Polars, over the already-fetched
     frames -- in SQL's own clause order: FROM/JOIN, WHERE, GROUP BY,
     HAVING, ORDER BY, SELECT, DISTINCT, OFFSET/LIMIT.
@@ -1033,7 +1296,9 @@ def _evaluate(plan: _Select, frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
     ORDER BY price``), and once the frame has been narrowed to the
     projected columns that key is gone. Grouped queries sort inside
     :func:`_aggregate` for the same reason, one step later -- there the
-    sortable columns are the groups and the reductions."""
+    the sortable columns are the groups and the reductions."""
+    if isinstance(plan, _SetOp):
+        return _evaluate_set_operation(plan, frames)
     name, first = plan.sources[0]
     frame = _source_frame(name, first, frames)
     by_name = dict(plan.sources)
@@ -1061,6 +1326,80 @@ def _evaluate(plan: _Select, frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
     if plan.limit is not None:
         frame = frame.head(plan.limit)
     return frame
+
+
+def _evaluate_set_operation(
+    plan: _SetOp, frames: dict[str, pl.DataFrame]
+) -> pl.DataFrame:
+    """Combine two branches. Both come out of :func:`_project` with the
+    same positional column names, so they line up by position the way
+    SQL says they should -- no name matching involved."""
+    left = _evaluate(plan.left, frames)
+    right = _evaluate(plan.right, frames)
+    if left.width != right.width:
+        msg = (
+            f"{plan.kind.upper()} needs both sides to select the same "
+            f"number of columns, got {left.width} and {right.width}"
+        )
+        raise errors.ProgrammingError(msg)
+    right = right.rename(dict(zip(right.columns, left.columns, strict=True)))
+
+    if plan.kind == "union":
+        # `vertical_relaxed` so a branch that came back empty (dtype
+        # `Null`, nothing to infer from) still concatenates.
+        combined = pl.concat([left, right], how="vertical_relaxed")
+    else:
+        how = "semi" if plan.kind == "intersect" else "anti"
+        combined = left.join(
+            right,
+            on=left.columns,
+            how=how,
+            # SQL's INTERSECT/EXCEPT compare rows with NULL = NULL,
+            # unlike a join's ON -- two null-valued rows are the same
+            # row here.
+            nulls_equal=True,
+        )
+    if plan.distinct:
+        combined = combined.unique(maintain_order=True)
+
+    if plan.order:
+        combined = _sort_positional(combined, plan)
+    if plan.offset:
+        combined = combined.slice(plan.offset)
+    if plan.limit is not None:
+        combined = combined.head(plan.limit)
+    return combined
+
+
+def _sort_positional(frame: pl.DataFrame, plan: _SetOp) -> pl.DataFrame:
+    """``ORDER BY`` on a set operation can only address the result's own
+    columns -- by position (``ORDER BY 1``) or by the name the first
+    branch gave them. Neither branch's source columns are reachable
+    here, which is exactly what SQL says too."""
+    by: list[str] = []
+    descending: list[bool] = []
+    for node, desc in plan.order:
+        if isinstance(node, exp.Literal) and not node.is_string:
+            index = int(node.this) - 1
+        elif isinstance(node, exp.Column) and node.name in plan.output_names:
+            index = plan.output_names.index(node.name)
+        else:
+            msg = (
+                "ORDER BY on a set operation must name a result column "
+                f"or its position, not {node.sql()!r}"
+            )
+            raise errors.ProgrammingError(msg)
+        if not 0 <= index < frame.width:
+            msg = f"ORDER BY position {index + 1} is out of range"
+            raise errors.ProgrammingError(msg)
+        by.append(frame.columns[index])
+        descending.append(desc)
+    return frame.sort(
+        by,
+        descending=descending,
+        nulls_last=[not desc for desc in descending],
+        maintain_order=True,
+    )
 
 
 def _project(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
@@ -1139,10 +1478,12 @@ def _resolvable(node: exp.Column, ctx: _Ctx) -> bool:
 
 
 def _source_frame(
-    name: str, source: _Scan | _Select, frames: dict[str, pl.DataFrame]
+    name: str,
+    source: _Scan | _Select | _SetOp,
+    frames: dict[str, pl.DataFrame],
 ) -> pl.DataFrame:
     if isinstance(source, _Scan):
-        return frames[name]
+        return frames[source.key]
     inner = _evaluate(source, frames)
     # A derived table is addressed as `alias.column`, where `column` is
     # the *label* the inner SELECT gave it -- `_project` names its
@@ -1150,7 +1491,7 @@ def _source_frame(
     # back on here, in order, before the alias is applied.
     labels = (
         inner.columns
-        if _has_star(source)
+        if isinstance(source, _Select) and _has_star(source)
         else [f"{name}.{label}" for label in source.output_names]
     )
     return inner.rename(dict(zip(inner.columns, labels, strict=True)))
@@ -1308,7 +1649,10 @@ def _top_level_aggregates(node: exp.Expression) -> list[exp.Expression]:
     reduction belongs to the subquery, which evaluates on its own."""
     if isinstance(node, exp.AggFunc):
         return [node]
-    if isinstance(node, exp.Select):
+    if isinstance(node, (exp.Select, exp.Window)):
+        # A windowed aggregate is not a grouped one: `SUM(x) OVER (...)`
+        # keeps one row per input row, so it must not turn the query
+        # into a reduction.
         return []
     found: list[exp.Expression] = []
     for child in node.args.values():
@@ -1454,12 +1798,87 @@ def _expression(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clea
         return pl.coalesce(candidates)
     if isinstance(node, (exp.Subquery, exp.Select)):
         return pl.lit(_scalar_subquery(node, ctx))
+    if isinstance(node, exp.Window):
+        return _window(node, ctx)
     if isinstance(node, exp.AggFunc):
         # An aggregate reached outside a GROUP BY reduction: a HAVING or
         # ORDER BY on an ungrouped query. Reduce over the whole frame.
         return _reduce(node, ctx)
     msg = f"unsupported expression: {node.__class__.__name__} ({node.sql()!r})"
     raise errors.NotSupportedError(msg)
+
+
+#: Ranking window function -> the Polars ranking method that matches
+#: it. ``ROW_NUMBER`` is "ordinal" (ties broken by order of appearance),
+#: ``RANK`` leaves gaps after a tie, ``DENSE_RANK`` does not.
+_WINDOW_RANKS: dict[type[exp.Expression], str] = {
+    exp.RowNumber: "ordinal",
+    exp.Rank: "min",
+    exp.DenseRank: "dense",
+}
+
+
+def _window(node: exp.Window, ctx: _Ctx) -> pl.Expr:
+    """``<fn>() OVER (PARTITION BY ... ORDER BY ...)`` -> the Polars
+    windowed expression.
+
+    This is the shape that makes "top-k per group" expressible against a
+    vector search -- ``ROW_NUMBER() OVER (PARTITION BY category ORDER BY
+    distance)`` over the hits, then a filter on the rank."""
+    if node.args.get("spec") is not None:
+        msg = (
+            "window frame clauses (ROWS/RANGE BETWEEN) are not "
+            "supported: only the whole partition is available"
+        )
+        raise errors.NotSupportedError(msg)
+    partition = [
+        _expression(key, ctx) for key in node.args.get("partition_by") or []
+    ]
+    function = node.this
+    method = _WINDOW_RANKS.get(type(function))
+    if method is not None:
+        windowed = _rank_expression(node, method, ctx)
+    elif isinstance(function, exp.Count) or type(function) in _AGGREGATES:
+        # `SUM(x) OVER (PARTITION BY g)` -- the same reduction a GROUP BY
+        # would compute, broadcast back over each row of its partition.
+        # Matched by type rather than by `AggFunc`, which in sqlglot also
+        # covers `LAG`/`NTILE`/... -- those are window functions with no
+        # reduction behind them, and belong in the error below.
+        windowed = _reduce(function, ctx)
+    else:
+        msg = (
+            f"unsupported window function: {function.sql()!r}. "
+            "ROW_NUMBER, RANK, DENSE_RANK and the aggregate functions "
+            "are supported"
+        )
+        raise errors.NotSupportedError(msg)
+    # No PARTITION BY means one partition holding everything, which is
+    # what a constant key gives.
+    return windowed.over(partition or pl.lit(1))
+
+
+def _rank_expression(node: exp.Window, method: str, ctx: _Ctx) -> pl.Expr:
+    order = node.args.get("order")
+    if order is None:
+        msg = (
+            f"{node.this.sql()!r} needs an ORDER BY inside OVER (...): "
+            "a ranking has no meaning without one"
+        )
+        raise errors.NotSupportedError(msg)
+    keys = order.expressions
+    if len(keys) != 1:
+        # Polars ranks one expression; ranking on several keys would
+        # need a composite ordering this does not build.
+        msg = (
+            "a window ORDER BY is supported with one key only, got "
+            f"{len(keys)}"
+        )
+        raise errors.NotSupportedError(msg)
+    key = keys[0]
+    return _expression(key.this, ctx).rank(
+        method=t.cast("t.Any", method),
+        descending=bool(key.args.get("desc")),
+    )
 
 
 def _combine(
@@ -1548,4 +1967,8 @@ def _like_to_regex(pattern: str) -> str:
     return "".join(out)
 
 
-__all__ = ["build_relational_call", "needs_relational_engine"]
+__all__ = [
+    "build_relational_call",
+    "build_set_operation_call",
+    "needs_relational_engine",
+]

@@ -116,9 +116,15 @@ What reaches Milvus, and what does not:
 | Pushed to Milvus | Evaluated client-side |
 |---|---|
 | Every `WHERE` conjunct naming a single collection (`i.price > 20`) | Predicates spanning two collections (`i.price > c.budget`) |
-| The columns the statement actually references (projection pushdown) | Joins, `GROUP BY`, `HAVING`, aggregates |
-| `ORDER BY <vector> <=> :q LIMIT k` as a real ANN `search` | Scalar `ORDER BY`, `DISTINCT`, `LIMIT`/`OFFSET` |
-| Equi-join keys learned from the previous read, as `key in [...]` | Subquery results (`IN (SELECT ...)`, `EXISTS`, scalar) |
+| The columns the statement actually references (projection pushdown) | Joins (`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`, `ON` or `USING`) |
+| `ORDER BY <vector> <=> :q LIMIT k` as a real ANN `search` | `GROUP BY`, `HAVING`, aggregates, window functions |
+| Equi-join keys learned from the previous read, as `key in [...]` | `WITH` (CTEs), `UNION`/`INTERSECT`/`EXCEPT`, subqueries |
+| | Scalar `ORDER BY`, `DISTINCT`, `LIMIT`/`OFFSET` |
+
+Window functions are the one worth calling out against a vector database:
+`ROW_NUMBER() OVER (PARTITION BY category ORDER BY distance)` over a search's
+hits is *top-k per group*, which Milvus cannot express and an ANN index
+cannot answer directly.
 
 The key pushdown is what keeps this usable: an ANN search returning 50 hits
 joined against a million-row collection reads 50 rows from it, not a million.
@@ -156,13 +162,21 @@ Django's compiler groups and orders by *ordinal position* (`GROUP BY 1`,
 `ORDER BY 2 DESC`) rather than by name, and both ORMs quote every
 identifier; the planner resolves both spellings.
 
-Not supported yet, and rejected explicitly rather than mistranslated:
-**correlated** subqueries (SQLAlchemy's `.any()`/`.has()`, Django's
-`Exists(... OuterRef(...))` and `Subquery(...)` annotations — their result
-depends on the outer row, which needs either one read per row or a
-semi-join rewrite), `WITH` (CTEs), set operations
-(`UNION`/`INTERSECT`/`EXCEPT`), `JOIN ... USING`, `SELECT *` across a join,
-and window functions.
+Not supported, and rejected explicitly rather than mistranslated:
+
+- **Correlated subqueries** — SQLAlchemy's `.any()`/`.has()`, Django's
+  `Exists(... OuterRef(...))` and `Subquery(...)` annotations. Their result
+  depends on the outer row, which needs either one Milvus read per row or a
+  rewrite into a semi-join.
+- **`SELECT *` across a join** — not a client-side limitation: Milvus needs
+  an explicit `output_fields` list *before* any row comes back, and no
+  collection schema is available at translate time to expand `*` into one
+  per collection. Name the columns.
+- **`WITH RECURSIVE`** (re-reads until a fixpoint), **`INTERSECT ALL` /
+  `EXCEPT ALL`** (duplicate-count semantics a semi/anti join cannot
+  express), **window frame clauses** (`ROWS`/`RANGE BETWEEN`), **`LAG`/
+  `LEAD`/`NTILE`**, and **`JOIN ... USING` past two sources** (no schema to
+  say which of them owns the key — spell it as `ON`).
 
 Anything that *doesn't* need this path — a filter `SELECT`, a vector search, a
 hybrid search, a bare `COUNT(*)` — is still exactly one RPC and never builds a

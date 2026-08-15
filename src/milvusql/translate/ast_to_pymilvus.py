@@ -49,6 +49,7 @@ from milvusql.translate._common import (
 )
 from milvusql.translate.relational import (
     build_relational_call,
+    build_set_operation_call,
     needs_relational_engine,
 )
 
@@ -1078,6 +1079,18 @@ _BUILDERS: dict[type[exp.Expression], t.Callable[..., Call]] = {
     exp.Delete: lambda _client, ast, params: _build_delete(ast, params),
     exp.Update: lambda _client, ast, params: _build_update(ast, params),
     exp.Select: lambda _client, ast, params: _build_select(ast, params),
+    # A set operation is not a `Select`, so it needs its own entries:
+    # each branch is planned like any other query, into the same chain,
+    # and the rows are combined once both are in hand.
+    exp.Union: lambda _client, ast, params: build_set_operation_call(
+        ast, params
+    ),
+    exp.Intersect: lambda _client, ast, params: build_set_operation_call(
+        ast, params
+    ),
+    exp.Except: lambda _client, ast, params: build_set_operation_call(
+        ast, params
+    ),
 }
 
 
