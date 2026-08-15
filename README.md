@@ -16,6 +16,24 @@
 
 ---
 
+## Compatibility
+
+| milvusql | pymilvus | Milvus server | Status |
+|---|---|---|---|
+| 1.x | `>=2.6.17,<3` | 2.6.x | Tested — CI runs standalone via testcontainers |
+| 1.x | `>=2.6.17,<3` | Milvus Lite | Tested — reads past 16384 rows raise `NotSupportedError` rather than truncate |
+| 1.x | `3.0.x` | 3.0.x | **Not supported** |
+
+Milvus 3.0 moves work into the engine that this library currently does in the
+client: `ORDER BY` with per-segment sort and merge-sort across query nodes,
+single-collection `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` computed in the
+kernel, and `TEXT` as a first-class field type. `milvusql` evaluates the first
+two client-side and maps `TEXT` onto an analyzer-enabled `VARCHAR`; delegating to
+the server where 3.0 supports it is tracked in
+[#TODO](https://github.com/Callix-Tools/milvusql/issues). Whether the 16384-row
+per-call ceiling still applies on 3.0 is unverified — the paging behaviour
+described [below](#join-group-by-and-subqueries) is what 2.6.x and Milvus Lite do.
+
 ## Why a DBAPI, not a client wrapper?
 
 | Feature | **milvusql** | raw `pymilvus` |
@@ -27,7 +45,8 @@
 | Drop-in for SQLAlchemy / Django | ✅ [`milvusql-sqlalchemy`](packages/milvusql-sqlalchemy), [`milvusql-django`](packages/milvusql-django) | ❌ |
 | Auto-`LOAD` on first use, cached per connection | ✅ | manual `load_collection()` |
 | Consistency-level fallback (per-connection default, per-query override) | ✅ | manual per-call |
-| `JOIN` / `GROUP BY` / subqueries / correlated `EXISTS` | ✅ planned into one read per collection, combined client-side | ❌ Milvus has none of them |
+| `JOIN` / subqueries / correlated `EXISTS` | ✅ planned into one read per collection, combined client-side | ❌ not expressible |
+| `GROUP BY` + aggregates **across collections** | ✅ combined client-side | ⚠️ single-collection only (in-kernel since 3.0) |
 | Full-text search (BM25, `MATCH ... AGAINST`) | ✅ one `TEXT` column + one generated `SPARSEVEC` | ⚠️ schema `Function` + analyzer flags by hand |
 | Reads past the 16384-row per-call ceiling | ✅ transparent primary-key-cursor pages | ⚠️ `query_iterator` (sync client only) |
 | Introspection (`SHOW TABLES`, `DESCRIBE`) | ✅ | Python method calls |
@@ -143,11 +162,14 @@ await conn.close()
 
 ## JOIN, GROUP BY and subqueries
 
-Milvus reads one collection per RPC, joins nothing and reduces nothing.
-`milvusql` closes that gap without pretending it isn't there: a statement
-that needs more than one collection, a grouped aggregate or a subquery is
-**planned** into one Milvus read per collection, and the relational part is
-evaluated client-side with [Polars](https://pola.rs).
+Milvus reads one collection per RPC and joins nothing. Since 3.0 it sorts and
+aggregates *within* a collection in the engine — `ORDER BY` with per-segment
+sort, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` in the kernel — and
+`COUNT(*)` has been server-side for longer than that. What no version does is
+span two collections. `milvusql` closes that gap without pretending it isn't
+there: a statement that needs more than one collection, a grouped aggregate or
+a subquery is **planned** into one Milvus read per collection, and the
+relational part is evaluated client-side with [Polars](https://pola.rs).
 
 ```python
 cur.execute(
@@ -288,7 +310,7 @@ milvusql.connect(
 | `BIGINT` / `INT` / `SMALLINT` / `TINYINT` | `INT64/32/16/8` | `PRIMARY KEY [AUTO_INCREMENT]` on `BIGINT`/`VARCHAR` |
 | `FLOAT` / `DOUBLE` / `BOOLEAN` / `JSON` | ditto | JSON paths filter server-side: `WHERE meta['brand'] = :b` |
 | `VARCHAR(n)` | `VARCHAR` | |
-| `TEXT` | analyzer-enabled `VARCHAR(65535)` | full-text input: `MATCH ... AGAINST` + BM25 |
+| `TEXT` | analyzer-enabled `VARCHAR(65535)` | full-text input: `MATCH ... AGAINST` + BM25. Milvus 3.0 makes `TEXT` a first-class field type — see [Compatibility](#compatibility) |
 | `ARRAY<T>(capacity)` | `ARRAY` | `ARRAY_CONTAINS`/`_ALL`/`_ANY`, `ARRAY_LENGTH` filter server-side |
 | `VECTOR(dim)` | `FLOAT_VECTOR` | |
 | `SPARSEVEC` | `SPARSE_FLOAT_VECTOR` | `GENERATED ALWAYS AS (BM25(text_col))` for full-text |
