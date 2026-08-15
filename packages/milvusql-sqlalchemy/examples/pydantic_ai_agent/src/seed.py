@@ -1,15 +1,15 @@
 """One-time bootstrap + seed data for the `products` collection.
 
-    python -m catalog.seed
+    uv run src/seed.py
 """
 
 from __future__ import annotations
 
-from sqlalchemy import create_engine, insert
+import asyncio
 
-from catalog.config import SYNC_DATABASE_URL
-from catalog.db import bootstrap_schema, products
-from catalog.embeddings import get_embedder
+from db import bootstrap_schema, make_engine, products
+from embeddings import get_embedder
+from sqlalchemy import insert
 
 SAMPLE_PRODUCTS = [
     {
@@ -71,14 +71,14 @@ SAMPLE_PRODUCTS = [
 ]
 
 
-def main() -> None:
-    bootstrap_schema()
-    embedder = get_embedder()
-
-    engine = create_engine(SYNC_DATABASE_URL)
+async def main() -> None:
+    engine = make_engine()
     try:
-        with engine.connect() as conn:
-            conn.execute(
+        await bootstrap_schema(engine)
+        embedder = get_embedder()
+
+        async with engine.connect() as conn:
+            await conn.execute(
                 insert(products),
                 [
                     {
@@ -90,12 +90,12 @@ def main() -> None:
                     for item in SAMPLE_PRODUCTS
                 ],
             )
-            conn.commit()
+            await conn.commit()
     finally:
-        engine.dispose()
+        await engine.dispose()
 
     print(f"seeded {len(SAMPLE_PRODUCTS)} products")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

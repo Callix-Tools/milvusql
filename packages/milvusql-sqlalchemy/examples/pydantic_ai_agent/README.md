@@ -9,54 +9,67 @@ so its answers are grounded in whatever the catalog actually contains.
 
 ## Layout
 
-- `catalog/config.py` — settings from the environment.
-- `catalog/db.py` — the `products` collection (Core `Table`), and schema
+- `src/config.py` — settings for this example (a real Milvus target, the
+  agent model, the embedding backend).
+- `src/db.py` — the `products` collection (Core `Table`), and schema
   bootstrap.
-- `catalog/embeddings.py` — pluggable text embedder: `all-MiniLM-L6-v2` by
+- `src/embeddings.py` — pluggable text embedder: `all-MiniLM-L6-v2` by
   default, or a zero-dependency `deterministic` backend for smoke-testing.
-- `catalog/seed.py` — bootstraps the schema and inserts a small sample
-  catalog.
-- `catalog/agent.py` — the agent, its two tools, and the `ProductResult`
-  type they return.
-- `catalog/main.py` — an interactive CLI chat loop.
+- `src/seed.py` — bootstraps the schema and inserts a small sample catalog.
+- `src/agent.py` — the agent, its two tools, and the `ProductResult` type
+  they return.
+- `src/main.py` — an interactive CLI chat loop.
 
-## Two things worth noticing in `catalog/db.py`/`catalog/main.py`
+This example has its own `pyproject.toml` but is deliberately **not** a
+member of the repo's root `uv` workspace (unlike
+[`examples/*`](../../../../examples)): its agent/ML dependencies (`torch`,
+`pydantic-ai`, ...) are heavy enough that folding it into the monorepo's
+shared `uv.lock`/`task install` would slow every contributor's sync and
+every `ci-*.yml` job down for something none of them need. `[tool.uv.sources]`
+in its `pyproject.toml` points at the local `milvusql-sqlalchemy`/`milvusql`
+checkouts directly instead.
 
-1. **Schema bootstrap uses a sync engine.** `CREATE INDEX` waits for
-   completion via an RPC that Milvus Lite's async gRPC server doesn't
-   implement — a Lite-only gap, not a general one (see
-   `ast_to_pymilvus._build_create_index`'s docstring in the root `milvusql`
-   package) — so `bootstrap_schema()` builds the collection through a plain
-   `create_engine`, and only the agent's tools (`catalog/agent.py`) talk to
-   it through `milvusql+aio`.
+## Why schema bootstrap doesn't need a sync-client workaround
 
-2. **`catalog/main.py` re-runs `bootstrap_schema()` on startup, not just
-   `seed.py`.** Milvus Lite's "loaded" state lives in the process that
-   loaded it, not in the on-disk file — so a fresh process (the chat CLI)
-   reopening the same file needs its own `load_collection()` call even
-   though `seed.py` already made one in its own process. `bootstrap_schema`
-   guards every step, so calling it again is cheap when nothing's missing.
-   A real (non-Lite) server keeps load state independently of any one
-   client connection, so this is a no-op there — correct either way, which
-   is why `search_products` itself doesn't have to special-case Lite at
-   all.
+`db.py`'s `bootstrap_schema()` creates, indexes, and *doesn't* explicitly
+load the collection, entirely through the async (`milvusql+aio`) engine.
+Two things make that possible against this example's real Milvus target
+(brought up by the bundled `docker-compose.yaml`, not Milvus Lite):
+
+- `CREATE INDEX` waits for completion via an RPC that only Milvus Lite's
+  async gRPC server fails to implement — a Lite-only gap, not a general one
+  (see `ast_to_pymilvus._build_create_index`'s docstring in the root
+  `milvusql` package) — so it just works here.
+- `search`/`query` now auto-load their target collection the first time a
+  connection touches it, so there's no `LOAD TABLE`/`load_collection()` step
+  to work around at all — including for `main.py`'s chat loop, run as a
+  fresh process after `seed.py` already exited: against a real server, load
+  state isn't tied to the process that set it, and auto-load would cover it
+  either way.
 
 ## Run it
 
+### 1. Start Milvus
+
 ```bash
-pip install -r requirements.txt
+docker compose up -d
+```
+
+Brings up `etcd`/`minio`/`milvus-standalone`/`attu` (the shared infra from
+[`example_infra/`](../../../../example_infra) — the same containers the
+root package's own examples use, under the shared Compose project
+`milvus-examples`, so if you already have one of those running, this is a
+no-op). Wait for it to report healthy (`docker compose ps`, ~90s on a cold
+start) before continuing.
+
+### 2. Run the example
+
+```bash
 export OPENAI_API_KEY=sk-...   # or any provider pydantic-ai supports --
                                 # see AGENT_MODEL below
 
-python -m catalog.seed          # once: creates + indexes + seeds the catalog
-python -m catalog.main          # chat
-```
-
-No Milvus server needed by default — `DATABASE_URL` defaults to Milvus Lite
-(`milvusql+aio:///./catalog.db`). Point at a real server instead with:
-
-```bash
-export DATABASE_URL="milvusql+aio://root:Milvus@localhost:19530/default"
+uv run src/seed.py    # once: creates + indexes + seeds the catalog
+uv run src/main.py    # chat
 ```
 
 Use a different model provider with `AGENT_MODEL` (any string
@@ -70,13 +83,13 @@ pseudo-embedding instead of real semantics, so `search_products` results
 won't be meaningfully ranked:
 
 ```bash
-EMBEDDING_BACKEND=deterministic python -m catalog.seed
+EMBEDDING_BACKEND=deterministic uv run src/seed.py
 ```
 
 ## Example session
 
 ```
-$ python -m catalog.main
+$ uv run src/main.py
 Catalog assistant -- ask about products ('quit' to exit).
 > I need something warm for cold hikes
 I found a couple of good options for cold-weather hikes:
@@ -88,4 +101,11 @@ I found a couple of good options for cold-weather hikes:
 
 Want more detail on either one?
 > tell me more about the first one
+```
+
+### 3. Tear down
+
+```bash
+docker compose down       # stop the containers, keep data volumes
+docker compose down -v    # also wipe them
 ```

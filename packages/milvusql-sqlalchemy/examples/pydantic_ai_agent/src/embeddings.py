@@ -1,7 +1,7 @@
 """Pluggable text embedder for the catalog.
 
 Default backend is `sentence-transformers`' `all-MiniLM-L6-v2` -- what
-makes `search_products` (`catalog.agent`) semantically meaningful.
+makes `search_products` (`agent.py`) semantically meaningful.
 
 A `deterministic` backend is also included, with no ML dependency at
 all: a hash-derived pseudo-embedding, useful only for smoke-testing
@@ -18,7 +18,7 @@ import math
 import typing as t
 from functools import lru_cache
 
-from catalog.config import EMBEDDING_BACKEND, VECTOR_DIM
+from config import EMBEDDING_BACKEND, VECTOR_DIM
 
 
 class Embedder(t.Protocol):

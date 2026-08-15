@@ -4,9 +4,10 @@ image/text embedding space).
 
 Run with:
 
-    uvicorn app.main:app --reload
+    uv run uvicorn main:app --app-dir src --reload
 
-See the package README for setup and example `curl` calls.
+See the package README for setup (bringing up Milvus via Docker
+Compose) and example `curl` calls.
 """
 
 from __future__ import annotations
@@ -14,14 +15,13 @@ from __future__ import annotations
 import typing as t
 from contextlib import asynccontextmanager
 
+from db import bootstrap_schema, images, make_engine
+from embeddings import Embedder, get_embedder
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from schemas import ImageOut, SearchHit
 from sqlalchemy import delete, insert, literal_column, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.concurrency import run_in_threadpool
-
-from app.db import bootstrap_schema, images, make_async_engine
-from app.embeddings import Embedder, get_embedder
-from app.schemas import ImageOut, SearchHit
 
 _engine: AsyncEngine | None = None
 
@@ -29,11 +29,8 @@ _engine: AsyncEngine | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> t.AsyncIterator[None]:
     global _engine  # noqa: PLW0603 -- one engine for the app's lifetime, standard FastAPI lifespan pattern
-    # Blocking DDL (see `bootstrap_schema`'s docstring for why it's
-    # sync) -- off the event loop so it doesn't stall it during
-    # startup.
-    await run_in_threadpool(bootstrap_schema)
-    _engine = make_async_engine()
+    _engine = make_engine()
+    await bootstrap_schema(_engine)
     yield
     await _engine.dispose()
     _engine = None
@@ -58,7 +55,7 @@ async def create_image(
 ) -> ImageOut:
     data = await file.read()
     # CLIP inference is CPU-bound, synchronous work -- off the event
-    # loop, same reasoning as `bootstrap_schema` above.
+    # loop so it doesn't stall other requests.
     vector = await run_in_threadpool(embedder.embed_image, data)
 
     async with engine.connect() as conn:
@@ -146,9 +143,7 @@ async def search_by_image(
     data = await file.read()
     vector = await run_in_threadpool(embedder.embed_image, data)
     async with engine.connect() as conn:
-        rows = (
-            await conn.execute(_search_statement(vector, limit))
-        ).all()
+        rows = (await conn.execute(_search_statement(vector, limit))).all()
     return [
         SearchHit(
             id=r.id, filename=r.filename, caption=r.caption, distance=r.distance
@@ -169,9 +164,7 @@ async def search_by_text(
     # same `embedding` column/index `/search/image` does.
     vector = await run_in_threadpool(embedder.embed_text, q)
     async with engine.connect() as conn:
-        rows = (
-            await conn.execute(_search_statement(vector, limit))
-        ).all()
+        rows = (await conn.execute(_search_statement(vector, limit))).all()
     return [
         SearchHit(
             id=r.id, filename=r.filename, caption=r.caption, distance=r.distance

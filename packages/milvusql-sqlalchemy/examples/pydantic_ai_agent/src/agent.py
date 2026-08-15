@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from config import AGENT_MODEL
+from db import products
+from embeddings import Embedder
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from sqlalchemy import literal_column, select
 from sqlalchemy.ext.asyncio import AsyncEngine
-
-from catalog.config import AGENT_MODEL
-from catalog.db import products
-from catalog.embeddings import Embedder
 
 
 @dataclass

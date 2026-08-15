@@ -22,7 +22,7 @@ import math
 import typing as t
 from functools import lru_cache
 
-from app.config import EMBEDDING_BACKEND, VECTOR_DIM
+from config import EMBEDDING_BACKEND, VECTOR_DIM
 
 
 class Embedder(t.Protocol):

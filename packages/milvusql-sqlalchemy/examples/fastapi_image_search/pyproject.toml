@@ -1,0 +1,32 @@
+[project]
+name = "fastapi-image-search"
+version = "0.1.0"
+description = "FastAPI image-search service on milvusql-sqlalchemy"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "milvusql-sqlalchemy",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "sqlalchemy>=2.0",
+    # Real image/text embeddings (EMBEDDING_BACKEND=clip, the
+    # default) -- omit these two and run with
+    # EMBEDDING_BACKEND=deterministic to try the app without
+    # installing torch or downloading model weights.
+    "sentence-transformers",
+    "pillow",
+]
+
+[tool.uv.sources]
+# Deliberately NOT a member of the root `uv` workspace (unlike
+# ../../../../examples/*): this example's web/ML dependencies (torch,
+# fastapi, ...) are heavy enough that folding it into the monorepo's
+# shared `uv.lock`/`task install` would slow every contributor's sync
+# and every `ci-*.yml` job down for something none of them need. These
+# two path sources point at the same local `milvusql-sqlalchemy`/
+# `milvusql` checkouts a workspace member would resolve to, just
+# pinned explicitly instead of via `workspace = true` (which only
+# resolves meaningfully for an actual workspace member).
+milvusql-sqlalchemy = { path = "../../", editable = true }
+milvusql = { path = "../../../../", editable = true }

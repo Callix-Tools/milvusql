@@ -1,17 +1,12 @@
-"""Configuration, read once from the environment."""
+"""Configuration for the catalog-agent example."""
 
 from __future__ import annotations
 
 import os
 
-#: Milvus Lite (a local file) by default -- zero infrastructure to try
-#: the agent. Point at a real server with, e.g.:
-#: DATABASE_URL="milvusql+aio://root:Milvus@localhost:19530/default"
-DATABASE_URL = os.environ.get("DATABASE_URL", "milvusql+aio:///./catalog.db")
-#: Schema bootstrap and seeding run through the sync dialect, not
-#: `+aio` -- see `catalog.db.bootstrap_schema`'s docstring for why.
-#: Same connection target either way, just the driver name.
-SYNC_DATABASE_URL = DATABASE_URL.replace("milvusql+aio", "milvusql", 1)
+#: A real Milvus server, not Milvus Lite -- see the README for the
+#: bundled `docker-compose.yaml` that brings one up.
+DATABASE_URL = "milvusql+aio://root:Milvus@localhost:19530/default"
 
 COLLECTION_NAME = "products"
 
@@ -19,7 +14,7 @@ COLLECTION_NAME = "products"
 #: transformers`' `all-MiniLM-L6-v2` -- what makes `search_products`
 #: semantically meaningful. "deterministic": a hash-derived pseudo-
 #: embedding with no ML dependency at all, for smoke-testing the
-#: agent's tool wiring only -- see `catalog.embeddings`'s module
+#: agent's tool wiring only -- see `embeddings.py`'s module
 #: docstring.
 EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND", "minilm")
 #: `all-MiniLM-L6-v2`'s embedding dimension.

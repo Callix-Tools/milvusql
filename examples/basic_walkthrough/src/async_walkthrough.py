@@ -1,29 +1,18 @@
 """The exact same tour as ``walkthrough.py``, over ``milvusql.aio``
-instead of the sync PEP 249 surface.
+instead of the sync PEP 249 surface -- schema setup included: unlike
+Milvus Lite, a real server's async client (this example's target, via
+``docker-compose.yaml`` -- see the README) has no gap around ``CREATE
+INDEX``'s completion RPC, so this script stays all-async throughout,
+with no sync client anywhere (see
+``ast_to_pymilvus._build_create_index``'s own docstring in the root
+``milvusql`` package for the Lite-only gap this would otherwise need
+to work around). No explicit ``LOAD TABLE`` step either -- ``search``/
+``query`` auto-load their target collection the first time a
+connection touches it.
 
 Run with:
 
-    python async_walkthrough.py
-
-Defaults to a local Milvus Lite file (``./walkthrough_async.db``) --
-different filename than ``walkthrough.py``'s so the two can be run one
-after another without colliding. Point at a real server the same way:
-
-    MILVUS_URI=http://localhost:19530 MILVUS_TOKEN=root:Milvus python async_walkthrough.py
-
-One deliberate wrinkle: schema setup (``CREATE TABLE``/``CREATE
-INDEX``) runs through the *sync* client, not ``milvusql.aio``, even
-though this is otherwise an all-async script. ``CREATE INDEX`` waits
-for completion via an ``AllocTimestamp`` RPC that Milvus Lite's async
-gRPC server doesn't implement (a Lite-only gap -- a real server's
-async client handles it fine) -- see
-``ast_to_pymilvus._build_create_index``'s own docstring. Building the
-schema through the sync client and only switching to async for
-DML/DQL sidesteps that gap entirely, and is exactly the pattern this
-project's own async test suite uses (``seeded_engine_aio`` in
-``milvusql-sqlalchemy``'s fixtures). No explicit ``LOAD TABLE`` step
-either way -- both clients auto-``LOAD`` a collection the first time
-they run a search/query against it.
+    uv run src/async_walkthrough.py
 """
 
 import asyncio
@@ -58,12 +47,12 @@ async def main() -> None:
     cur = conn.cursor()
 
     try:
-        logger.info("\n--- CREATE TABLE (sync) ---")
+        logger.info("\n--- CREATE TABLE ---")
         await cur.execute(QUERY_DROP_TABLE)
         await cur.execute(QUERY_CREATE_TABLE)
         logger.info("collection 'walkthrough_items' created")
 
-        logger.info("\n--- CREATE INDEX (sync) ---")
+        logger.info("\n--- CREATE INDEX ---")
         await cur.execute(QUERY_CREATE_INDEX)
         logger.info("index built")
 

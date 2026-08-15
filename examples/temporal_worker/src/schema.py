@@ -1,7 +1,7 @@
 """One-time bootstrap: create the `catalog_items` collection this
 example's workflow inserts into. Run once, before starting the worker:
 
-    python schema.py
+    uv run src/schema.py
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ CREATE_TABLE = (
 )
 CREATE_INDEX = """
 CREATE INDEX idx_embedding ON catalog_items (embedding)
-USING HNSW WITH (metric_type='COSINE', M=16, efConstruction=200)
+USING HNSW WITH (metric_type='COSINE', M=16, ef_construction=200)
 """
 
 

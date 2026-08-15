@@ -33,7 +33,7 @@ CREATE TABLE walkthrough_items (
 
 QUERY_CREATE_INDEX = """
 CREATE INDEX idx_embedding ON walkthrough_items (embedding)
-USING HNSW WITH (metric_type='COSINE', M=16, efConstruction=200)
+USING HNSW WITH (metric_type='COSINE', M=16, ef_construction=200)
 """
 
 QUERY_INSERT_DATA = """
