@@ -22,9 +22,7 @@ for both) -- calling them here does not compromise the sync/async split.
 
 from __future__ import annotations
 
-import json
 import typing as t
-from dataclasses import dataclass, field
 
 from pymilvus import AnnSearchRequest, DataType, RRFRanker, WeightedRanker
 from sqlglot import exp
@@ -40,63 +38,23 @@ from sqlglot_milvus.expressions import (
 )
 
 from milvusql.dbapi import errors
+from milvusql.translate._common import (
+    DEFAULT_QUERY_LIMIT,
+    Call,
+    Postprocess,
+    RowsAndDescription,
+    description,
+    filter_text,
+    resolve_value,
+)
+from milvusql.translate.relational import (
+    build_relational_call,
+    build_set_operation_call,
+    needs_relational_engine,
+)
 
 if t.TYPE_CHECKING:
     from pymilvus import AsyncMilvusClient, MilvusClient
-
-#: Milvus's own hard ceiling on how many rows a single ``query``/
-#: ``search`` RPC can return (confirmed directly: ``pymilvus.orm.
-#: constants.MAX_BATCH_SIZE``). Used as the *default* ``limit`` for a
-#: SELECT that carries no ``LIMIT`` clause of its own -- Django's own
-#: SQL compiler never emits a ``LIMIT`` for a bare ``Model.objects.
-#: all()`` (confirmed against ``DatabaseOperations.no_limit_value()``
-#: returning ``None``, which suppresses the clause entirely), so a
-#: small hand-picked default here used to silently drop every row past
-#: it with no error at all. This is Milvus's actual per-call ceiling,
-#: not a guess -- the honest answer to "how many rows can come back
-#: with no explicit LIMIT" is "as many as Milvus itself allows in one
-#: call", never an arbitrary smaller number.
-_DEFAULT_QUERY_LIMIT = 16384
-
-#: Rows as PEP 249 wants them back from ``fetch*``, the column
-#: descriptions ``Cursor.description`` exposes (name-only; the rest of
-#: the 7-tuple is unknown and left ``None``, same simplification
-#: ``elasticsearch-dbapi`` makes for the same reason -- Milvus's client
-#: gives us values, not a typed wire schema, at this layer), the
-#: ``rowcount`` PEP 249 wants set after ``execute()`` (-1 for DDL/DDL-like
-#: statements where the concept does not apply, same as every other
-#: DBAPI does for ``CREATE``/``LOAD``), and ``lastrowid`` -- the
-#: PEP 249-conventional (sqlite3, MySQLdb, ...) place an auto-assigned
-#: primary key surfaces after ``INSERT``, ``None`` for anything else.
-RowsAndDescription = tuple[
-    list[tuple[t.Any, ...]], list[tuple] | None, int, t.Any
-]
-
-Postprocess = t.Callable[[t.Any], RowsAndDescription]
-
-
-@dataclass(frozen=True)
-class Call:
-    """What to call on a ``MilvusClient``/``AsyncMilvusClient``, and how
-    to turn its return value into DBAPI-shaped rows.
-
-    ``then`` exists for the one statement that genuinely cannot be a
-    single RPC: ``UPDATE``. Milvus has no partial-row update, only
-    ``upsert()``, which replaces the whole entity -- so an ``UPDATE ...
-    SET ... WHERE ...`` has to read the matching rows in full first,
-    merge the ``SET`` values in Python, then upsert the merged rows
-    back. Given this call's raw result, ``then`` returns the next
-    ``Call`` to run, or ``None`` to stop and postprocess *this* call's
-    raw result instead -- still just describing what to call next, the
-    same "no I/O in this module" invariant every ``_build_*`` function
-    above keeps; ``dbapi/cursor.py`` (sync) and ``aio.py`` (async) are
-    still the only two places that actually invoke a client method,
-    now in a small loop instead of once."""
-
-    method: str
-    kwargs: dict[str, t.Any] = field(default_factory=dict)
-    postprocess: Postprocess = lambda _raw: ([], None, -1, None)
-    then: t.Callable[[t.Any], Call | None] | None = None
 
 
 def _no_rows(_raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
@@ -151,38 +109,11 @@ def _upsert_result(raw: dict[str, t.Any]) -> RowsAndDescription:
 # -----------------------------------------------------------------------
 
 
-def _resolve_value(
-    node: exp.Expression, parameters: dict[str, t.Any]
-) -> t.Any:  # noqa: ANN401 -- a bind value is genuinely any JSON-ish type
-    """A literal, placeholder or array -> the Python value it names.
-    Bind values (vectors, scalars passed as ``:name``) are read from
-    ``parameters``, never parsed back out of query text (D1)."""
-    if isinstance(node, (exp.Placeholder, exp.Parameter)):
-        name = node.this
-        if name not in parameters:
-            msg = f"missing bind parameter {name!r}"
-            raise errors.ProgrammingError(msg)
-        return parameters[name]
-    if isinstance(node, exp.Boolean):
-        return bool(node.this)
-    if isinstance(node, exp.Literal):
-        if node.is_string:
-            return node.this
-        text = node.this
-        return float(text) if "." in text or "e" in text.lower() else int(text)
-    if isinstance(node, (exp.Array, exp.Tuple)):
-        return [_resolve_value(e, parameters) for e in node.expressions]
-    if isinstance(node, exp.Null):
-        return None
-    msg = f"unsupported value expression: {node.__class__.__name__}"
-    raise errors.NotSupportedError(msg)
-
-
 def _property_list_to_dict(
     properties: list[exp.Property], parameters: dict[str, t.Any]
 ) -> dict[str, t.Any]:
     return {
-        prop.this.name: _resolve_value(prop.args["value"], parameters)
+        prop.this.name: resolve_value(prop.args["value"], parameters)
         for prop in properties
     }
 
@@ -193,146 +124,6 @@ def _properties_to_dict(
     if node is None:
         return {}
     return _property_list_to_dict(node.expressions, parameters)
-
-
-# -----------------------------------------------------------------------
-# WHERE -> Milvus filter-expression templating (shared: DELETE, SELECT)
-# -----------------------------------------------------------------------
-
-_COMPARISON_OPS: dict[type[exp.Expression], str] = {
-    exp.EQ: "==",
-    exp.NEQ: "!=",
-    exp.GT: ">",
-    exp.GTE: ">=",
-    exp.LT: "<",
-    exp.LTE: "<=",
-}
-
-
-def _render_filter_value(value: t.Any) -> str:  # noqa: ANN401
-    """A resolved bind value -> its Milvus filter-DSL literal spelling.
-    ``json.dumps`` for strings gives correct escaping (quotes,
-    backslashes, control characters) for free -- Milvus's own string
-    literal syntax is JSON-compatible double-quoting, confirmed against
-    the docs and against a real Milvus Lite instance below."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return json.dumps(value)
-    if isinstance(value, (int, float)):
-        return repr(value)
-    msg = f"unsupported filter value type: {type(value).__name__}"
-    raise errors.NotSupportedError(msg)
-
-
-def _render_filter(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clearer flat than nested
-    node: exp.Expression, parameters: dict[str, t.Any]
-) -> str:
-    """MilvusQL's WHERE tree -> Milvus's boolean filter-expression text.
-
-    Milvus's ``{name}`` filter templating (the documented way to keep
-    bound values out of the expression string) was tried first and
-    empirically does not work against Milvus Lite -- confirmed with a
-    direct ``MilvusClient.query(filter="x == {p}", filter_params=...)``
-    call, which the embedded server's expression parser rejects with
-    "unexpected character '{'". Scalar WHERE values (unlike vectors,
-    the thing D1's never-inline-into-text rule is actually about) are
-    small and not precision-sensitive, so resolving and escaping them
-    inline here, via :func:`_render_filter_value`, is the fallback that
-    is verified to actually work."""
-    if isinstance(node, exp.Where):
-        return _render_filter(node.this, parameters)
-    if isinstance(node, exp.Paren):
-        return f"({_render_filter(node.this, parameters)})"
-    if isinstance(node, exp.And):
-        left = _render_filter(node.this, parameters)
-        right = _render_filter(node.expression, parameters)
-        return f"({left} and {right})"
-    if isinstance(node, exp.Or):
-        left = _render_filter(node.this, parameters)
-        right = _render_filter(node.expression, parameters)
-        return f"({left} or {right})"
-    if isinstance(node, exp.Not):
-        return f"not ({_render_filter(node.this, parameters)})"
-    op = _COMPARISON_OPS.get(type(node))
-    if op is not None:
-        left = _render_filter(node.this, parameters)
-        right = _render_filter(node.expression, parameters)
-        return f"{left} {op} {right}"
-    if isinstance(node, exp.In):
-        # Milvus's filter DSL has its own native `field in [...]`
-        # syntax (confirmed directly against Milvus Lite) -- no
-        # transpiling needed, just render the column and each
-        # resolved value the same way every other comparison here
-        # does. `col IN ()` (Django's `filter(pk__in=[])`, though the
-        # ORM usually short-circuits that to an empty queryset before
-        # any SQL is even sent) matches nothing, same as SQL's own
-        # empty-IN-list semantics -- `false` says that honestly rather
-        # than sending Milvus a syntax error over an empty `[]`.
-        if not node.expressions:
-            return "false"
-        column = _render_filter(node.this, parameters)
-        values = ", ".join(
-            _render_filter_value(_resolve_value(value, parameters))
-            for value in node.expressions
-        )
-        return f"{column} in [{values}]"
-    if isinstance(node, exp.Like):
-        # Milvus's filter DSL has its own native `field like "pattern"`
-        # syntax (confirmed directly against Milvus Lite, SQL-style `%`/
-        # `_` wildcards) -- no transpiling needed. `NOT LIKE` compiles
-        # to a `negate` flag on the same node (unlike `NOT IN`/
-        # `IS NOT NULL`, which wrap in a separate `exp.Not`), so it is
-        # handled here rather than falling through to the generic `Not`
-        # case above.
-        column = _render_filter(node.this, parameters)
-        pattern = _render_filter_value(
-            _resolve_value(node.expression, parameters)
-        )
-        text = f"{column} like {pattern}"
-        return f"not ({text})" if node.args.get("negate") else text
-    if isinstance(node, exp.Between):
-        # Milvus's filter DSL has no `BETWEEN` keyword at all (confirmed
-        # directly: a bare `id BETWEEN 1 AND 2` is a syntax error), so
-        # this transpiles to the equivalent `>=`/`<=` pair every other
-        # comparison here already renders -- `NOT BETWEEN` gets this for
-        # free via the generic `Not` case above, since (unlike `LIKE`)
-        # it wraps in a separate `exp.Not` rather than a node flag.
-        column = _render_filter(node.this, parameters)
-        low = _render_filter_value(
-            _resolve_value(node.args["low"], parameters)
-        )
-        high = _render_filter_value(
-            _resolve_value(node.args["high"], parameters)
-        )
-        return f"({column} >= {low} and {column} <= {high})"
-    if isinstance(node, exp.Is):
-        # Milvus's filter DSL only has `is null`/`is not null`
-        # (confirmed directly) -- no other `IS <predicate>` form (e.g.
-        # `IS TRUE`) to transpile to, so anything but a `NULL` right-hand
-        # side is a real gap, not a silent guess.
-        if not isinstance(node.expression, exp.Null):
-            msg = (
-                "unsupported IS comparison: IS "
-                f"{node.expression.__class__.__name__}"
-            )
-            raise errors.NotSupportedError(msg)
-        column = _render_filter(node.this, parameters)
-        return f"{column} is null"
-    if isinstance(node, exp.Column):
-        return node.this.name
-    if isinstance(
-        node, (exp.Placeholder, exp.Parameter, exp.Literal, exp.Boolean)
-    ):
-        return _render_filter_value(_resolve_value(node, parameters))
-    msg = f"unsupported filter expression: {node.__class__.__name__}"
-    raise errors.NotSupportedError(msg)
-
-
-def _filter_text(where: exp.Where | None, parameters: dict[str, t.Any]) -> str:
-    if where is None:
-        return ""
-    return _render_filter(where, parameters)
 
 
 # -----------------------------------------------------------------------
@@ -604,7 +395,7 @@ def _insert_rows(
     values_node = ast.args["expression"]
     return [
         {
-            name: _resolve_value(value, parameters)
+            name: resolve_value(value, parameters)
             for name, value in zip(columns, row.expressions, strict=True)
         }
         for row in values_node.expressions
@@ -664,10 +455,10 @@ def build_batch_call(
 
 def _build_delete(ast: exp.Delete, parameters: dict[str, t.Any]) -> Call:
     table_name = ast.this.name
-    filter_text = _filter_text(ast.args.get("where"), parameters)
+    filter_expr = filter_text(ast.args.get("where"), parameters)
     kwargs: dict[str, t.Any] = {"collection_name": table_name}
-    if filter_text:
-        kwargs["filter"] = filter_text
+    if filter_expr:
+        kwargs["filter"] = filter_expr
     return Call("delete", kwargs, _mutation_count("delete_count"))
 
 
@@ -695,16 +486,16 @@ def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
     key instead."""
     table_name = ast.this.name
     # `UPDATE`'s `SET` list is always `col = <expr>` (`exp.EQ`) by
-    # grammar -- `_resolve_value` is what actually rejects an
+    # grammar -- `resolve_value` is what actually rejects an
     # unsupported right-hand side (`SET stock = stock + 1`, an `F()`
     # expression in Django terms: `exp.Add`, not a bare bind value or
     # literal), the same way it rejects one anywhere else in this
     # module.
     set_values = {
-        assignment.this.name: _resolve_value(assignment.expression, parameters)
+        assignment.this.name: resolve_value(assignment.expression, parameters)
         for assignment in ast.expressions
     }
-    filter_text = _filter_text(ast.args.get("where"), parameters)
+    filter_expr = filter_text(ast.args.get("where"), parameters)
 
     query_kwargs: dict[str, t.Any] = {
         "collection_name": table_name,
@@ -712,14 +503,30 @@ def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
         # whole entity, so the merged row has to carry everything the
         # row already had, not just the columns SET touches.
         "output_fields": ["*"],
-        "limit": _DEFAULT_QUERY_LIMIT,
+        "limit": DEFAULT_QUERY_LIMIT,
     }
-    if filter_text:
-        query_kwargs["filter"] = filter_text
+    if filter_expr:
+        query_kwargs["filter"] = filter_expr
 
     def _then(raw: list[dict[str, t.Any]]) -> Call | None:
         if not raw:
             return None
+        if len(raw) >= DEFAULT_QUERY_LIMIT:
+            # The read that feeds the upsert is subject to Milvus's own
+            # per-call ceiling like any other. Writing back only the
+            # rows that fit would leave the rest untouched and report a
+            # `rowcount` that looks like the whole thing -- the same
+            # silent-truncation trap the aggregate, ORDER BY and
+            # join/grouping paths all refuse to fall into. Nothing has
+            # been written at this point: this is the read step.
+            msg = (
+                "UPDATE cannot be honored: the WHERE filter matches at "
+                f"least Milvus's own per-call row ceiling "
+                f"({DEFAULT_QUERY_LIMIT}), so only part of the matching "
+                "rows would be updated. Narrow the WHERE filter and run "
+                "it in batches."
+            )
+            raise errors.NotSupportedError(msg)
         merged = [{**row, **set_values} for row in raw]
         return Call(
             "upsert",
@@ -758,12 +565,6 @@ def _select_output_names(ast: exp.Select) -> list[str]:
     return [column.output_name for column in ast.expressions]
 
 
-def _description(output_names: list[str]) -> list[tuple]:
-    return [
-        (name, None, None, None, None, None, True) for name in output_names
-    ]
-
-
 def _search_rows(
     field_names: list[str], output_names: list[str]
 ) -> Postprocess:
@@ -777,7 +578,7 @@ def _search_rows(
                 "distance": hit.get("distance"),
             }
             rows.append(tuple(available.get(name) for name in field_names))
-        return rows, _description(output_names), len(rows), None
+        return rows, description(output_names), len(rows), None
 
     return postprocess
 
@@ -787,7 +588,7 @@ def _query_rows(
 ) -> Postprocess:
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
         rows = [tuple(row.get(name) for name in field_names) for row in raw]
-        return rows, _description(output_names), len(rows), None
+        return rows, description(output_names), len(rows), None
 
     return postprocess
 
@@ -801,13 +602,13 @@ def _sorted_query_rows(
     """Client-side ``ORDER BY <scalar column>`` + ``LIMIT``: Milvus's
     ``query()`` RPC has no ordering concept of its own (confirmed --
     it accepts a filter and a row cap, nothing else), so this sorts
-    every matching row (fetched up to :data:`_DEFAULT_QUERY_LIMIT`,
+    every matching row (fetched up to :data:`DEFAULT_QUERY_LIMIT`,
     same ceiling a plain unordered SELECT is already subject to) in
     Python and only *then* applies the real ``LIMIT`` -- sorting after
     truncating would return the wrong rows entirely.
 
     If the ``WHERE`` filter itself matches more than
-    :data:`_DEFAULT_QUERY_LIMIT` rows, the fetch above is itself
+    :data:`DEFAULT_QUERY_LIMIT` rows, the fetch above is itself
     truncated -- the sort would then run over an arbitrary subset of
     the true matches, silently returning the wrong "top N" with no
     error at all. ``postprocess`` below detects that (the fetch came
@@ -821,11 +622,11 @@ def _sorted_query_rows(
     never do (D1/D12)."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
-        if len(raw) >= _DEFAULT_QUERY_LIMIT:
+        if len(raw) >= DEFAULT_QUERY_LIMIT:
             msg = (
                 "ORDER BY cannot be honored: the WHERE filter matches "
                 f"at least Milvus's own per-call row ceiling "
-                f"({_DEFAULT_QUERY_LIMIT}), so the true sort order "
+                f"({DEFAULT_QUERY_LIMIT}), so the true sort order "
                 "across every matching row cannot be verified. Narrow "
                 "the WHERE filter to match fewer rows."
             )
@@ -844,7 +645,7 @@ def _sorted_query_rows(
             )
         rows = rows[:limit]
         tuples = [tuple(row.get(name) for name in field_names) for row in rows]
-        return tuples, _description(output_names), len(tuples), None
+        return tuples, description(output_names), len(tuples), None
 
     return postprocess
 
@@ -883,6 +684,14 @@ def _flatten_trivial_subquery(ast: exp.Select) -> exp.Select:
     confident to flatten (including a bare ``SELECT`` with no ``FROM``
     at all, e.g. ``SELECT EXISTS(...)`` -- :func:`_table_name` still
     rejects that cleanly, same as every other shape left unflattened)."""
+    if ast.args.get("group") is not None or ast.args.get("joins"):
+        # The relational engine handles this statement, and it addresses
+        # the subquery by its alias (`t.category`) -- rewriting the FROM
+        # out from under those references would leave them pointing at a
+        # name that no longer exists. Nothing is lost by not flattening:
+        # that engine plans the subquery's own filter into its scan
+        # anyway, which is all this rewrite buys.
+        return ast
     from_node = ast.args.get("from_")
     if from_node is None:
         return ast
@@ -975,7 +784,7 @@ def _count_star_rows(count: int, output_names: list[str]) -> Postprocess:
         # value across every expression -- there is nothing else it
         # could mean with no other aggregate or real column present.
         row = tuple(total for _ in range(count))
-        return [row], _description(output_names), 1, None
+        return [row], description(output_names), 1, None
 
     return postprocess
 
@@ -986,7 +795,7 @@ def _reduce_aggregate_rows(
     """``SUM``/``AVG``/``MIN``/``MAX``/``COUNT(<column>)`` (everything
     but a pure ``COUNT(*)``, which the server-side fast path above
     handles instead): Milvus computes none of these itself, so every
-    matching row is fetched (up to :data:`_DEFAULT_QUERY_LIMIT`) and
+    matching row is fetched (up to :data:`DEFAULT_QUERY_LIMIT`) and
     reduced here in Python. Same reasoning as
     :func:`_sorted_query_rows` for why hitting that ceiling raises
     instead of silently reducing over a truncated subset -- a ``SUM``
@@ -994,11 +803,11 @@ def _reduce_aggregate_rows(
     wrong number with no indication it is wrong."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
-        if len(raw) >= _DEFAULT_QUERY_LIMIT:
+        if len(raw) >= DEFAULT_QUERY_LIMIT:
             msg = (
                 "aggregate cannot be honored: the WHERE filter matches "
                 f"at least Milvus's own per-call row ceiling "
-                f"({_DEFAULT_QUERY_LIMIT}), so the aggregate cannot be "
+                f"({DEFAULT_QUERY_LIMIT}), so the aggregate cannot be "
                 "computed over every matching row. Narrow the WHERE "
                 "filter to match fewer rows."
             )
@@ -1025,14 +834,14 @@ def _reduce_aggregate_rows(
                 values.append(min(numbers) if numbers else None)
             elif func == "max":
                 values.append(max(numbers) if numbers else None)
-        return [tuple(values)], _description(output_names), 1, None
+        return [tuple(values)], description(output_names), 1, None
 
     return postprocess
 
 
 def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     table_name = _table_name(ast)
-    filter_text = _filter_text(ast.args.get("where"), parameters)
+    filter_expr = filter_text(ast.args.get("where"), parameters)
     output_names = _select_output_names(ast)
 
     specs: list[tuple[str, str | None]] = []
@@ -1047,13 +856,13 @@ def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
         # needed at all, and no ceiling to worry about either
         # (confirmed directly against Milvus Lite: `query(...,
         # output_fields=["count(*)"])` returns the true total even
-        # past `_DEFAULT_QUERY_LIMIT` rows).
+        # past `DEFAULT_QUERY_LIMIT` rows).
         kwargs: dict[str, t.Any] = {
             "collection_name": table_name,
             "output_fields": ["count(*)"],
         }
-        if filter_text:
-            kwargs["filter"] = filter_text
+        if filter_expr:
+            kwargs["filter"] = filter_expr
         return Call(
             "query", kwargs, _count_star_rows(len(specs), output_names)
         )
@@ -1062,10 +871,10 @@ def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     kwargs = {
         "collection_name": table_name,
         "output_fields": columns or ["count(*)"],
-        "limit": _DEFAULT_QUERY_LIMIT,
+        "limit": DEFAULT_QUERY_LIMIT,
     }
-    if filter_text:
-        kwargs["filter"] = filter_text
+    if filter_expr:
+        kwargs["filter"] = filter_expr
     return Call("query", kwargs, _reduce_aggregate_rows(specs, output_names))
 
 
@@ -1104,12 +913,12 @@ def _build_hybrid_search(
     table_name = _table_name(ast)
     field_names = _select_field_names(ast)
     output_names = _select_output_names(ast)
-    filter_text = _filter_text(ast.args.get("where"), parameters)
+    filter_expr = filter_text(ast.args.get("where"), parameters)
     limit_node = ast.args.get("limit")
     limit = (
-        int(_resolve_value(limit_node.expression, parameters))
+        int(resolve_value(limit_node.expression, parameters))
         if limit_node
-        else _DEFAULT_QUERY_LIMIT
+        else DEFAULT_QUERY_LIMIT
     )
 
     reqs = []
@@ -1124,10 +933,10 @@ def _build_hybrid_search(
             )
             raise errors.NotSupportedError(msg)
         column_name = distance_node.this.this.name
-        query_vector = _resolve_value(distance_node.expression, parameters)
+        query_vector = resolve_value(distance_node.expression, parameters)
         weight_node = arm.args.get("weight")
         weight = (
-            float(_resolve_value(weight_node, parameters))
+            float(resolve_value(weight_node, parameters))
             if weight_node is not None
             else 1.0
         )
@@ -1138,8 +947,8 @@ def _build_hybrid_search(
             "param": {"metric_type": metric_type},
             "limit": limit,
         }
-        if filter_text:
-            req_kwargs["expr"] = filter_text
+        if filter_expr:
+            req_kwargs["expr"] = filter_expr
         reqs.append(AnnSearchRequest(**req_kwargs))
 
     rerank_node = hybrid.args.get("rerank")
@@ -1177,24 +986,26 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     if hybrid:
         return _build_hybrid_search(hybrid, ast, parameters)
 
+    if needs_relational_engine(ast):
+        # A JOIN, a GROUP BY or a subquery: more than one collection
+        # read, or a reduction Milvus has no RPC for. `relational` plans
+        # those into one fetch per collection plus a client-side
+        # evaluation -- everything else stays exactly one RPC and never
+        # touches that path. Checked before `_is_aggregate_select`
+        # below, which looks only at the SELECT list and would otherwise
+        # claim `SELECT COUNT(*) FROM a JOIN b` as a single-collection
+        # aggregate; the bare `SELECT COUNT(*) FROM items` it is for
+        # still lands there, since one collection with no GROUP BY never
+        # needs this engine.
+        return build_relational_call(ast, parameters)
+
     if _is_aggregate_select(ast):
         return _build_aggregate(ast, parameters)
-
-    if ast.args.get("group") is not None:
-        # `_is_aggregate_select` already returns False whenever GROUP BY
-        # is present (grouped or not), so every GROUP BY query falls
-        # through to here. Milvus's `query()`/`search()` have no
-        # server-side grouping and nothing downstream reduces per-group
-        # -- silently falling through to the plain-select path below
-        # used to run the query ungrouped and return one row per
-        # matching entity instead of one row per group.
-        msg = "GROUP BY is not supported"
-        raise errors.NotSupportedError(msg)
 
     table_name = _table_name(ast)
     field_names = _select_field_names(ast)
     output_names = _select_output_names(ast)
-    filter_text = _filter_text(ast.args.get("where"), parameters)
+    filter_expr = filter_text(ast.args.get("where"), parameters)
     limit_node = ast.args.get("limit")
     # LIMIT is a literal in hand-written MilvusQL, but a bound
     # parameter in SQLAlchemy-generated text by default (confirmed
@@ -1203,11 +1014,11 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     # else instead of assuming a literal. No LIMIT clause at all (a
     # bare `Model.objects.all()`) falls back to Milvus's own per-call
     # ceiling, never an arbitrary smaller number -- see
-    # `_DEFAULT_QUERY_LIMIT`.
+    # `DEFAULT_QUERY_LIMIT`.
     limit = (
-        int(_resolve_value(limit_node.expression, parameters))
+        int(resolve_value(limit_node.expression, parameters))
         if limit_node
-        else _DEFAULT_QUERY_LIMIT
+        else DEFAULT_QUERY_LIMIT
     )
 
     order = ast.args.get("order")
@@ -1224,8 +1035,8 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
             "output_fields": field_names,
             "limit": limit,
         }
-        if filter_text:
-            kwargs["filter"] = filter_text
+        if filter_expr:
+            kwargs["filter"] = filter_expr
         if order is None:
             return Call(
                 "query", kwargs, _query_rows(field_names, output_names)
@@ -1240,7 +1051,7 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
             if column not in fetch_fields:
                 fetch_fields.append(column)
         kwargs["output_fields"] = fetch_fields
-        kwargs["limit"] = _DEFAULT_QUERY_LIMIT
+        kwargs["limit"] = DEFAULT_QUERY_LIMIT
         return Call(
             "query",
             kwargs,
@@ -1248,7 +1059,7 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
         )
 
     column_name = distance_node.this.this.name
-    query_vector = _resolve_value(distance_node.expression, parameters)
+    query_vector = resolve_value(distance_node.expression, parameters)
 
     search_params_node = ast.args.get(SEARCH_PARAMS_ARG)
     knobs = _property_list_to_dict(
@@ -1264,8 +1075,8 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
         "output_fields": field_names,
         "search_params": {"metric_type": metric_type, "params": knobs},
     }
-    if filter_text:
-        kwargs["filter"] = filter_text
+    if filter_expr:
+        kwargs["filter"] = filter_expr
     consistency = ast.args.get(CONSISTENCY_ARG)
     if consistency is not None:
         kwargs["consistency_level"] = consistency.this.name
@@ -1284,6 +1095,18 @@ _BUILDERS: dict[type[exp.Expression], t.Callable[..., Call]] = {
     exp.Delete: lambda _client, ast, params: _build_delete(ast, params),
     exp.Update: lambda _client, ast, params: _build_update(ast, params),
     exp.Select: lambda _client, ast, params: _build_select(ast, params),
+    # A set operation is not a `Select`, so it needs its own entries:
+    # each branch is planned like any other query, into the same chain,
+    # and the rows are combined once both are in hand.
+    exp.Union: lambda _client, ast, params: build_set_operation_call(
+        ast, params
+    ),
+    exp.Intersect: lambda _client, ast, params: build_set_operation_call(
+        ast, params
+    ),
+    exp.Except: lambda _client, ast, params: build_set_operation_call(
+        ast, params
+    ),
 }
 
 

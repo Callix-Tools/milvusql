@@ -1,35 +1,17 @@
 """Error-path coverage for ``translate.ast_to_pymilvus.build_call`` on
-``GROUP BY`` -- a shape Milvus cannot execute (no server-side grouping,
-nothing downstream reduces per-group), so it must raise a clean
-``NotSupportedError`` instead of silently running ungrouped."""
+aggregate ``SELECT``s. ``GROUP BY`` is no longer among them -- it is
+planned by ``translate.relational`` and covered in
+``tests/unit/translate/select_group_by``; what stays here is the
+single-collection reduction and the row ceiling that makes it honest."""
 
 from __future__ import annotations
 
 import pytest
 
 import milvusql
-from milvusql.translate.ast_to_pymilvus import _DEFAULT_QUERY_LIMIT
+from milvusql.translate._common import DEFAULT_QUERY_LIMIT
 
 pytestmark = [pytest.mark.unit, pytest.mark.translate]
-
-
-class TestGroupByIsRejected:
-    def test_group_by_raises_not_supported_error(self, build_call_helper):
-        """``_is_aggregate_select`` already returns ``False`` whenever
-        ``GROUP BY`` is present, so this used to fall through to the
-        plain-select path and execute as an ungrouped ``query()`` --
-        one row per matching entity instead of one row per group, with
-        no error at all."""
-        with pytest.raises(milvusql.NotSupportedError, match="GROUP BY"):
-            build_call_helper(
-                "SELECT category, COUNT(*) FROM items GROUP BY category"
-            )
-
-    def test_group_by_is_rejected_even_with_a_bare_column_select(
-        self, build_call_helper
-    ):
-        with pytest.raises(milvusql.NotSupportedError, match="GROUP BY"):
-            build_call_helper("SELECT category FROM items GROUP BY category")
 
 
 class TestRowCeilingIsDetected:
@@ -43,7 +25,7 @@ class TestRowCeilingIsDetected:
         self, build_call_helper
     ):
         call = build_call_helper('SELECT SUM("id") AS "total" FROM items')
-        raw = [{"id": i} for i in range(_DEFAULT_QUERY_LIMIT)]
+        raw = [{"id": i} for i in range(DEFAULT_QUERY_LIMIT)]
         with pytest.raises(milvusql.NotSupportedError, match="aggregate"):
             call.postprocess(raw)
 
@@ -51,9 +33,9 @@ class TestRowCeilingIsDetected:
         self, build_call_helper
     ):
         call = build_call_helper('SELECT SUM("id") AS "total" FROM items')
-        raw = [{"id": 1} for _ in range(_DEFAULT_QUERY_LIMIT - 1)]
+        raw = [{"id": 1} for _ in range(DEFAULT_QUERY_LIMIT - 1)]
         rows, _description, rowcount, _lastrowid = call.postprocess(raw)
-        assert rows == [(_DEFAULT_QUERY_LIMIT - 1,)]
+        assert rows == [(DEFAULT_QUERY_LIMIT - 1,)]
         assert rowcount == 1
 
     def test_a_pure_count_star_is_exempt_from_the_ceiling(
@@ -65,6 +47,6 @@ class TestRowCeilingIsDetected:
         call = build_call_helper('SELECT COUNT(*) AS "n" FROM items')
         assert call.kwargs.get("limit") is None
         rows, _description, _rowcount, _lastrowid = call.postprocess(
-            [{"count(*)": _DEFAULT_QUERY_LIMIT + 1}]
+            [{"count(*)": DEFAULT_QUERY_LIMIT + 1}]
         )
-        assert rows == [(_DEFAULT_QUERY_LIMIT + 1,)]
+        assert rows == [(DEFAULT_QUERY_LIMIT + 1,)]

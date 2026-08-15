@@ -188,3 +188,21 @@ class TestTrivialSubqueryIsFlattened:
             {"cat": "book", "n": 1},
         )
         assert call.kwargs["filter"] == '(id > 1 and category == "book")'
+
+
+class TestClausesWithNoMilvusEquivalent:
+    """``query()`` takes a filter and a row cap, nothing else -- so a
+    statement carrying one of these has to be evaluated client-side
+    rather than sent as-is and quietly dropped."""
+
+    def test_distinct_on_one_collection_deduplicates(self, build_call_helper):
+        call = build_call_helper("SELECT DISTINCT cid FROM items")
+        rows, _desc, _rc, _l = call.postprocess([{"cid": 1}, {"cid": 1}])
+        assert rows == [(1,)]
+
+    def test_offset_on_one_collection_is_applied(self, build_call_helper):
+        call = build_call_helper("SELECT id FROM items LIMIT 2 OFFSET 1")
+        rows, _desc, _rc, _l = call.postprocess(
+            [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+        )
+        assert rows == [(2,), (3,)]
