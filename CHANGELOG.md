@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-08-15
+### Features
+
+- **translate**: feat(translate): JOIN, GROUP BY and subqueries via a Polars engine by @Neko1313 in [#9](https://github.com/Callix-Tools/milvusql/pull/9)
+- feat!: 1.0.0 — BM25 full-text, ARRAY/JSON, introspection, unbounded reads, correlated EXISTS by @Neko1313 in [#10](https://github.com/Callix-Tools/milvusql/pull/10)
+> **BREAKING CHANGE**: reads that used to raise NotSupportedError at the
+16384-row per-call ceiling (aggregates, client-side ORDER BY, joins,
+UPDATE) now page through and return/write the complete result; Django's
+TextField DDL type changed from VARCHAR(65535) to TEXT (analyzer-enabled
+-- new collections created from existing models differ). This is the
+1.0.0 release commit.
+
+
+
+
+**Full Changelog**: https://github.com/Callix-Tools/milvusql/compare/v0.1.4...v1.0.0
 ## [0.1.4] - 2026-08-15
 ### Documentation
 

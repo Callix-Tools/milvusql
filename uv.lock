@@ -560,7 +560,7 @@ wheels = [
 
 [[package]]
 name = "milvusql"
-version = "0.1.4"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "polars" },
@@ -615,7 +615,7 @@ test = [
 
 [[package]]
 name = "milvusql-django"
-version = "0.1.4"
+version = "1.0.0"
 source = { editable = "packages/milvusql-django" }
 dependencies = [
     { name = "django" },
@@ -630,7 +630,7 @@ requires-dist = [
 
 [[package]]
 name = "milvusql-sqlalchemy"
-version = "0.1.4"
+version = "1.0.0"
 source = { editable = "packages/milvusql-sqlalchemy" }
 dependencies = [
     { name = "milvusql" },
