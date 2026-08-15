@@ -89,8 +89,7 @@ class TestUnsupportedShapes:
         reads Milvus a fixed number of times."""
         with pytest.raises(milvusql.NotSupportedError, match="RECURSIVE"):
             build_call_helper(
-                "WITH RECURSIVE r AS (SELECT id FROM items) "
-                "SELECT r.id FROM r"
+                "WITH RECURSIVE r AS (SELECT id FROM items) SELECT r.id FROM r"
             )
 
     def test_a_vector_search_without_a_limit_is_rejected(
@@ -104,41 +103,64 @@ class TestUnsupportedShapes:
             )
 
 
-class TestRowCeilingIsDetected:
+class TestRowCeilingIsPagedPast:
     """A join or a grouped aggregate computed over *some* of the
-    matching rows is a wrong answer with nothing to show it is wrong --
-    the same reasoning, and the same ceiling, as the single-collection
-    aggregate and ``ORDER BY`` paths."""
+    matching rows would be a wrong answer with nothing to show it is
+    wrong -- so a scan that comes back at Milvus's per-call ceiling
+    now pages through the rest (primary-key cursor, same protocol as
+    pymilvus's own iterator) instead of raising, and the join/grouping
+    runs over the complete rows."""
 
-    def test_a_grouped_read_at_the_ceiling_raises(self, build_call_helper):
-        call = build_call_helper(
-            "SELECT category, COUNT(*) FROM items GROUP BY category"
-        )
-        at_ceiling = [{"category": "book"}] * DEFAULT_QUERY_LIMIT
-        with pytest.raises(milvusql.NotSupportedError, match="row ceiling"):
-            call.postprocess(at_ceiling)
-
-    def test_the_message_names_the_collection(self, build_call_helper):
-        call = build_call_helper(
-            "SELECT category, COUNT(*) FROM items GROUP BY category"
-        )
-        with pytest.raises(milvusql.NotSupportedError, match="'items'"):
-            call.postprocess([{"category": "book"}] * DEFAULT_QUERY_LIMIT)
-
-    def test_a_joined_read_at_the_ceiling_raises(
+    def test_a_grouped_read_at_the_ceiling_pages(
         self, build_call_helper, drive_chain
     ):
-        with pytest.raises(milvusql.NotSupportedError, match="row ceiling"):
-            drive_chain(
-                build_call_helper(
-                    "SELECT i.id, c.title FROM items AS i "
-                    "JOIN cats AS c ON i.cat_id = c.id"
-                ),
-                [
-                    [{"id": 1, "cat_id": 10}] * DEFAULT_QUERY_LIMIT,
-                    [{"id": 10, "title": "books"}],
-                ],
-            )
+        call = build_call_helper(
+            "SELECT category, COUNT(*) AS n FROM items GROUP BY category"
+        )
+        at_ceiling = [
+            {"id": i, "category": "book"} for i in range(DEFAULT_QUERY_LIMIT)
+        ]
+        describe = {"fields": [{"name": "id", "is_primary": True}]}
+        remainder = [{"id": DEFAULT_QUERY_LIMIT, "category": "film"}]
+        calls, (rows, _d, _rc, _l) = drive_chain(
+            call, [at_ceiling, describe, at_ceiling, remainder]
+        )
+        assert [c.method for c in calls] == [
+            "query",
+            "describe_collection",
+            "query",
+            "query",
+        ]
+        assert calls[3].kwargs["filter"] == f"id > {DEFAULT_QUERY_LIMIT - 1}"
+        assert sorted(rows) == [
+            ("book", DEFAULT_QUERY_LIMIT),
+            ("film", 1),
+        ]
+
+    def test_a_joined_read_at_the_ceiling_pages(
+        self, build_call_helper, drive_chain
+    ):
+        """The driving side of the join comes back complete across two
+        pages before the second collection is read at all."""
+        first = [{"id": i, "cat_id": 10} for i in range(DEFAULT_QUERY_LIMIT)]
+        describe = {"fields": [{"name": "id", "is_primary": True}]}
+        remainder = [{"id": DEFAULT_QUERY_LIMIT, "cat_id": 10}]
+        cats = [{"id": 10, "title": "books"}]
+        calls, (_rows, _d, rowcount, _l) = drive_chain(
+            build_call_helper(
+                "SELECT i.id, c.title FROM items AS i "
+                "JOIN cats AS c ON i.cat_id = c.id"
+            ),
+            [first, describe, first, remainder, cats],
+        )
+        assert [c.kwargs.get("collection_name") for c in calls] == [
+            "items",
+            "items",
+            "items",
+            "items",
+            "cats",
+        ]
+        assert rowcount == DEFAULT_QUERY_LIMIT + 1
 
     def test_a_bounded_vector_search_is_not_subject_to_it(
         self, build_call_helper

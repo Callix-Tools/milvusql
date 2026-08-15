@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import sqlglot
 from django.db import models
-from django.db.models import Avg, Count, Exists, OuterRef
+from django.db.models import Avg, Count, Exists, OuterRef, Subquery
 from django.test.utils import isolate_apps
 from pymilvus import MilvusClient
 
@@ -167,19 +167,63 @@ class TestRelations:
         assert rows == [(1,)]
 
 
+class TestExists:
+    def test_exists_with_outerref_plans_a_semi_join(self, related):
+        """``Exists(... OuterRef(...))`` is the correlated-``EXISTS``
+        shape the planner decorrelates into a semi join -- Django's own
+        spelling of it (aliased subquery, ``LIMIT 1``, everything
+        quoted) plans into one read per table and keeps exactly the
+        outer rows with a match."""
+        sql, call = _plan(
+            related.item.objects.filter(
+                Exists(
+                    related.category.objects.filter(pk=OuterRef("category_id"))
+                )
+            ).values("id")
+        )
+        assert "EXISTS" in sql
+        calls, (rows, _d, _rc, _l) = _chain(
+            call,
+            [
+                [{"id": 5}],
+                [{"id": 1, "category_id": 5}, {"id": 2, "category_id": 9}],
+            ],
+        )
+        collections = [c.kwargs["collection_name"] for c in calls]
+        assert collections == ["dj_app_category", "dj_app_item"]
+        assert rows == [(1,)]
+
+    def test_negated_exists_is_the_anti_join(self, related):
+        _sql, call = _plan(
+            related.item.objects.filter(
+                ~Exists(
+                    related.category.objects.filter(pk=OuterRef("category_id"))
+                )
+            ).values("id")
+        )
+        _calls, (rows, _d, _rc, _l) = _chain(
+            call,
+            [
+                [{"id": 5}],
+                [{"id": 1, "category_id": 5}, {"id": 2, "category_id": 9}],
+            ],
+        )
+        assert rows == [(2,)]
+
+
 class TestUnsupported:
-    def test_a_correlated_exists_is_rejected_by_name(self, related):
-        """``Exists(... OuterRef(...))`` depends on the outer row, which
-        needs either a read per row or a semi-join rewrite -- the error
-        says which construct is missing rather than complaining about an
-        unknown table."""
+    def test_a_correlated_scalar_annotation_is_rejected_by_name(self, related):
+        """``annotate(Subquery(... OuterRef(...)))`` puts a correlated
+        subquery in the SELECT list -- a value per outer row, which the
+        semi-join rewrite cannot express. The error still names the
+        construct rather than complaining about an unknown table."""
         with pytest.raises(milvusql.NotSupportedError, match="correlated"):
             _plan(
-                related.item.objects.filter(
-                    Exists(
+                related.item.objects.annotate(
+                    title=Subquery(
                         related.category.objects.filter(
                             pk=OuterRef("category_id")
-                        )
+                        ).values("title")[:1]
                     )
-                ).values("id")
+                ).values("id", "title")
             )

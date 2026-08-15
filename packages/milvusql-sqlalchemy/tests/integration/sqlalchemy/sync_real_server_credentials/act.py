@@ -42,7 +42,11 @@ def test_credentials_host_and_port_reach_a_real_server(remote_engine):
         f"idx_{name}",
         items.c.embedding,
         milvusql_using="HNSW",
-        milvusql_with={"metric_type": "COSINE", "M": 16, "ef_construction": 200},
+        milvusql_with={
+            "metric_type": "COSINE",
+            "M": 16,
+            "ef_construction": 200,
+        },
     ).create(engine)
 
     try:

@@ -78,3 +78,19 @@ def test_hybrid_search_postprocess_reads_the_top_level_hit_list(
     rows, _description, rowcount, _lastrowid = call.postprocess(raw)
     assert rows == [(1, "book")]
     assert rowcount == 1
+
+
+def test_a_bm25_arm_becomes_a_full_text_search_request(build_call_helper):
+    """``BM25_SCORE(sparse_field, :q)`` as an arm is the dense+full-text
+    hybrid Milvus itself advertises: the arm searches the BM25-generated
+    sparse field with the *query text* as data, ``metric_type='BM25'``."""
+    call = build_call_helper(
+        "SELECT id FROM items HYBRID SEARCH "
+        "(embedding <=> :dv WEIGHT 0.7, BM25_SCORE(text_sparse, :q) "
+        "WEIGHT 0.3) RERANK RRF LIMIT 5",
+        {"dv": [0.1] * 8, "q": "hello world"},
+    )
+    assert call.method == "hybrid_search"
+    bm25_request = call.kwargs["reqs"][1]
+    assert bm25_request.anns_field == "text_sparse"
+    assert bm25_request.param == {"metric_type": "BM25"}

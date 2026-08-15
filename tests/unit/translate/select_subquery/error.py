@@ -11,24 +11,24 @@ pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 
 class TestCorrelatedSubqueries:
-    """A correlated subquery's result depends on the outer row being
-    evaluated. Answering it means either one Milvus read per outer row
-    or a rewrite into a semi-join -- neither exists here, and both ORMs
-    emit this shape, so the error names the construct instead of
-    surfacing a confusing "unknown table qualifier"."""
+    """A correlated ``[NOT] EXISTS`` with an *equality* correlation is
+    decorrelated into a semi/anti join now (see
+    ``tests/unit/translate/select_exists``) -- what stays rejected is
+    every correlation that rewrite cannot express: a non-equi
+    correlation, and a correlated subquery anywhere but ``EXISTS``. The
+    error still names the construct instead of surfacing a confusing
+    "unknown table qualifier"."""
 
-    def test_a_correlated_exists_is_rejected(self, build_call_helper):
-        """What SQLAlchemy's ``.has()``/``.any()`` and Django's
-        ``Exists(... OuterRef(...))`` both compile to."""
+    def test_a_non_equi_correlated_exists_is_rejected(self, build_call_helper):
+        """`c.price < i.price` depends on the outer row in a way a
+        semi-join key cannot carry."""
         with pytest.raises(milvusql.NotSupportedError, match="correlated"):
             build_call_helper(
                 "SELECT i.id FROM items AS i WHERE EXISTS "
-                "(SELECT c.id FROM cats AS c WHERE c.id = i.cat_id)"
+                "(SELECT c.id FROM cats AS c WHERE c.price < i.price)"
             )
 
-    def test_a_correlated_scalar_subquery_is_rejected(
-        self, build_call_helper
-    ):
+    def test_a_correlated_scalar_subquery_is_rejected(self, build_call_helper):
         """Django's ``annotate(Subquery(...))`` puts one in the SELECT
         list, where the single-call path used to ask Milvus for an
         output field named after it and hand back a column of
@@ -43,7 +43,7 @@ class TestCorrelatedSubqueries:
         with pytest.raises(milvusql.NotSupportedError, match="'i'"):
             build_call_helper(
                 "SELECT i.id FROM items AS i WHERE EXISTS "
-                "(SELECT c.id FROM cats AS c WHERE c.id = i.cat_id)"
+                "(SELECT c.id FROM cats AS c WHERE c.price < i.price)"
             )
 
     def test_an_uncorrelated_subquery_in_the_select_list_works(

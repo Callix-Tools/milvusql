@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import importlib.metadata as _metadata
+
 from milvusql_sqlalchemy.dialect import MilvusDialect
 from milvusql_sqlalchemy.hybrid import hybrid_search, weighted
 from milvusql_sqlalchemy.types import SPARSEVEC, VECTOR
 
-__version__ = "0.1.0"
+# Single-sourced from the installed package's metadata (pyproject's
+# `version`, which the release pipeline bumps) -- a hardcoded string
+# here silently drifted from the released version.
+try:
+    __version__ = _metadata.version("milvusql-sqlalchemy")
+except _metadata.PackageNotFoundError:  # pragma: no cover -- source tree only
+    __version__ = "0.0.0"
 
 __all__ = [
     "SPARSEVEC",

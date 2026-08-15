@@ -50,8 +50,12 @@ def test_matching_rows_chain_into_an_upsert_of_the_merged_rows(
 
 
 def test_upsert_postprocess_reports_the_upsert_count(build_call_helper):
+    """The upsert's `then` runs before its `postprocess` (the cursor's
+    own order) -- it accumulates the chunk's count and, with every row
+    written, ends the chain; `postprocess` then reports the total."""
     call = build_call_helper(SQL, {"n": 5, "who": "Widget"})
     next_call = call.then([{"id": 1, "name": "Widget", "stock": 1}])
+    assert next_call.then({"upsert_count": 1}) is None
     _rows, _description, rowcount, _lastrowid = next_call.postprocess(
         {"upsert_count": 1}
     )

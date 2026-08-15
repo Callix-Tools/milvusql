@@ -122,7 +122,9 @@ def _start_milvus_container() -> MilvusContainer:
     )
     container.waiting_for(
         CompositeWaitStrategy(
-            LogMessageWaitStrategy("successfully initialized and ready to serve"),
+            LogMessageWaitStrategy(
+                "successfully initialized and ready to serve"
+            ),
             HttpWaitStrategy(container.healthcheck_port, "/healthz"),
         ).with_startup_timeout(300)
     )
@@ -238,7 +240,9 @@ def milvus_remote_target(
 
 
 @pytest.fixture(scope="session")
-def milvus_db_name(milvus_remote_target: tuple[str, int], worker_id: str) -> str:
+def milvus_db_name(
+    milvus_remote_target: tuple[str, int], worker_id: str
+) -> str:
     """A Milvus database dedicated to this pytest-xdist worker
     (``worker_id`` is ``"master"`` outside ``-n``), so parallel workers
     never see each other's collections. Created once per worker via a
@@ -257,7 +261,9 @@ def milvus_db_name(milvus_remote_target: tuple[str, int], worker_id: str) -> str
 
 
 @pytest.fixture(scope="session")
-def milvus_sync_url(milvus_remote_target: tuple[str, int], milvus_db_name: str) -> str:
+def milvus_sync_url(
+    milvus_remote_target: tuple[str, int], milvus_db_name: str
+) -> str:
     """The real ``milvusql://user:pass@host:port/db`` URL string every
     sync integration fixture/test in this package builds its engine
     from."""
@@ -276,7 +282,9 @@ def milvus_async_url(
 
 
 @pytest.fixture
-def _milvus_worker_cleanup(milvus_remote_target: tuple[str, int], milvus_db_name: str):
+def _milvus_worker_cleanup(
+    milvus_remote_target: tuple[str, int], milvus_db_name: str
+):
     """Drops every collection left behind in this worker's database
     after each test. All tests in a worker share one database, so this
     replaces Milvus Lite's old "fresh file per test" isolation -- wired

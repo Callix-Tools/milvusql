@@ -42,11 +42,15 @@ class TestPlan:
         assert call.kwargs["filter"] == "stock > 0"
 
     def test_it_is_a_single_rpc(self, build_call_helper):
-        """One collection, one read -- grouping adds no round trip."""
+        """One collection, one read -- grouping adds no round trip.
+        The read carries a ``then`` now (it pages past the row ceiling
+        when a result demands it), but a result under the ceiling ends
+        the chain right there."""
         call = build_call_helper(
             "SELECT category, COUNT(*) FROM items GROUP BY category"
         )
-        assert call.then is None
+        assert call.method == "query"
+        assert call.then([{"category": "book"}]) is None
 
 
 class TestReduction:
@@ -185,6 +189,4 @@ class TestOrdinalAndQuotedKeys:
         self, build_call_helper
     ):
         with pytest.raises(milvusql.ProgrammingError, match="out of range"):
-            build_call_helper(
-                "SELECT category FROM items GROUP BY 5"
-            )
+            build_call_helper("SELECT category FROM items GROUP BY 5")

@@ -182,7 +182,12 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         "PositiveSmallIntegerField": "INT",
         "PositiveBigIntegerField": "BIGINT",
         "JSONField": "JSON",
-        "TextField": "VARCHAR(65535)",
+        # `TEXT` is the full-text column: an analyzer-enabled max-length
+        # VARCHAR the DBAPI maps so `MATCH ... AGAINST` filters and a
+        # BM25-generated SPARSEVEC can consume it -- a plain
+        # `VARCHAR(65535)` stored the same bytes but could never be
+        # full-text searched.
+        "TextField": "TEXT",
         # Milvus has no native date/time/decimal/UUID/binary column
         # type, so all of these round-trip as text -- exactly what
         # Django's own generic ``adapt_*field_value``/``get_prep_value``

@@ -24,15 +24,27 @@ def test_a_computed_set_value_is_rejected(build_call_helper):
 
 
 class TestUpdateTruncation:
-    def test_an_update_at_the_row_ceiling_raises(self, build_call_helper):
-        """The read that feeds the upsert is subject to the same ceiling
-        as any other read. Writing back only what fit would leave the
-        rest untouched and report a rowcount that looks complete --
-        nothing has been written when this raises."""
+    def test_an_update_at_the_row_ceiling_pages_then_upserts_everything(
+        self, build_call_helper
+    ):
+        """The read that feeds the upsert pages past the per-call
+        ceiling (it used to raise there), so a broad UPDATE reads every
+        matching row before anything is written -- and the write itself
+        goes out in bounded chunks."""
         call = build_call_helper("UPDATE items SET cid = 1 WHERE id > 0")
-        at_ceiling = [{"id": i} for i in range(DEFAULT_QUERY_LIMIT)]
-        with pytest.raises(milvusql.NotSupportedError, match="row ceiling"):
-            call.then(at_ceiling)
+        at_ceiling = [{"id": i, "cid": 9} for i in range(DEFAULT_QUERY_LIMIT)]
+        describe_call = call.then(at_ceiling)
+        assert describe_call.method == "describe_collection"
+        page = describe_call.then(
+            {"fields": [{"name": "id", "is_primary": True}]}
+        )
+        assert page.method == "query"
+        remainder = [{"id": DEFAULT_QUERY_LIMIT, "cid": 9}]
+        upsert = page.then(at_ceiling).then(remainder)
+        assert upsert.method == "upsert"
+        # 16385 merged rows go out in 1000-row chunks.
+        assert len(upsert.kwargs["data"]) == 1000
+        assert upsert.kwargs["data"][0] == {"id": 0, "cid": 1}
 
     def test_a_normal_update_still_upserts(self, build_call_helper):
         call = build_call_helper("UPDATE items SET cid = 1 WHERE id > 0")

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import pytest
 
+import milvusql
+
 pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 
@@ -206,3 +208,42 @@ class TestClausesWithNoMilvusEquivalent:
             [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
         )
         assert rows == [(2,), (3,)]
+
+
+class TestJsonAndArrayFilters:
+    def test_a_json_path_comparison_renders_with_brackets(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM t WHERE meta['brand'] = :b LIMIT 5", {"b": "acme"}
+        )
+        assert call.kwargs["filter"] == 'meta["brand"] == "acme"'
+
+    def test_a_nested_json_path_renders_every_step(self, build_call_helper):
+        call = build_call_helper(
+            "SELECT id FROM t WHERE meta['spec']['w'] > 10 LIMIT 5"
+        )
+        assert call.kwargs["filter"] == 'meta["spec"]["w"] > 10'
+
+    def test_array_contains_and_friends_pass_through_by_name(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "SELECT id FROM t WHERE ARRAY_CONTAINS(tags, :v) LIMIT 5",
+            {"v": "x"},
+        )
+        assert call.kwargs["filter"] == 'array_contains(tags, "x")'
+        call = build_call_helper(
+            "SELECT id FROM t WHERE ARRAY_CONTAINS_ANY(tags, :vals) LIMIT 5",
+            {"vals": ["a", "b"]},
+        )
+        assert call.kwargs["filter"] == 'array_contains_any(tags, ["a", "b"])'
+
+    def test_an_unknown_filter_function_is_rejected_with_the_roster(
+        self, build_call_helper
+    ):
+        with pytest.raises(milvusql.NotSupportedError, match="ARRAY_CONTAINS"):
+            build_call_helper(
+                "SELECT id FROM t WHERE MYSTERY_FN(name) = :v LIMIT 5",
+                {"v": "x"},
+            )

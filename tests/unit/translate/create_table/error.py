@@ -10,8 +10,15 @@ pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 
 def test_unsupported_column_type_raises_not_supported_error(build_call_helper):
-    with pytest.raises(milvusql.NotSupportedError, match="TEXT"):
-        build_call_helper("CREATE TABLE items (payload TEXT)")
+    """``DATETIME`` has no Milvus field type at all -- the honest
+    rejection an unmapped scalar spelling has always gotten (``TEXT``
+    used to be this test's example, but it maps to an analyzer-enabled
+    VARCHAR now)."""
+    with pytest.raises(milvusql.NotSupportedError, match="DATETIME"):
+        build_call_helper(
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, "
+            "payload DATETIME, v VECTOR(4))"
+        )
 
 
 def test_unrecognized_user_defined_type_still_raises_not_supported_error(

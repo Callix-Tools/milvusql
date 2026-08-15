@@ -6,9 +6,29 @@ in one neutral module so neither imports the other's private names
 from __future__ import annotations
 
 import functools
+import logging
 
 import sqlglot
 from sqlglot import exp
+
+
+class _CommandFallbackIsFine(logging.Filter):
+    """sqlglot warns "contains unsupported syntax. Falling back to
+    parsing as a 'Command'" for every statement its grammar has no
+    structured node for -- but ``SHOW TABLES``/``SHOW DATABASES`` reach
+    this DBAPI *as* that Command fallback by design and are fully
+    supported, so the warning is noise exactly where a user typed a
+    working statement. Genuinely unsupported Commands still fail loudly
+    at dispatch ("unsupported statement: Command"), which is the honest
+    signal; the log line never was one."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Falling back to parsing as a 'Command'" not in (
+            record.getMessage()
+        )
+
+
+logging.getLogger("sqlglot").addFilter(_CommandFallbackIsFine())
 
 #: Parsing is pure and param-independent, so the same SQL text always
 #: parses to the same AST -- safe to reuse across calls with different

@@ -120,7 +120,9 @@ def _start_milvus_container() -> MilvusContainer:
     )
     container.waiting_for(
         CompositeWaitStrategy(
-            LogMessageWaitStrategy("successfully initialized and ready to serve"),
+            LogMessageWaitStrategy(
+                "successfully initialized and ready to serve"
+            ),
             HttpWaitStrategy(container.healthcheck_port, "/healthz"),
         ).with_startup_timeout(300)
     )
@@ -236,7 +238,9 @@ def milvus_server_target(
 
 
 @pytest.fixture(scope="session")
-def milvus_db_name(milvus_server_target: tuple[str, int], worker_id: str) -> str:
+def milvus_db_name(
+    milvus_server_target: tuple[str, int], worker_id: str
+) -> str:
     """A Milvus database dedicated to this pytest-xdist worker
     (``worker_id`` is ``"master"`` outside ``-n``), so parallel workers
     never see each other's collections. Created once per worker via a
