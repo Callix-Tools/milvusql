@@ -49,13 +49,17 @@ class TestAmbiguousColumns:
 
 
 class TestUnsupportedShapes:
-    def test_select_star_across_a_join_is_rejected(self, build_call_helper):
-        """``*`` cannot be turned into an ``output_fields`` list per
-        collection without a schema, and asking each side for ``*``
-        would fetch both collections whole, vectors included."""
+    def test_select_star_inside_a_joined_subquery_is_rejected(
+        self, build_call_helper
+    ):
+        """The outer query addresses a subquery's columns as
+        ``alias.column``, and a starred join produces two columns
+        sharing a bare name -- re-qualifying them under one alias would
+        collide."""
         with pytest.raises(milvusql.NotSupportedError, match="SELECT \\*"):
             build_call_helper(
-                "SELECT * FROM items AS i JOIN cats AS c ON i.cat_id = c.id"
+                "SELECT t.id, COUNT(*) FROM (SELECT * FROM items AS i "
+                "JOIN cats AS c ON i.cat_id = c.id) AS t GROUP BY t.id"
             )
 
     def test_join_using_across_three_sources_is_rejected(

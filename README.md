@@ -126,6 +126,11 @@ Window functions are the one worth calling out against a vector database:
 hits is *top-k per group*, which Milvus cannot express and an ANN index
 cannot answer directly.
 
+`SELECT *` works across a join too, but it means what it says: each side is
+asked for `output_fields=["*"]`, so every field of every collection comes
+back — **vectors included**. Naming the columns is the difference between
+moving a few scalars and moving every embedding.
+
 The key pushdown is what keeps this usable: an ANN search returning 50 hits
 joined against a million-row collection reads 50 rows from it, not a million.
 
@@ -168,15 +173,12 @@ Not supported, and rejected explicitly rather than mistranslated:
   `Exists(... OuterRef(...))` and `Subquery(...)` annotations. Their result
   depends on the outer row, which needs either one Milvus read per row or a
   rewrite into a semi-join.
-- **`SELECT *` across a join** — not a client-side limitation: Milvus needs
-  an explicit `output_fields` list *before* any row comes back, and no
-  collection schema is available at translate time to expand `*` into one
-  per collection. Name the columns.
 - **`WITH RECURSIVE`** (re-reads until a fixpoint), **`INTERSECT ALL` /
   `EXCEPT ALL`** (duplicate-count semantics a semi/anti join cannot
   express), **window frame clauses** (`ROWS`/`RANGE BETWEEN`), **`LAG`/
-  `LEAD`/`NTILE`**, and **`JOIN ... USING` past two sources** (no schema to
-  say which of them owns the key — spell it as `ON`).
+  `LEAD`/`NTILE`**, **`JOIN ... USING` past two sources**, and **`SELECT *`
+  inside a subquery that joins** — the last two because two collections can
+  own the same column name, and nothing at translate time says which.
 
 Anything that *doesn't* need this path — a filter `SELECT`, a vector search, a
 hybrid search, a bare `COUNT(*)` — is still exactly one RPC and never builds a

@@ -363,12 +363,6 @@ def _plan_select(
     ]
 
     wants_star = any(isinstance(p, exp.Star) for p in projections)
-    if wants_star and len(sources) > 1:
-        msg = (
-            "SELECT * is not supported across a join: name the columns "
-            "so each collection's fields can be requested explicitly"
-        )
-        raise errors.NotSupportedError(msg)
 
     # Pushed-down conjuncts are deliberately absent: Milvus applies
     # those server-side, so the columns they name need not come back.
@@ -536,9 +530,24 @@ def _plan_sources(
                     f"{inner.__class__.__name__}"
                 )
                 raise errors.NotSupportedError(msg)
-            sources.append(
-                (name, _plan_select(inner, parameters, scans, scope))
-            )
+            planned = _plan_select(inner, parameters, scans, scope)
+            if (
+                isinstance(planned, _Select)
+                and _has_star(planned)
+                and len(planned.sources) > 1
+            ):
+                # The outer query addresses this subquery's columns as
+                # `alias.column`, and a starred join produces two
+                # columns that share a bare name (`items.id` and
+                # `cats.id` both become `id`) -- re-qualifying them
+                # under one alias would collide. Naming the columns in
+                # the subquery resolves it.
+                msg = (
+                    "SELECT * inside a subquery that joins is not "
+                    "supported: name the columns it should expose"
+                )
+                raise errors.NotSupportedError(msg)
+            sources.append((name, planned))
         else:
             msg = (
                 f"unsupported FROM source: {node.__class__.__name__}; FROM "
@@ -1276,7 +1285,11 @@ def _finish(
     # `SELECT *` learns its column names from the data, so the
     # description comes off the evaluated frame rather than the plan.
     starred = isinstance(plan, _Select) and _has_star(plan)
-    names = list(frame.columns) if starred else plan.output_names
+    names = (
+        [column.split(".", 1)[-1] for column in frame.columns]
+        if starred
+        else plan.output_names
+    )
     return rows, description(names), len(rows), None
 
 
@@ -1410,11 +1423,17 @@ def _project(frame: pl.DataFrame, ctx: _Ctx) -> pl.DataFrame:
     c.id``) where a DataFrame cannot."""
     plan = ctx.plan
     if _has_star(plan):
-        # `SELECT *` means the collection's own fields -- keep them all,
-        # minus the source qualifier this engine added.
-        return frame.rename(
-            {name: name.split(".", 1)[-1] for name in frame.columns}
-        )
+        # `SELECT *` means every field of every source, in source order
+        # -- which is what the joined frame already holds. The qualifier
+        # this engine added stays on the DataFrame (two collections can
+        # both have an `id`, and a frame cannot); `_finish` strips it
+        # when naming the columns for `cursor.description`, where SQL
+        # does allow the repeat.
+        if len(plan.sources) == 1:
+            return frame.rename(
+                {name: name.split(".", 1)[-1] for name in frame.columns}
+            )
+        return frame
     return frame.select(
         [
             _expression(projection, ctx).alias(f"_out{index}")

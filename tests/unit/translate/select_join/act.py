@@ -359,3 +359,57 @@ class TestCommonTableExpressions:
             "SELECT h.id FROM hot AS h"
         )
         assert call.kwargs["collection_name"] == "items"
+
+
+class TestSelectStar:
+    """``SELECT *`` needs no collection schema: ``output_fields=["*"]``
+    asks Milvus for every field, and the columns come back with the
+    rows. What it costs is exactly what it asks for -- every field of
+    every source, vectors included."""
+
+    SQL = "SELECT * FROM items AS i JOIN cats AS c ON i.cat_id = c.id"
+
+    def test_each_side_is_asked_for_everything(
+        self, build_call_helper, drive_chain
+    ):
+        calls, _result = drive_chain(
+            build_call_helper(self.SQL),
+            [[{"id": 1, "cat_id": 10}], [{"id": 10, "title": "books"}]],
+        )
+        assert [call.kwargs["output_fields"] for call in calls] == [
+            ["*"],
+            ["*"],
+        ]
+
+    def test_every_column_of_both_sides_comes_back(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, desc, _rc, _l) = drive_chain(
+            build_call_helper(self.SQL),
+            [
+                [{"id": 1, "cat_id": 10, "price": 5.0}],
+                [{"id": 10, "title": "books"}],
+            ],
+        )
+        assert rows == [(1, 10, 5.0, 10, "books")]
+        # Both collections have an `id`; SQL repeats the label, and a
+        # DBAPI description is a list, not a mapping, so it can.
+        assert [column[0] for column in desc] == [
+            "id",
+            "cat_id",
+            "price",
+            "id",
+            "title",
+        ]
+
+    def test_a_single_source_star_is_unqualified(
+        self, build_call_helper, drive_chain
+    ):
+        _calls, (rows, desc, _rc, _l) = drive_chain(
+            build_call_helper(
+                "SELECT * FROM items WHERE cat_id IN (SELECT id FROM cats)"
+            ),
+            [[{"id": 10}], [{"id": 1, "cat_id": 10}]],
+        )
+        assert [column[0] for column in desc] == ["id", "cat_id"]
+        assert rows == [(1, 10)]
