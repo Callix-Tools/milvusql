@@ -1,0 +1,29 @@
+[project]
+name = "pydantic-ai-agent"
+version = "0.1.0"
+description = "A pydantic-ai catalog agent on milvusql-sqlalchemy"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "milvusql-sqlalchemy",
+    "pydantic-ai",
+    "sqlalchemy>=2.0",
+    # Real text embeddings (EMBEDDING_BACKEND=minilm, the default) --
+    # omit this and run with EMBEDDING_BACKEND=deterministic to try
+    # the agent without installing torch or downloading model
+    # weights.
+    "sentence-transformers",
+]
+
+[tool.uv.sources]
+# Deliberately NOT a member of the root `uv` workspace (unlike
+# ../../../../examples/*): this example's ML/agent dependencies
+# (torch, pydantic-ai, ...) are heavy enough that folding it into the
+# monorepo's shared `uv.lock`/`task install` would slow every
+# contributor's sync and every `ci-*.yml` job down for something none
+# of them need. These two path sources point at the same local
+# `milvusql-sqlalchemy`/`milvusql` checkouts a workspace member would
+# resolve to, just pinned explicitly instead of via `workspace = true`
+# (which only resolves meaningfully for an actual workspace member).
+milvusql-sqlalchemy = { path = "../../", editable = true }
+milvusql = { path = "../../../../", editable = true }

@@ -25,6 +25,9 @@ with (
     ).all()
 ```
 
+**Examples:** a FastAPI image-search service and a pydantic-ai agent live in
+[`examples/`](examples).
+
 **Full docs: https://Callix-Tools.github.io/milvusql-docs/docs/sqlalchemy/overview**
 
 Status: early development, not yet published.

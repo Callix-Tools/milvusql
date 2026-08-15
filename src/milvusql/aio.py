@@ -20,7 +20,11 @@ from pymilvus import AsyncMilvusClient
 from pymilvus.exceptions import MilvusException
 from sqlglot.errors import SqlglotError
 
-from milvusql._shared import CONSISTENCY_AWARE_METHODS, parse_cached
+from milvusql._shared import (
+    CONSISTENCY_AWARE_METHODS,
+    note_load_state,
+    parse_cached,
+)
 from milvusql.dbapi import errors
 from milvusql.translate.ast_to_pymilvus import (
     Call,
@@ -63,15 +67,26 @@ class AsyncCursor:
 
     async def _invoke(self, call: Call) -> t.Any:  # noqa: ANN401 -- a raw pymilvus response is genuinely any shape
         default_level = self.connection.consistency_level
-        if (
-            default_level is not None
-            and call.method in CONSISTENCY_AWARE_METHODS
-            and "consistency_level" not in call.kwargs
-        ):
-            call.kwargs["consistency_level"] = default_level
-        return await getattr(self.connection._client, call.method)(
+        if call.method in CONSISTENCY_AWARE_METHODS:
+            if (
+                default_level is not None
+                and "consistency_level" not in call.kwargs
+            ):
+                call.kwargs["consistency_level"] = default_level
+            # See `dbapi.cursor.Cursor._invoke` (sync): D2 revised,
+            # auto-LOAD on first use per connection.
+            name = call.kwargs.get("collection_name")
+            loaded = self.connection._loaded_collections
+            if name is not None and name not in loaded:
+                await self.connection._client.load_collection(name)
+                loaded.add(name)
+        raw = await getattr(self.connection._client, call.method)(
             **call.kwargs
         )
+        note_load_state(
+            self.connection._loaded_collections, call.method, call.kwargs
+        )
+        return raw
 
     async def _run(self, call: Call) -> None:
         """Async mirror of ``Cursor._run`` (sync). Shared by
@@ -197,6 +212,9 @@ class AsyncConnection:
         self._client = AsyncMilvusClient(**client_kwargs)
         self.consistency_level = consistency_level
         self.closed = False
+        #: See `dbapi.connection.Connection._loaded_collections` (sync
+        #: mirror): connection-scoped auto-LOAD cache, D2 revised.
+        self._loaded_collections: set[str] = set()
 
     def cursor(self) -> AsyncCursor:
         if self.closed:

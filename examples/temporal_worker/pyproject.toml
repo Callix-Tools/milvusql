@@ -1,0 +1,13 @@
+[project]
+name = "temporal-worker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "milvusql",
+    "temporalio>=1.9,<2",
+]
+
+[tool.uv.sources]
+milvusql = { workspace = true }

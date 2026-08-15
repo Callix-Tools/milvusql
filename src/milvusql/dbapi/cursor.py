@@ -12,7 +12,11 @@ import grpc
 from pymilvus.exceptions import MilvusException
 from sqlglot.errors import SqlglotError
 
-from milvusql._shared import CONSISTENCY_AWARE_METHODS, parse_cached
+from milvusql._shared import (
+    CONSISTENCY_AWARE_METHODS,
+    note_load_state,
+    parse_cached,
+)
 from milvusql.dbapi import errors
 from milvusql.translate.ast_to_pymilvus import (
     Call,
@@ -51,13 +55,28 @@ class Cursor:
 
     def _invoke(self, call: Call) -> t.Any:  # noqa: ANN401 -- a raw pymilvus response is genuinely any shape
         default_level = self.connection.consistency_level
-        if (
-            default_level is not None
-            and call.method in CONSISTENCY_AWARE_METHODS
-            and "consistency_level" not in call.kwargs
-        ):
-            call.kwargs["consistency_level"] = default_level
-        return getattr(self.connection._client, call.method)(**call.kwargs)
+        if call.method in CONSISTENCY_AWARE_METHODS:
+            if (
+                default_level is not None
+                and "consistency_level" not in call.kwargs
+            ):
+                call.kwargs["consistency_level"] = default_level
+            # D2 revised: auto-LOAD -- search/query/hybrid_search need
+            # a loaded collection server-side; load it transparently on
+            # first use per connection instead of making every caller
+            # issue LOAD TABLE by hand first. `LOAD TABLE` itself
+            # remains available for explicit control (replica count,
+            # warming a collection up before traffic arrives).
+            name = call.kwargs.get("collection_name")
+            loaded = self.connection._loaded_collections
+            if name is not None and name not in loaded:
+                self.connection._client.load_collection(name)
+                loaded.add(name)
+        raw = getattr(self.connection._client, call.method)(**call.kwargs)
+        note_load_state(
+            self.connection._loaded_collections, call.method, call.kwargs
+        )
+        return raw
 
     def _run(self, call: Call) -> None:
         """Run ``call`` (looping through ``Call.then`` for a statement
