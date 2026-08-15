@@ -119,7 +119,9 @@ def _start_milvus_container() -> MilvusContainer:
     )
     container.waiting_for(
         CompositeWaitStrategy(
-            LogMessageWaitStrategy("successfully initialized and ready to serve"),
+            LogMessageWaitStrategy(
+                "successfully initialized and ready to serve"
+            ),
             HttpWaitStrategy(container.healthcheck_port, "/healthz"),
         ).with_startup_timeout(300)
     )
@@ -259,7 +261,9 @@ def _milvus_worker_cleanup(milvus_db_name: str, milvus_uri: str):
     wired as a dependency of ``conn``/``aconn``, never as a bare
     ``autouse=True``, so it never fires for ``unit`` tests."""
     yield
-    client = MilvusClient(uri=milvus_uri, token=_ROOT_TOKEN, db_name=milvus_db_name)
+    client = MilvusClient(
+        uri=milvus_uri, token=_ROOT_TOKEN, db_name=milvus_db_name
+    )
     try:
         for collection in client.list_collections():
             client.drop_collection(collection)

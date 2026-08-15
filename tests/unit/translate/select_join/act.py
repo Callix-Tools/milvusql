@@ -586,3 +586,25 @@ class TestStarSpellings:
         )
         assert [column[0] for column in desc] == ["id", "cid"]
         assert len(rows[0]) == 2
+
+
+def test_a_residual_like_bind_resolves_client_side(
+    build_call_helper, drive_chain
+):
+    """A ``LIKE :pat`` on the null-supplying side of a LEFT JOIN stays
+    residual (client-side); the pattern bind used to raise a misleading
+    'missing bind parameter' because evaluation resolved against an
+    empty dict instead of the statement's parameters."""
+    _calls, (rows, _d, _rc, _l) = drive_chain(
+        build_call_helper(
+            "SELECT i.id FROM items AS i "
+            "LEFT JOIN cats AS c ON i.cat_id = c.id "
+            "WHERE c.title LIKE :pat",
+            {"pat": "%x%"},
+        ),
+        [
+            [{"id": 1, "cat_id": 10}, {"id": 2, "cat_id": 11}],
+            [{"id": 10, "title": "axb"}, {"id": 11, "title": "b"}],
+        ],
+    )
+    assert rows == [(1,)]

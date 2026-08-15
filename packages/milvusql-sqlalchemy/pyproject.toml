@@ -11,12 +11,13 @@ authors = [
 requires-python = ">=3.12"
 keywords = ["milvus", "sqlalchemy", "dialect", "vector-search"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     # NOTE: no "Framework :: SQLAlchemy" -- not a registered PyPI Trove
     # classifier (confirmed directly: PyPI rejected the upload with a 400
     # for it, see https://pypi.org/classifiers/ for the real list).

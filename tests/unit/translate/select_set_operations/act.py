@@ -41,7 +41,9 @@ class TestPlan:
         self, build_call_helper, drive_chain
     ):
         calls, _result = drive_chain(
-            build_call_helper("SELECT id FROM items UNION SELECT id FROM cats"),
+            build_call_helper(
+                "SELECT id FROM items UNION SELECT id FROM cats"
+            ),
             [LEFT, RIGHT],
         )
         assert [call.kwargs["collection_name"] for call in calls] == [
@@ -53,7 +55,9 @@ class TestPlan:
 class TestCombination:
     def test_union_removes_duplicates(self, build_call_helper, drive_chain):
         _calls, (rows, desc, rowcount, _l) = drive_chain(
-            build_call_helper("SELECT id FROM items UNION SELECT id FROM cats"),
+            build_call_helper(
+                "SELECT id FROM items UNION SELECT id FROM cats"
+            ),
             [LEFT, RIGHT],
         )
         assert rows == [(1,), (2,), (3,)]
@@ -117,7 +121,9 @@ class TestCombination:
         """An empty read has no values to infer a dtype from; the
         concatenation has to cope with that rather than raise."""
         _calls, (rows, _d, _rc, _l) = drive_chain(
-            build_call_helper("SELECT id FROM items UNION SELECT id FROM cats"),
+            build_call_helper(
+                "SELECT id FROM items UNION SELECT id FROM cats"
+            ),
             [[], RIGHT],
         )
         assert rows == [(2,), (3,)]

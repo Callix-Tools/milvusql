@@ -45,7 +45,6 @@ import polars as pl
 from sqlglot import exp
 from sqlglot_milvus.expressions import (
     CONSISTENCY_ARG,
-    METRIC_TYPES,
     SEARCH_PARAMS_ARG,
 )
 
@@ -54,11 +53,14 @@ from milvusql.translate._common import (
     COMPARISON_OPS,
     DEFAULT_QUERY_LIMIT,
     Call,
+    Rows,
     RowsAndDescription,
+    ann_metric,
     description,
-    render_filter,
     render_filter_value,
+    render_predicate,
     resolve_value,
+    unbounded_query_call,
 )
 
 #: How many distinct join-key values are worth pushing into a later
@@ -178,6 +180,14 @@ class _Select:
     #: Frames that only the predicates reference, keyed by the id of the
     #: ``exp.Subquery``/``exp.Select`` node that produced them.
     subqueries: dict[int, _Select] = field(default_factory=dict)
+    #: Correlated ``[NOT] EXISTS`` conjuncts, decorrelated into
+    #: semi/anti joins -- see :class:`_SemiJoin`.
+    semi_joins: list[_SemiJoin] = field(default_factory=list)
+    #: The statement's bind parameters, kept so client-side evaluation
+    #: (residual predicates, HAVING) can resolve a ``:name`` the same
+    #: way pushed-down filters do -- refusing them was an artifact of
+    #: not threading this through, not a real limitation.
+    parameters: dict[str, t.Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -194,6 +204,29 @@ class _SetOp:
     order: list[tuple[exp.Expression, bool]]
     limit: int | None
     offset: int | None
+
+
+@dataclass(frozen=True)
+class _SemiJoin:
+    """A correlated ``[NOT] EXISTS`` rewritten into a semi (or anti)
+    join -- the decorrelation SQL engines perform for the same shape.
+
+    ``EXISTS (SELECT 1 FROM child WHERE child.parent_id = parent.id AND
+    ...)`` keeps a ``parent`` row exactly when a ``child`` row shares
+    the key, which is a semi join of the outer frame against the
+    subquery's (decorrelated) result on that key; ``NOT EXISTS`` is the
+    anti join. This is the shape SQLAlchemy's ``.any()``/``.has()`` and
+    Django's ``Exists(... OuterRef(...))`` compile to.
+
+    ``plan`` projects exactly the correlated inner columns, in
+    ``left_keys``'s order, so the joined frames line up positionally.
+    ``outer_columns`` keeps the outer key column nodes so the planner
+    fetches them from Milvus like any other referenced column."""
+
+    plan: _Select
+    left_keys: list[str]
+    outer_columns: list[exp.Column]
+    anti: bool
 
 
 @dataclass(frozen=True)
@@ -229,6 +262,12 @@ def needs_relational_engine(ast: exp.Select) -> bool:
     if (
         ast.args.get("joins")
         or ast.args.get("group") is not None
+        # HAVING without GROUP BY is SQL's "treat the whole result as
+        # one group" -- only this engine applies `having` at all, so
+        # the single-call aggregate path would silently drop it
+        # (confirmed by direct execution: `SELECT COUNT(*) ... HAVING
+        # COUNT(*) > 100` returned the count row regardless).
+        or ast.args.get("having") is not None
         or ast.args.get("with_") is not None
         # `DISTINCT` and `OFFSET` have no Milvus-side equivalent either:
         # `query()` takes a filter and a row cap, nothing else. The
@@ -365,7 +404,7 @@ def _plan_select(
         name for name, source in sources if isinstance(source, _Scan)
     }
 
-    pushable, residual, subqueries = _plan_predicates(
+    pushable, residual, subqueries, semi_joins = _plan_predicates(
         ast,
         known,
         scan_frames - _null_supplying(ast, join_nodes),
@@ -401,6 +440,10 @@ def _plan_select(
     # Pushed-down conjuncts are deliberately absent: Milvus applies
     # those server-side, so the columns they name need not come back.
     consumers: list[exp.Expression] = [*projections, *residual, *group]
+    # A decorrelated EXISTS consumes its outer key columns at join
+    # time, so they must be fetched like any other referenced column.
+    for semi_join in semi_joins:
+        consumers.extend(semi_join.outer_columns)
     # An ORDER BY key that names an output label (`ORDER BY r`, for
     # `ROW_NUMBER() ... AS r`) is not a source column -- the projection
     # it refers to is already in this list, and asking Milvus for a
@@ -465,6 +508,8 @@ def _plan_select(
             f"{search_frame}.{_RANK_COLUMN}" if search is not None else None
         ),
         subqueries=subqueries,
+        semi_joins=semi_joins,
+        parameters=parameters,
     )
 
 
@@ -632,6 +677,7 @@ def _plan_predicates(  # noqa: PLR0913, PLR0917 -- one argument per planning inp
     dict[str, list[exp.Expression]],
     list[exp.Expression],
     dict[int, _Select],
+    list[_SemiJoin],
 ]:
     """Split ``WHERE`` into what Milvus can filter and what Polars has
     to evaluate.
@@ -640,11 +686,17 @@ def _plan_predicates(  # noqa: PLR0913, PLR0917 -- one argument per planning inp
     becomes part of that collection's own ``filter``; one that spans two
     collections, contains a subquery, or names a source an outer join
     can null-extend (see :func:`_null_supplying`) stays behind as
-    residual."""
+    residual. A correlated ``[NOT] EXISTS`` conjunct becomes a
+    :class:`_SemiJoin` instead of either."""
     subqueries: dict[int, _Select] = {}
     residual: list[exp.Expression] = []
+    semi_joins: list[_SemiJoin] = []
     pushable: dict[str, list[exp.Expression]] = {name: [] for name in known}
     for conjunct in _split_conjuncts(ast.args.get("where")):
+        semi_join = _plan_exists(conjunct, known, parameters, scans, scope)
+        if semi_join is not None:
+            semi_joins.append(semi_join)
+            continue
         nested = _outermost_selects(conjunct)
         if nested:
             for inner in nested:
@@ -658,7 +710,148 @@ def _plan_predicates(  # noqa: PLR0913, PLR0917 -- one argument per planning inp
             pushable[next(iter(frames))].append(conjunct)
         else:
             residual.append(conjunct)
-    return pushable, residual, subqueries
+    return pushable, residual, subqueries, semi_joins
+
+
+def _plan_exists(  # noqa: PLR0911, PLR0912 -- one return per non-rewritable shape, clearer flat than nested
+    conjunct: exp.Expression,
+    known: set[str],
+    parameters: dict[str, t.Any],
+    scans: list[_Scan],
+    scope: _Scope,
+) -> _SemiJoin | None:
+    """A ``[NOT] EXISTS (SELECT ...)`` conjunct whose subquery
+    correlates with this query through equality -- SQLAlchemy's
+    ``.any()``/``.has()`` and Django's ``Exists(... OuterRef(...))``
+    both compile to exactly this -- decorrelated into a
+    :class:`_SemiJoin`. Returns ``None`` for anything else (an
+    uncorrelated ``EXISTS`` keeps its existing whole-frame evaluation;
+    a correlation this cannot rewrite falls through to the planner's
+    correlated-subquery rejection, which names the construct)."""
+    anti = False
+    node = conjunct
+    # SQLAlchemy renders the negation as `NOT (EXISTS (...))` -- parens
+    # at either level are structural noise here.
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Not):
+        anti = True
+        node = node.this
+        while isinstance(node, exp.Paren):
+            node = node.this
+    if not isinstance(node, exp.Exists):
+        return None
+    inner = node.this
+    if isinstance(inner, exp.Subquery):
+        inner = inner.this
+    if not isinstance(inner, exp.Select):
+        return None
+    inner_from = inner.args.get("from_")
+    if inner_from is None:
+        return None
+    if inner.args.get("offset") is not None:
+        # `EXISTS (... OFFSET k)` asks "are there more than k matching
+        # rows *for this outer row*" -- a per-row count no join
+        # expresses. Falls through to the correlated-subquery error.
+        return None
+    inner_names: set[str] = set()
+    try:
+        inner_names.add(_source_name(inner_from.this))
+        for join in inner.args.get("joins") or []:
+            inner_names.add(_source_name(join.this))
+    except errors.NotSupportedError:
+        return None
+
+    correlations: list[tuple[exp.Column, exp.Column]] = []
+    remaining: list[exp.Expression] = []
+    for inner_conjunct in _split_conjuncts(inner.args.get("where")):
+        if not _references_outer(inner_conjunct, known, inner_names):
+            remaining.append(inner_conjunct)
+            continue
+        pair = _correlated_pair(inner_conjunct, known, inner_names)
+        if pair is None:
+            return None
+        correlations.append(pair)
+    if not correlations:
+        return None
+
+    decorrelated = inner.copy()
+    decorrelated.set(
+        "where",
+        exp.Where(this=_conjunct_expression([c.copy() for c in remaining]))
+        if remaining
+        else None,
+    )
+    # Django spells its subquery `SELECT 1 ... LIMIT 1`: per outer row
+    # that LIMIT is semantically inert for EXISTS, but applied to the
+    # *decorrelated* set it would drop the very key rows the join needs.
+    # ORDER BY inside an EXISTS never means anything at all.
+    decorrelated.set("limit", None)
+    decorrelated.set("order", None)
+    decorrelated.set("expressions", [pair[1].copy() for pair in correlations])
+    planned = _plan_select(decorrelated, parameters, scans, scope)
+
+    outer_columns = [pair[0] for pair in correlations]
+    left_keys = []
+    for column in outer_columns:
+        frame, name = _qualified(column, known)
+        left_keys.append(f"{frame}.{name}")
+    return _SemiJoin(
+        plan=planned,
+        left_keys=left_keys,
+        outer_columns=outer_columns,
+        anti=anti,
+    )
+
+
+def _references_outer(
+    node: exp.Expression, known: set[str], inner_names: set[str]
+) -> bool:
+    """Does this (inner-query) conjunct name a column of the enclosing
+    query? A qualifier that the subquery itself declares shadows the
+    outer name, same as SQL's own scoping."""
+    return any(
+        column.table
+        and column.table in known
+        and column.table not in inner_names
+        for column in _columns_of(node)
+    )
+
+
+def _correlated_pair(
+    conjunct: exp.Expression, known: set[str], inner_names: set[str]
+) -> tuple[exp.Column, exp.Column] | None:
+    """``outer.key = inner.key`` -> ``(outer column, inner column)``,
+    or ``None`` when the correlation is anything but a plain equality
+    between one outer and one inner column."""
+    if not isinstance(conjunct, exp.EQ):
+        return None
+    left, right = conjunct.this, conjunct.expression
+    # Django parenthesizes the OuterRef side -- `U0."id" =
+    # ("item"."category_id")` -- so a bare Paren unwraps before the
+    # column check.
+    while isinstance(left, exp.Paren):
+        left = left.this
+    while isinstance(right, exp.Paren):
+        right = right.this
+    if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+        return None
+
+    def side(column: exp.Column) -> str:
+        if column.table and column.table in inner_names:
+            return "inner"
+        if column.table and column.table in known:
+            return "outer"
+        # A bare column belongs to the subquery, same scoping rule the
+        # rest of the planner applies when one source is in scope.
+        return "inner" if not column.table else "?"
+
+    sides = (side(left), side(right))
+    if sides == ("outer", "inner"):
+        return left, right
+    if sides == ("inner", "outer"):
+        return right, left
+    return None
 
 
 def _plan_value_subqueries(
@@ -705,7 +898,7 @@ def _plan_order(
     if order_node is None:
         return [], None, None
     keys = order_node.expressions
-    metric_type = METRIC_TYPES.get(type(keys[0].this))
+    metric_type = ann_metric(keys[0].this)
     if metric_type is None:
         return (
             [(key.this, bool(key.args.get("desc"))) for key in keys],
@@ -956,7 +1149,10 @@ def _conjunct_filter(
     combined = stripped[0]
     for conjunct in stripped[1:]:
         combined = exp.and_(combined, conjunct)
-    return render_filter(combined, parameters)
+    # Predicate position: a single pushed-down conjunct can be a bare
+    # boolean column (Django's `.filter(active=True)`), which Milvus
+    # only accepts as an explicit comparison.
+    return render_predicate(combined, parameters)
 
 
 def _nested_plans(plan: _Select | _SetOp) -> list[_Select | _SetOp]:
@@ -971,6 +1167,7 @@ def _nested_plans(plan: _Select | _SetOp) -> list[_Select | _SetOp]:
         if not isinstance(source, _Scan)
     ]
     nested.extend(plan.subqueries.values())
+    nested.extend(semi_join.plan for semi_join in plan.semi_joins)
     return nested
 
 
@@ -1156,12 +1353,35 @@ def _scan_call(
     ``frames`` is the accumulator the chain writes into: each link
     records its own rows and then either builds the next link -- late
     enough for :func:`_apply_pushdown` to use the rows just fetched --
-    or, for the last link, evaluates the plan in ``postprocess``."""
+    or, for the last link, evaluates the plan in ``postprocess``.
+
+    A ``search`` scan is bounded by its own top-k, so it stays one RPC.
+    A ``query`` scan has no bound of its own and pages past Milvus's
+    per-call row ceiling (see :func:`unbounded_query_call`) -- it used
+    to raise there instead."""
     scan = scans[index]
     _apply_pushdown(scan, frames)
     method, kwargs = _call_args(scan)
+    last = index == len(scans) - 1
 
-    if index == len(scans) - 1:
+    if method == "query":
+
+        def query_complete(rows: Rows) -> Call | None:
+            frames[scan.key] = _frame(scan, rows)
+            return None if last else _scan_call(index + 1, scans, frames, plan)
+
+        def query_finish(rows: Rows) -> RowsAndDescription:
+            # `complete` normally recorded the frame already (`then`
+            # runs before `postprocess`); the guard keeps a directly
+            # driven `postprocess` -- as unit tests do -- working too.
+            if scan.key not in frames:
+                frames[scan.key] = _frame(scan, rows)
+            return _finish(plan, frames)
+
+        kwargs.pop("limit", None)
+        return unbounded_query_call(kwargs, query_complete, query_finish)
+
+    if last:
 
         def postprocess(raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
             frames[scan.key] = _frame(scan, raw)
@@ -1262,17 +1482,11 @@ def _frame(scan: _Scan, raw: t.Any) -> pl.DataFrame:  # noqa: ANN401
             for rank, hit in enumerate(hits)
         ]
     else:
+        # A query scan's rows arrive complete: `unbounded_query_call`
+        # pages past Milvus's per-call ceiling (or raises where the
+        # server cannot page honestly), so there is no truncation left
+        # to guard against here.
         rows = list(raw or [])
-        if len(rows) >= scan.limit:
-            msg = (
-                f"cannot be answered: reading {scan.collection!r} hit "
-                f"Milvus's per-call row ceiling ({scan.limit}), so the "
-                "join/grouping would run over a truncated subset and "
-                "return a wrong answer with nothing to show it is wrong. "
-                "Narrow the WHERE filter, or add a vector search so "
-                "Milvus returns a bounded top-k."
-            )
-            raise errors.NotSupportedError(msg)
 
     columns = list(scan.fields)
     if scan.search is not None:
@@ -1407,9 +1621,24 @@ def _evaluate(
         frame = frame.filter(_expression(plan.where, ctx))
         ctx = ctx.against(frame)
 
+    for semi_join in plan.semi_joins:
+        frame = _apply_semi_join(frame, semi_join, frames)
+        ctx = ctx.against(frame)
+
     if plan.group or _has_aggregate(plan):
         frame = _aggregate(frame, ctx)
     else:
+        if plan.having is not None:
+            # Reaching here means no GROUP BY and no aggregate anywhere
+            # (a HAVING containing one routes through `_aggregate`
+            # above) -- SQL has no meaning for that HAVING, and this
+            # engine is the only place `having` is ever applied, so
+            # dropping it silently would be a wrong answer.
+            msg = (
+                "HAVING without GROUP BY needs an aggregate to filter "
+                "on; use WHERE for row-level conditions"
+            )
+            raise errors.ProgrammingError(msg)
         if plan.order or plan.search_rank:
             frame = _sort(frame, ctx.against(frame))
             ctx = ctx.against(frame)
@@ -1422,6 +1651,30 @@ def _evaluate(
     if plan.limit is not None:
         frame = frame.head(plan.limit)
     return frame
+
+
+def _apply_semi_join(
+    frame: pl.DataFrame,
+    semi_join: _SemiJoin,
+    frames: dict[str, pl.DataFrame],
+) -> pl.DataFrame:
+    """One decorrelated ``[NOT] EXISTS``: evaluate the subquery once,
+    then keep (semi) or drop (anti) the outer rows whose keys appear in
+    it. ``nulls_equal=False`` on both is SQL's own semantics: a null
+    key equals nothing, so ``EXISTS`` never keeps it and ``NOT
+    EXISTS`` always does."""
+    inner = _evaluate(semi_join.plan, frames)
+    right_keys = list(inner.columns)
+    aligned_left, aligned_inner = _align(
+        frame, inner, semi_join.left_keys, right_keys
+    )
+    return aligned_left.join(
+        aligned_inner,
+        left_on=semi_join.left_keys,
+        right_on=right_keys,
+        how="anti" if semi_join.anti else "semi",
+        nulls_equal=False,
+    )
 
 
 def _evaluate_set_operation(
@@ -1638,12 +1891,36 @@ def _join(
     return _outer_join_with_condition(left, right, join, plan, frames)
 
 
+#: The most rows either side of a *quadratic* (no-equi-key) join may
+#: carry. This is the bound Milvus's own per-call row ceiling used to
+#: impose on every scan before reads learned to page past it -- the
+#: "small inputs only; the row ceiling keeps that honest" guarantee the
+#: cross-join fallback was written against. Pagination removed that
+#: implicit guard, so the quadratic path re-imposes it explicitly:
+#: 16384 x 16384 pairings is the accepted worst case, anything larger
+#: raises rather than materializing an unbounded row product.
+_QUADRATIC_JOIN_MAX_SIDE = DEFAULT_QUERY_LIMIT
+
+
 def _pair(
     left: pl.DataFrame, right: pl.DataFrame, join: _Join, how: str
 ) -> pl.DataFrame:
     if how == "cross" or not join.left_keys:
         # No equality to hash on: the pairing is every combination, and
         # whatever condition came with it narrows them afterwards.
+        if (
+            left.height > _QUADRATIC_JOIN_MAX_SIDE
+            or right.height > _QUADRATIC_JOIN_MAX_SIDE
+        ):
+            msg = (
+                "cannot be answered: a JOIN with no equality condition "
+                "pairs every row combination, and one side has "
+                f"{max(left.height, right.height)} rows (over the "
+                f"{_QUADRATIC_JOIN_MAX_SIDE}-row bound for the "
+                "quadratic fallback). Add an equi-join key, or narrow "
+                "the sides with WHERE."
+            )
+            raise errors.NotSupportedError(msg)
         return left.join(right, how="cross")
     left, right = _align(left, right, join.left_keys, join.right_keys)
     return left.join(
@@ -1969,12 +2246,12 @@ def _expression(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clea
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null)):
         return pl.lit(resolve_value(node, {}))
     if isinstance(node, (exp.Placeholder, exp.Parameter)):
-        msg = (
-            f"bind parameter {node.this!r} is used in a position this "
-            "engine evaluates client-side; only WHERE comparisons "
-            "pushed to Milvus can bind there"
-        )
-        raise errors.NotSupportedError(msg)
+        # Client-side positions bind too: the plan carries the
+        # statement's parameters, so `HAVING COUNT(*) > :n` and a
+        # residual `LIKE :pat` resolve exactly like a pushed-down
+        # comparison (a genuinely missing name still raises
+        # ProgrammingError inside resolve_value).
+        return pl.lit(resolve_value(node, ctx.plan.parameters))
     if isinstance(node, exp.Is):
         if isinstance(node.expression, exp.Null):
             return _expression(node.this, ctx).is_null()
@@ -1982,7 +2259,9 @@ def _expression(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clea
         raise errors.NotSupportedError(msg)
     if isinstance(node, exp.Like):
         matched = _expression(node.this, ctx).str.contains(
-            _like_to_regex(str(resolve_value(node.expression, {})))
+            _like_to_regex(
+                str(resolve_value(node.expression, ctx.plan.parameters))
+            )
         )
         return ~matched if node.args.get("negate") else matched
     if isinstance(node, exp.Between):
@@ -2121,7 +2400,7 @@ def _in_expression(node: exp.In, ctx: _Ctx) -> pl.Expr:
         # semantics and as the Milvus-side renderer's `false`.
         return pl.lit(value=False)
     return _expression(node.this, ctx).is_in(
-        [resolve_value(e, {}) for e in node.expressions]
+        [resolve_value(e, ctx.plan.parameters) for e in node.expressions]
     )
 
 

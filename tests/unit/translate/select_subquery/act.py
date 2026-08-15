@@ -36,7 +36,7 @@ class TestInPredicate:
         carries the filter."""
         call = build_call_helper(self.SQL)
         assert call.kwargs["collection_name"] == "cats"
-        assert call.kwargs["filter"] == "active"
+        assert call.kwargs["filter"] == "active == true"
         assert call.kwargs["output_fields"] == ["id"]
 
     def test_the_outer_rows_are_filtered_by_the_inner_ones(

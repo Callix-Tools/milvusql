@@ -15,7 +15,7 @@
 
 ---
 
-Core/ORM `select()`, DDL (`CREATE TABLE`/`CREATE INDEX`), reflection, and Alembic migrations all go through the standard SQLAlchemy surface — vector search is just `.order_by(column.cosine_distance(q))`, spelled exactly like [pgvector](https://github.com/pgvector/pgvector-python)'s own comparator.
+Core/ORM `select()`, DDL (`CREATE TABLE`/`CREATE INDEX`), reflection, and Alembic migrations all go through the standard SQLAlchemy surface — vector search is just `.order_by(column.cosine_distance(q))`, spelled exactly like [pgvector](https://github.com/pgvector/pgvector-python)'s own comparator. Joins, grouped aggregates, subqueries and relationship `.any()`/`.has()` (correlated `EXISTS`, decorrelated into a semi/anti join) run through the DBAPI's relational planner; a `sa.Text` column is Milvus's full-text input (analyzer-enabled), ready for a BM25-generated sparse field.
 
 ## Installation
 

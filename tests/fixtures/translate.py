@@ -37,17 +37,27 @@ def build_call_helper():
 
 def _drive(call, raws: list):
     """Run a ``Call`` chain exactly the way ``Cursor._run`` does --
-    ``then`` builds the next call from the previous raw result, and the
-    last call's ``postprocess`` turns its own raw result into rows.
+    ``then`` (when set) is consulted after every raw result and either
+    builds the next call or returns ``None`` to stop, and the last
+    call's ``postprocess`` turns its own raw result into rows. The
+    paginated read chains rely on that exact order (``then`` records
+    rows before ``postprocess`` finishes), so this mirrors the loop
+    rather than approximating it.
 
     Returns ``(calls, postprocess_result)`` so a test can assert both
     what was sent (one entry per RPC, including any filter a later scan
     had join keys pushed into) and what came back."""
     calls = [call]
-    for index in range(1, len(raws)):
-        call = call.then(raws[index - 1])
+    raw_results = iter(raws)
+    raw = next(raw_results)
+    while call.then is not None:
+        next_call = call.then(raw)
+        if next_call is None:
+            break
+        call = next_call
         calls.append(call)
-    return calls, call.postprocess(raws[-1])
+        raw = next(raw_results)
+    return calls, call.postprocess(raw)
 
 
 @pytest.fixture

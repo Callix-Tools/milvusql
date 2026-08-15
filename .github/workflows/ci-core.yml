@@ -46,15 +46,22 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     defaults:
       run:
         shell: bash
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: ${{ matrix.python-version }}
 
       - uses: arduino/setup-task@v2
         with:
@@ -70,6 +77,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: core-test-results
+          name: core-test-results-py${{ matrix.python-version }}
           path: reports/
           retention-days: 30

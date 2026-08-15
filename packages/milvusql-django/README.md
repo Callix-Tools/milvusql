@@ -15,7 +15,7 @@
 
 ---
 
-`Model`/`Field` CRUD and filtering go through Django's normal query compiler; vector search goes through an explicit helper instead of a queryset method, because Milvus needs an index built and the collection loaded before a vector column is searchable at all — see [API](#api) below.
+`Model`/`Field` CRUD and filtering go through Django's normal query compiler; vector search goes through an explicit helper instead of a queryset method, because Milvus needs an index built and the collection loaded before a vector column is searchable at all — see [API](#api) below. Relation lookups (`filter(related__field=...)`), `.values().annotate(...)` grouping and `Exists(... OuterRef(...))` (correlated `EXISTS`, decorrelated into a semi/anti join) all plan through the DBAPI's relational engine, and a `TextField` is Milvus's analyzer-enabled full-text input.
 
 ## Installation
 

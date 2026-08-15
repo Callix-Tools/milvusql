@@ -24,12 +24,18 @@ from __future__ import annotations
 
 import typing as t
 
-from pymilvus import AnnSearchRequest, DataType, RRFRanker, WeightedRanker
+from pymilvus import (
+    AnnSearchRequest,
+    DataType,
+    Function,
+    FunctionType,
+    RRFRanker,
+    WeightedRanker,
+)
 from sqlglot import exp
 from sqlglot_milvus.expressions import (
     CONSISTENCY_ARG,
     HYBRID_ARG,
-    METRIC_TYPES,
     SEARCH_PARAMS_ARG,
     AddField,
     HybridSearch,
@@ -42,10 +48,13 @@ from milvusql.translate._common import (
     DEFAULT_QUERY_LIMIT,
     Call,
     Postprocess,
+    Rows,
     RowsAndDescription,
+    ann_metric,
     description,
     filter_text,
     resolve_value,
+    unbounded_query_call,
 )
 from milvusql.translate.relational import (
     build_relational_call,
@@ -88,20 +97,12 @@ def _mutation_count(key: str) -> Postprocess:
     return postprocess
 
 
-def _update_zero(_raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
-    """``UPDATE``'s first step (the read) short-circuits here when
-    nothing matched the ``WHERE`` clause -- ``rowcount`` is honestly
-    ``0``, not the ``-1`` "not applicable" DDL convention, since an
-    UPDATE that matched nothing is a completed, well-understood
-    outcome."""
+def _update_zero(_rows: t.Any) -> RowsAndDescription:  # noqa: ANN401
+    """``UPDATE`` ends here when nothing matched the ``WHERE`` clause --
+    ``rowcount`` is honestly ``0``, not the ``-1`` "not applicable" DDL
+    convention, since an UPDATE that matched nothing is a completed,
+    well-understood outcome."""
     return [], None, 0, None
-
-
-def _upsert_result(raw: dict[str, t.Any]) -> RowsAndDescription:
-    """``UPDATE``'s second step (the write): ``upsert`` returns
-    ``{"upsert_count": n, ...}`` -- confirmed directly against Milvus
-    Lite, the same shape family as ``insert``'s ``insert_count``."""
-    return [], None, raw.get("upsert_count", -1), None
 
 
 # -----------------------------------------------------------------------
@@ -142,37 +143,151 @@ _SCALAR_TYPES: dict[exp.DataType.Type, DataType] = {
     exp.DataType.Type.JSON: DataType.JSON,
 }
 
+#: The dimensioned vector spellings that (like ``SPARSEVEC``) parse as
+#: a user-defined type carrying its own name: ``BINARYVEC(128)`` and
+#: the reduced-precision families. Values are inserted as whatever
+#: ``pymilvus`` accepts for the type (``bytes`` for binary, a numpy
+#: array of the matching dtype for fp16/bf16/int8) -- the DBAPI passes
+#: bind values through untouched, so no conversion happens here.
+_USERDEFINED_VECTORS: dict[str, DataType] = {
+    "BINARYVEC": DataType.BINARY_VECTOR,
+    "FLOAT16VEC": DataType.FLOAT16_VECTOR,
+    "BFLOAT16VEC": DataType.BFLOAT16_VECTOR,
+    "INT8VEC": DataType.INT8_VECTOR,
+}
 
-def _map_datatype(dtype: exp.DataType) -> tuple[DataType, dict[str, t.Any]]:
+#: Every Milvus vector field type. Used for the one-vector-per-table
+#: check and for "a vector field can't be nullable".
+_VECTOR_TYPES = frozenset(
+    {
+        DataType.FLOAT_VECTOR,
+        DataType.SPARSE_FLOAT_VECTOR,
+        *_USERDEFINED_VECTORS.values(),
+    }
+)
+
+#: ``ARRAY<T>(n)`` with no explicit capacity: Milvus requires
+#: ``max_capacity`` on every array field, so a spelling without one
+#: gets the type's own documented maximum rather than a rejection.
+_DEFAULT_ARRAY_CAPACITY = 4096
+
+
+def _map_datatype(  # noqa: PLR0911 -- one return per type family, clearer flat than nested
+    dtype: exp.DataType,
+) -> tuple[DataType, dict[str, t.Any]]:
     """A parsed ``ColumnDef.kind`` -> ``(pymilvus DataType, extra
-    add_field kwargs)``. Only the types the phase-1 DDL surface actually
-    needs (README's ``CREATE TABLE`` example set) are mapped; anything
-    else -- ``TEXT``, ``ARRAY``, a binary-vector spelling -- is a real
-    gap, not a silent guess, so it raises rather than picks an arbitrary
-    Milvus type for a spelling this layer has never seen used.
+    add_field kwargs)``. Anything not mapped is a real gap, not a
+    silent guess, so it raises rather than picking an arbitrary Milvus
+    type for a spelling this layer has never seen used.
     """
     if dtype.this is exp.DataType.Type.VARCHAR:
         param = dtype.expressions[0] if dtype.expressions else None
         max_length = int(param.this.this) if param is not None else 65535
         return DataType.VARCHAR, {"max_length": max_length}
+    if dtype.this is exp.DataType.Type.TEXT:
+        # `TEXT` is the full-text column: max-length VARCHAR with the
+        # analyzer on (so a BM25 function can consume it) and keyword
+        # match on (so `MATCH ... AGAINST` filters work) -- the two
+        # flags Milvus's own full-text walkthroughs always set together.
+        return DataType.VARCHAR, {
+            "max_length": 65535,
+            "enable_analyzer": True,
+            "enable_match": True,
+        }
+    if dtype.this is exp.DataType.Type.ARRAY:
+        if not dtype.expressions or not isinstance(
+            dtype.expressions[0], exp.DataType
+        ):
+            msg = "ARRAY needs an element type: ARRAY<BIGINT>(100)"
+            raise errors.NotSupportedError(msg)
+        element_type, element_extra = _map_datatype(dtype.expressions[0])
+        if element_type is DataType.ARRAY or element_type in _VECTOR_TYPES:
+            msg = (
+                "unsupported ARRAY element type: "
+                f"{dtype.expressions[0].sql(dialect='milvus')} -- Milvus "
+                "arrays hold scalars only"
+            )
+            raise errors.NotSupportedError(msg)
+        values = dtype.args.get("values") or []
+        capacity = int(values[0].this) if values else _DEFAULT_ARRAY_CAPACITY
+        return DataType.ARRAY, {
+            "element_type": element_type,
+            "max_capacity": capacity,
+            # A VARCHAR element's max_length rides along -- pymilvus
+            # takes it as a sibling kwarg on the array field itself.
+            **element_extra,
+        }
     if dtype.this is exp.DataType.Type.VECTOR:
         dim = int(dtype.expressions[0].this.this)
         return DataType.FLOAT_VECTOR, {"dim": dim}
     if dtype.this is exp.DataType.Type.USERDEFINED:
-        # ``SPARSEVEC`` has no dedicated sqlglot ``DataType.Type`` of
-        # its own (unlike ``VECTOR``, recycled from a real one) -- it
-        # parses as a generic user-defined type carrying its own
-        # spelling as free text in ``kind`` (confirmed directly against
-        # sqlglot's own parser output), case-preserved from whatever the
-        # caller wrote, hence the case-insensitive match.
+        # ``SPARSEVEC`` and the dimensioned vector spellings have no
+        # dedicated sqlglot ``DataType.Type`` of their own (unlike
+        # ``VECTOR``, recycled from a real one) -- they parse as a
+        # generic user-defined type carrying their own spelling as free
+        # text in ``kind`` (confirmed directly against sqlglot's own
+        # parser output), case-preserved from whatever the caller
+        # wrote, hence the case-insensitive matches.
         kind = dtype.args.get("kind")
-        if isinstance(kind, str) and kind.upper() == "SPARSEVEC":
+        kind_name = kind.upper() if isinstance(kind, str) else ""
+        if kind_name == "SPARSEVEC":
             return DataType.SPARSE_FLOAT_VECTOR, {}
+        dimensioned = _USERDEFINED_VECTORS.get(kind_name)
+        if dimensioned is not None:
+            if not dtype.expressions:
+                msg = f"{kind_name} needs a dimension: {kind_name}(128)"
+                raise errors.NotSupportedError(msg)
+            return dimensioned, {"dim": int(dtype.expressions[0].this.this)}
     mapped = _SCALAR_TYPES.get(dtype.this)
     if mapped is None:
         msg = f"unsupported column type: {dtype.sql(dialect='milvus')}"
         raise errors.NotSupportedError(msg)
     return mapped, {}
+
+
+def _generated_bm25_input(column: exp.ColumnDef) -> str | None:
+    """``GENERATED ALWAYS AS (BM25(content))`` / ``AS (BM25(content))``
+    on a column -> the input column's name, or ``None`` when the column
+    is not generated.
+
+    Both spellings parse (confirmed directly): the long form to a
+    ``GeneratedAsIdentityColumnConstraint`` carrying the expression, the
+    short form to a ``ComputedColumnConstraint`` wrapping it in a
+    ``Paren``. ``BM25`` is the only generator Milvus computes
+    server-side, so anything else is rejected by name."""
+    for constraint in column.constraints or []:
+        kind = constraint.kind
+        if isinstance(kind, exp.ComputedColumnConstraint):
+            expression = kind.this
+        elif isinstance(kind, exp.GeneratedAsIdentityColumnConstraint):
+            expression = kind.args.get("expression")
+            if expression is None:
+                # `GENERATED ALWAYS AS IDENTITY` -- an identity column,
+                # not a computed one; the AUTO_INCREMENT handling owns it.
+                continue
+        else:
+            continue
+        while isinstance(expression, exp.Paren):
+            expression = expression.this
+        if (
+            isinstance(expression, exp.Anonymous)
+            and str(expression.this).upper() == "BM25"
+            and len(expression.expressions) == 1
+            and isinstance(expression.expressions[0], exp.Column)
+        ):
+            return expression.expressions[0].name
+        rendered = (
+            expression.sql(dialect="milvus")
+            if isinstance(expression, exp.Expression)
+            else str(expression)
+        )
+        msg = (
+            f"unsupported generated column expression: {rendered!r} -- "
+            "BM25(<text column>) is the one generator Milvus computes "
+            "server-side"
+        )
+        raise errors.NotSupportedError(msg)
+    return None
 
 
 def _build_create_table(
@@ -187,11 +302,7 @@ def _build_create_table(
     columns = [
         c for c in schema_node.expressions if isinstance(c, exp.ColumnDef)
     ]
-    if not any(
-        _map_datatype(c.kind)[0]
-        in (DataType.FLOAT_VECTOR, DataType.SPARSE_FLOAT_VECTOR)
-        for c in columns
-    ):
+    if not any(_map_datatype(c.kind)[0] in _VECTOR_TYPES for c in columns):
         # Milvus refuses `create_collection()` outright for a schema
         # with zero vector fields -- confirmed directly against a
         # real, non-Lite server (Milvus Lite silently tolerates it,
@@ -234,6 +345,7 @@ def _build_create_table(
             exp.PrimaryKeyColumnConstraint in constraint_kinds
             or name in pk_names
         )
+        generator_source = _generated_bm25_input(column)
         # A `Mapped[T | None]` column (no explicit `NOT NULL`, what
         # SQLAlchemy's own DDL compiler emits for it) needs
         # `nullable=True` on the Milvus `FieldSchema`, or `pymilvus`
@@ -244,8 +356,7 @@ def _build_create_table(
         nullable = (
             not is_primary
             and exp.NotNullColumnConstraint not in constraint_kinds
-            and milvus_type
-            not in (DataType.FLOAT_VECTOR, DataType.SPARSE_FLOAT_VECTOR)
+            and milvus_type not in _VECTOR_TYPES
         )
         milvus_schema.add_field(
             field_name=name,
@@ -255,6 +366,28 @@ def _build_create_table(
             nullable=nullable,
             **extra,
         )
+        if generator_source is not None:
+            # `content_sparse SPARSEVEC GENERATED ALWAYS AS
+            # (BM25(content))` -- the field itself plus the schema-level
+            # BM25 function Milvus computes it with, which is the whole
+            # full-text pipeline: the server tokenizes `content` (a
+            # `TEXT` column, i.e. analyzer-enabled VARCHAR) into this
+            # sparse field, and a search against it with
+            # `metric_type='BM25'` ranks by relevance.
+            if milvus_type is not DataType.SPARSE_FLOAT_VECTOR:
+                msg = (
+                    f"column {name!r}: BM25 generates a SPARSEVEC, not "
+                    f"{column.kind.sql(dialect='milvus')}"
+                )
+                raise errors.NotSupportedError(msg)
+            milvus_schema.add_function(
+                Function(
+                    name=f"{name}_bm25",
+                    function_type=FunctionType.BM25,
+                    input_field_names=[generator_source],
+                    output_field_names=[name],
+                )
+            )
 
     kwargs: dict[str, t.Any] = {
         "collection_name": table_name,
@@ -503,38 +636,61 @@ def _build_update(ast: exp.Update, parameters: dict[str, t.Any]) -> Call:
         # whole entity, so the merged row has to carry everything the
         # row already had, not just the columns SET touches.
         "output_fields": ["*"],
-        "limit": DEFAULT_QUERY_LIMIT,
     }
     if filter_expr:
         query_kwargs["filter"] = filter_expr
 
-    def _then(raw: list[dict[str, t.Any]]) -> Call | None:
-        if not raw:
+    def _write_back(rows: Rows) -> Call | None:
+        if not rows:
             return None
-        if len(raw) >= DEFAULT_QUERY_LIMIT:
-            # The read that feeds the upsert is subject to Milvus's own
-            # per-call ceiling like any other. Writing back only the
-            # rows that fit would leave the rest untouched and report a
-            # `rowcount` that looks like the whole thing -- the same
-            # silent-truncation trap the aggregate, ORDER BY and
-            # join/grouping paths all refuse to fall into. Nothing has
-            # been written at this point: this is the read step.
-            msg = (
-                "UPDATE cannot be honored: the WHERE filter matches at "
-                f"least Milvus's own per-call row ceiling "
-                f"({DEFAULT_QUERY_LIMIT}), so only part of the matching "
-                "rows would be updated. Narrow the WHERE filter and run "
-                "it in batches."
-            )
-            raise errors.NotSupportedError(msg)
-        merged = [{**row, **set_values} for row in raw]
+        merged = [{**row, **set_values} for row in rows]
+        return _chunked_upsert(table_name, merged)
+
+    # The read pages past Milvus's per-call row ceiling (it used to
+    # raise there), so a broad UPDATE now reads everything it matches
+    # and writes it back in bounded chunks. The full read deliberately
+    # completes BEFORE the first upsert goes out -- interleaving pages
+    # with writes would be cheaper on memory, but on an auto_id table
+    # every upsert mints a new primary key (see the docstring above),
+    # and a newly minted key can land past the read's pk cursor: the
+    # same logical row would then be read again, still match the
+    # filter, and be updated forever.
+    return unbounded_query_call(query_kwargs, _write_back, _update_zero)
+
+
+#: How many merged rows one ``upsert`` RPC carries. Milvus itself takes
+#: arbitrarily long lists, but the gRPC message has a size cap and every
+#: row carries its full vector here -- the same order of magnitude
+#: pymilvus's own bulk helpers batch at.
+_UPSERT_BATCH_ROWS = 1000
+
+
+def _chunked_upsert(table_name: str, merged: Rows) -> Call:
+    """The write half of ``UPDATE``: every merged row, ``upsert``\\ ed in
+    :data:`_UPSERT_BATCH_ROWS`-row chunks chained through ``then``, with
+    one total ``rowcount`` at the end."""
+    total = {"count": 0}
+
+    def link(start: int) -> Call:
+        chunk = merged[start : start + _UPSERT_BATCH_ROWS]
+
+        def then(raw: t.Any) -> Call | None:  # noqa: ANN401
+            if isinstance(raw, dict):
+                total["count"] += raw.get("upsert_count", 0)
+            following = start + _UPSERT_BATCH_ROWS
+            return link(following) if following < len(merged) else None
+
+        def postprocess(_raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
+            return [], None, total["count"], None
+
         return Call(
             "upsert",
-            {"collection_name": table_name, "data": merged},
-            _upsert_result,
+            {"collection_name": table_name, "data": chunk},
+            postprocess,
+            then=then,
         )
 
-    return Call("query", query_kwargs, _update_zero, then=_then)
+    return link(0)
 
 
 # -----------------------------------------------------------------------
@@ -602,35 +758,13 @@ def _sorted_query_rows(
     """Client-side ``ORDER BY <scalar column>`` + ``LIMIT``: Milvus's
     ``query()`` RPC has no ordering concept of its own (confirmed --
     it accepts a filter and a row cap, nothing else), so this sorts
-    every matching row (fetched up to :data:`DEFAULT_QUERY_LIMIT`,
-    same ceiling a plain unordered SELECT is already subject to) in
-    Python and only *then* applies the real ``LIMIT`` -- sorting after
-    truncating would return the wrong rows entirely.
-
-    If the ``WHERE`` filter itself matches more than
-    :data:`DEFAULT_QUERY_LIMIT` rows, the fetch above is itself
-    truncated -- the sort would then run over an arbitrary subset of
-    the true matches, silently returning the wrong "top N" with no
-    error at all. ``postprocess`` below detects that (the fetch came
-    back at the ceiling) and raises rather than guess: there is no way
-    to fetch a larger page from ``query()`` in this one-RPC-per-``Call``
-    model, and ``pymilvus``'s own pagination helper
-    (``MilvusClient.query_iterator``) has no counterpart on
-    ``AsyncMilvusClient`` at all (confirmed directly) -- adopting it
-    here would make the sync and async cursors behave differently for
-    the same MilvusQL text, which this module is deliberately built to
-    never do (D1/D12)."""
+    every matching row in Python and only *then* applies the real
+    ``LIMIT`` -- sorting after truncating would return the wrong rows
+    entirely. The fetch behind it pages past Milvus's per-call row
+    ceiling (see :func:`unbounded_query_call`), so the sort really does
+    run over every matching row."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
-        if len(raw) >= DEFAULT_QUERY_LIMIT:
-            msg = (
-                "ORDER BY cannot be honored: the WHERE filter matches "
-                f"at least Milvus's own per-call row ceiling "
-                f"({DEFAULT_QUERY_LIMIT}), so the true sort order "
-                "across every matching row cannot be verified. Narrow "
-                "the WHERE filter to match fewer rows."
-            )
-            raise errors.NotSupportedError(msg)
         rows = list(raw)
         # Stable-sort by the least significant key first so the most
         # significant key (applied last) wins ties -- the standard way
@@ -790,50 +924,39 @@ def _count_star_rows(count: int, output_names: list[str]) -> Postprocess:
 
 
 def _reduce_aggregate_rows(
-    specs: list[tuple[str, str | None]], output_names: list[str]
+    specs: list[tuple[str, str | None, bool]], output_names: list[str]
 ) -> Postprocess:
     """``SUM``/``AVG``/``MIN``/``MAX``/``COUNT(<column>)`` (everything
     but a pure ``COUNT(*)``, which the server-side fast path above
     handles instead): Milvus computes none of these itself, so every
-    matching row is fetched (up to :data:`DEFAULT_QUERY_LIMIT`) and
-    reduced here in Python. Same reasoning as
-    :func:`_sorted_query_rows` for why hitting that ceiling raises
-    instead of silently reducing over a truncated subset -- a ``SUM``
-    or ``AVG`` computed from only *some* of the matching rows is a
-    wrong number with no indication it is wrong."""
+    matching row is fetched -- paging past the per-call row ceiling
+    where needed (see :func:`unbounded_query_call`) -- and reduced here
+    in Python, over the complete set of matching rows. A ``DISTINCT``
+    inside the aggregate dedupes the values before reducing, SQL's own
+    semantics for ``COUNT(DISTINCT x)``/``SUM(DISTINCT x)``."""
 
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
-        if len(raw) >= DEFAULT_QUERY_LIMIT:
-            msg = (
-                "aggregate cannot be honored: the WHERE filter matches "
-                f"at least Milvus's own per-call row ceiling "
-                f"({DEFAULT_QUERY_LIMIT}), so the aggregate cannot be "
-                "computed over every matching row. Narrow the WHERE "
-                "filter to match fewer rows."
-            )
-            raise errors.NotSupportedError(msg)
         values: list[t.Any] = []
-        for func, column in specs:
-            if func == "count":
-                values.append(
-                    len(raw)
-                    if column is None
-                    else sum(1 for row in raw if row.get(column) is not None)
-                )
-                continue
-            numbers = [
+        for func, column, distinct in specs:
+            collected = [
                 row[column]
                 for row in raw
                 if column is not None and row.get(column) is not None
             ]
-            if func == "sum":
-                values.append(sum(numbers) if numbers else 0)
+            if distinct:
+                collected = list(dict.fromkeys(collected))
+            if func == "count":
+                values.append(len(raw) if column is None else len(collected))
+            elif func == "sum":
+                values.append(sum(collected) if collected else 0)
             elif func == "avg":
-                values.append(sum(numbers) / len(numbers) if numbers else None)
+                values.append(
+                    sum(collected) / len(collected) if collected else None
+                )
             elif func == "min":
-                values.append(min(numbers) if numbers else None)
+                values.append(min(collected) if collected else None)
             elif func == "max":
-                values.append(max(numbers) if numbers else None)
+                values.append(max(collected) if collected else None)
         return [tuple(values)], description(output_names), 1, None
 
     return postprocess
@@ -844,14 +967,26 @@ def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     filter_expr = filter_text(ast.args.get("where"), parameters)
     output_names = _select_output_names(ast)
 
-    specs: list[tuple[str, str | None]] = []
+    specs: list[tuple[str, str | None, bool]] = []
     for e in ast.expressions:
         inner = _unwrap_alias(e)
         func = _AGG_FUNCS[type(inner)]
-        column = None if isinstance(inner.this, exp.Star) else inner.this.name
-        specs.append((func, column))
+        target = inner.this
+        distinct = isinstance(target, exp.Distinct)
+        if distinct:
+            # `COUNT(DISTINCT x)` wraps the column in an `exp.Distinct`
+            # whose own `.name` is the empty string -- reading it
+            # directly asked Milvus for a field named "" (confirmed by
+            # direct execution), which a real server rejects and Lite
+            # silently omits, making the count always 0.
+            target = target.expressions[0]
+        column = None if isinstance(target, exp.Star) else target.name
+        specs.append((func, column, distinct))
 
-    if all(func == "count" and column is None for func, column in specs):
+    if all(
+        func == "count" and column is None and not distinct
+        for func, column, distinct in specs
+    ):
         # Milvus computes `count(*)` server-side -- no row fetch
         # needed at all, and no ceiling to worry about either
         # (confirmed directly against Milvus Lite: `query(...,
@@ -867,15 +1002,18 @@ def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
             "query", kwargs, _count_star_rows(len(specs), output_names)
         )
 
-    columns = sorted({column for _, column in specs if column is not None})
+    columns = sorted(
+        {column for _, column, _distinct in specs if column is not None}
+    )
     kwargs = {
         "collection_name": table_name,
         "output_fields": columns or ["count(*)"],
-        "limit": DEFAULT_QUERY_LIMIT,
     }
     if filter_expr:
         kwargs["filter"] = filter_expr
-    return Call("query", kwargs, _reduce_aggregate_rows(specs, output_names))
+    return unbounded_query_call(
+        kwargs, None, _reduce_aggregate_rows(specs, output_names)
+    )
 
 
 def _select_order_keys(
@@ -925,7 +1063,7 @@ def _build_hybrid_search(
     weights = []
     for arm in hybrid.expressions:
         distance_node = arm.this
-        metric_type = METRIC_TYPES.get(type(distance_node))
+        metric_type = ann_metric(distance_node)
         if metric_type is None:
             msg = (
                 "unsupported HYBRID SEARCH arm scoring expression: "
@@ -980,7 +1118,9 @@ def _build_hybrid_search(
     )
 
 
-def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
+def _build_select(  # noqa: PLR0911, PLR0912 -- one return per SELECT shape, clearer flat than nested
+    ast: exp.Select, parameters: dict[str, t.Any]
+) -> Call:
     ast = _flatten_trivial_subquery(ast)
     hybrid = ast.args.get(HYBRID_ARG)
     if hybrid:
@@ -1025,7 +1165,7 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
     if order is not None:
         ordered = order.expressions[0]
         distance_node = ordered.this
-        metric_type = METRIC_TYPES.get(type(distance_node))
+        metric_type = ann_metric(distance_node)
     else:
         metric_type = None
 
@@ -1033,17 +1173,25 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
         kwargs: dict[str, t.Any] = {
             "collection_name": table_name,
             "output_fields": field_names,
-            "limit": limit,
         }
         if filter_expr:
             kwargs["filter"] = filter_expr
         if order is None:
-            return Call(
-                "query", kwargs, _query_rows(field_names, output_names)
+            if limit_node is not None:
+                # A bounded read stays exactly one RPC.
+                kwargs["limit"] = limit
+                return Call(
+                    "query", kwargs, _query_rows(field_names, output_names)
+                )
+            # No LIMIT clause at all (a bare `Model.objects.all()`):
+            # fetch everything, paging past Milvus's per-call row
+            # ceiling where the result demands it.
+            return unbounded_query_call(
+                kwargs, None, _query_rows(field_names, output_names)
             )
         # A plain scalar `ORDER BY` -- not a distance operator, so this
-        # isn't a vector search. Fetch every matching row (up to
-        # Milvus's own ceiling) and sort client-side instead of
+        # isn't a vector search. Fetch every matching row (paging past
+        # the ceiling where needed) and sort client-side instead of
         # rejecting it outright.
         order_keys = _select_order_keys(order, field_names)
         fetch_fields = list(field_names)
@@ -1051,10 +1199,9 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
             if column not in fetch_fields:
                 fetch_fields.append(column)
         kwargs["output_fields"] = fetch_fields
-        kwargs["limit"] = DEFAULT_QUERY_LIMIT
-        return Call(
-            "query",
+        return unbounded_query_call(
             kwargs,
+            None,
             _sorted_query_rows(field_names, output_names, order_keys, limit),
         )
 
@@ -1085,6 +1232,146 @@ def _build_select(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
 
 
 # -----------------------------------------------------------------------
+# Introspection: SHOW TABLES / SHOW DATABASES / DESCRIBE
+# -----------------------------------------------------------------------
+
+#: pymilvus ``DataType`` -> the MilvusQL spelling ``DESCRIBE`` prints,
+#: so its output round-trips into ``CREATE TABLE`` unchanged.
+_DESCRIBE_TYPE_NAMES: dict[DataType, str] = {
+    DataType.INT8: "TINYINT",
+    DataType.INT16: "SMALLINT",
+    DataType.INT32: "INT",
+    DataType.INT64: "BIGINT",
+    DataType.FLOAT: "FLOAT",
+    DataType.DOUBLE: "DOUBLE",
+    DataType.BOOL: "BOOLEAN",
+    DataType.JSON: "JSON",
+    DataType.VARCHAR: "VARCHAR",
+    DataType.FLOAT_VECTOR: "VECTOR",
+    DataType.SPARSE_FLOAT_VECTOR: "SPARSEVEC",
+    DataType.BINARY_VECTOR: "BINARYVEC",
+    DataType.FLOAT16_VECTOR: "FLOAT16VEC",
+    DataType.BFLOAT16_VECTOR: "BFLOAT16VEC",
+    DataType.INT8_VECTOR: "INT8VEC",
+}
+
+
+def _describe_type_text(field: dict[str, t.Any]) -> str:
+    """One ``describe_collection`` field -> its MilvusQL type spelling
+    (``VARCHAR(64)``, ``VECTOR(8)``, ``ARRAY<BIGINT>(100)``)."""
+    datatype = DataType(field["type"])
+    params = field.get("params") or {}
+    if datatype is DataType.ARRAY:
+        element = field.get("element_type", params.get("element_type"))
+        element_name = (
+            _DESCRIBE_TYPE_NAMES.get(DataType(element), str(element))
+            if element is not None
+            else "?"
+        )
+        capacity = params.get("max_capacity")
+        suffix = f"({capacity})" if capacity else ""
+        return f"ARRAY<{element_name}>{suffix}"
+    name = _DESCRIBE_TYPE_NAMES.get(datatype, datatype.name)
+    size = params.get("dim") or params.get("max_length")
+    if size and datatype is not DataType.SPARSE_FLOAT_VECTOR:
+        return f"{name}({size})"
+    return name
+
+
+_DESCRIBE_COLUMNS = ["Field", "Type", "Null", "Key", "Extra"]
+
+
+def _describe_rows(raw: dict[str, t.Any]) -> RowsAndDescription:
+    rows = []
+    for field in raw.get("fields", []):
+        extras = []
+        if field.get("auto_id"):
+            extras.append("auto_increment")
+        for function in raw.get("functions", []):
+            if field["name"] in (function.get("output_field_names") or []):
+                inputs = ", ".join(function.get("input_field_names") or [])
+                extras.append(f"generated by BM25({inputs})")
+        rows.append(
+            (
+                field["name"],
+                _describe_type_text(field),
+                "YES" if field.get("nullable") else "NO",
+                "PRI" if field.get("is_primary") else "",
+                ", ".join(extras),
+            )
+        )
+    return rows, description(_DESCRIBE_COLUMNS), len(rows), None
+
+
+def _build_describe(ast: exp.Describe) -> Call:
+    return Call(
+        "describe_collection",
+        {"collection_name": ast.this.name},
+        _describe_rows,
+    )
+
+
+def _name_list_rows(label: str) -> Postprocess:
+    def postprocess(raw: list[str]) -> RowsAndDescription:
+        rows = [(name,) for name in raw]
+        return rows, description([label]), len(rows), None
+
+    return postprocess
+
+
+def _build_show(ast: exp.Command) -> Call:
+    """``SHOW ...`` reaches this layer as an opaque ``exp.Command`` (the
+    base grammar has no structured SHOW), so the one word after ``SHOW``
+    is read here: ``TABLES`` and ``DATABASES`` are the two Milvus can
+    answer."""
+    argument = ast.args.get("expression")
+    text = (argument.this if isinstance(argument, exp.Literal) else "").strip()
+    words = text.split()
+    keyword = words[0].upper() if words else ""
+    if len(words) > 1:
+        # `SHOW TABLES LIKE 'x%'` / `SHOW TABLES FROM other` -- matching
+        # on the keyword alone would silently drop the qualifier and
+        # return the full, unfiltered listing of the *current*
+        # database: a plausible wrong answer, which is worse than a
+        # named rejection.
+        msg = (
+            f"unsupported SHOW qualifier: SHOW {text} -- only bare "
+            "SHOW TABLES and SHOW DATABASES are supported"
+        )
+        raise errors.NotSupportedError(msg)
+    if keyword == "TABLES":
+        return Call("list_collections", {}, _name_list_rows("table_name"))
+    if keyword == "DATABASES":
+        return Call("list_databases", {}, _name_list_rows("database_name"))
+    msg = f"unsupported SHOW statement: SHOW {text or '?'}"
+    raise errors.NotSupportedError(msg)
+
+
+# -----------------------------------------------------------------------
+# Databases and indexes
+# -----------------------------------------------------------------------
+
+
+def _build_drop_index(ast: exp.Drop) -> Call:
+    on = ast.args.get("cluster")
+    if on is None:
+        # The grammar parses a bare `DROP INDEX idx`, but Milvus scopes
+        # index names to a collection, so the statement is unanswerable
+        # without one.
+        msg = "DROP INDEX needs the collection: DROP INDEX idx ON items"
+        raise errors.ProgrammingError(msg)
+    return Call(
+        "drop_index",
+        {"collection_name": on.this.name, "index_name": ast.this.name},
+        _no_rows,
+    )
+
+
+def _build_use(ast: exp.Use) -> Call:
+    return Call("use_database", {"db_name": ast.this.name}, _no_rows)
+
+
+# -----------------------------------------------------------------------
 # Public entry point
 # -----------------------------------------------------------------------
 
@@ -1107,10 +1394,12 @@ _BUILDERS: dict[type[exp.Expression], t.Callable[..., Call]] = {
     exp.Except: lambda _client, ast, params: build_set_operation_call(
         ast, params
     ),
+    exp.Describe: lambda _client, ast, _params: _build_describe(ast),
+    exp.Use: lambda _client, ast, _params: _build_use(ast),
 }
 
 
-def build_call(
+def build_call(  # noqa: PLR0911 -- one return per statement kind, clearer flat than nested
     client: MilvusClient | AsyncMilvusClient,
     ast: exp.Expression,
     parameters: dict[str, t.Any],
@@ -1122,6 +1411,10 @@ def build_call(
             return _build_create_table(client, ast, parameters)
         if ast.args.get("kind") == "INDEX":
             return _build_create_index(client, ast, parameters)
+        if ast.args.get("kind") in ("DATABASE", "SCHEMA"):
+            return Call(
+                "create_database", {"db_name": ast.this.name}, _no_rows
+            )
         msg = f"unsupported CREATE kind: {ast.args.get('kind')}"
         raise errors.NotSupportedError(msg)
     if isinstance(ast, exp.Alter):
@@ -1129,8 +1422,14 @@ def build_call(
     if isinstance(ast, exp.Drop):
         if ast.args.get("kind") == "TABLE":
             return _build_drop_table(ast)
+        if ast.args.get("kind") == "INDEX":
+            return _build_drop_index(ast)
+        if ast.args.get("kind") in ("DATABASE", "SCHEMA"):
+            return Call("drop_database", {"db_name": ast.this.name}, _no_rows)
         msg = f"unsupported DROP kind: {ast.args.get('kind')}"
         raise errors.NotSupportedError(msg)
+    if isinstance(ast, exp.Command) and str(ast.this).upper() == "SHOW":
+        return _build_show(ast)
     builder = _BUILDERS.get(type(ast))
     if builder is None:
         msg = f"unsupported statement: {ast.__class__.__name__}"

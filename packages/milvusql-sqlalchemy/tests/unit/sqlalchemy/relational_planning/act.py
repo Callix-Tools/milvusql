@@ -15,6 +15,7 @@ import typing as t
 import pytest
 import sqlglot
 from milvusql_sqlalchemy.dialect import MilvusDialect
+from milvusql_sqlalchemy.types import SPARSEVEC
 from pymilvus import MilvusClient
 from sqlalchemy import (
     BigInteger,
@@ -25,8 +26,10 @@ from sqlalchemy import (
     String,
     Table,
     func,
+    not_,
     select,
 )
+from sqlalchemy import exists as sa_exists
 
 import milvusql
 from milvusql.translate.ast_to_pymilvus import build_call
@@ -175,13 +178,93 @@ class TestSubquery:
 
 
 class TestUnsupported:
-    def test_a_correlated_exists_is_rejected_by_name(self):
-        """What ``.any()``/``.has()`` on a relationship compiles to."""
+    def test_a_non_equi_correlated_exists_is_rejected_by_name(self):
+        """An equality correlation decorrelates into a semi join (see
+        ``TestExists``); a correlation through any other comparison
+        still cannot, and the error names the construct."""
         with pytest.raises(milvusql.NotSupportedError, match="correlated"):
             _plan(
                 select(items.c.id).where(
                     select(categories.c.id)
-                    .where(categories.c.id == items.c.cat_id)
+                    .where(categories.c.id > items.c.cat_id)
                     .exists()
                 )
             )
+
+
+class TestExists:
+    """Correlated ``[NOT] EXISTS`` -- what ``relationship(...).any()``/
+    ``.has()`` compile to -- decorrelates into a semi/anti join in the
+    planner. Spelled here with Core's ``exists()``, which renders the
+    identical text the ORM emits."""
+
+    def test_exists_plans_a_semi_join_and_keeps_matching_rows(self):
+        _sql, call = _plan(
+            select(items.c.id).where(
+                sa_exists(select(1).where(items.c.cat_id == categories.c.id))
+            )
+        )
+        calls, (rows, _d, _rc, _l) = _chain(
+            call,
+            [
+                [{"id": 5}],
+                [{"id": 1, "cat_id": 5}, {"id": 2, "cat_id": 9}],
+            ],
+        )
+        assert [c.kwargs["collection_name"] for c in calls] == [
+            "categories",
+            "items",
+        ]
+        assert rows == [(1,)]
+
+    def test_orm_any_compiles_to_the_same_shape(self):
+        """The real ORM path: ``Category.items.any()`` through a mapped
+        relationship, planned end to end."""
+
+        _sql, call = _plan(
+            select(items.c.id).where(
+                not_(
+                    sa_exists(
+                        select(1).where(items.c.cat_id == categories.c.id)
+                    )
+                )
+            )
+        )
+        _calls, (rows, _d, _rc, _l) = _chain(
+            call,
+            [
+                [{"id": 5}],
+                [{"id": 1, "cat_id": 5}, {"id": 2, "cat_id": 9}],
+            ],
+        )
+        assert rows == [(2,)]
+
+
+class TestFullText:
+    """BM25 retrieval through the standard SQLAlchemy surface: a
+    generic ``func.BM25_SCORE(...)`` in ``ORDER BY`` compiles to text
+    the DBAPI plans as a ``metric_type='BM25'`` search -- no dialect
+    code involved, which is the point."""
+
+    def test_order_by_bm25_score_plans_a_bm25_search(self):
+        docs = Table(
+            "docs",
+            MetaData(),
+            Column("id", BigInteger, primary_key=True),
+            Column("content_sparse", SPARSEVEC()),
+        )
+        statement = (
+            select(docs.c.id)
+            .order_by(
+                func.BM25_SCORE(
+                    docs.c.content_sparse, "how do i tune hnsw"
+                ).desc()
+            )
+            .limit(10)
+        )
+        _sql, call = _plan(statement)
+        assert call.method == "search"
+        assert call.kwargs["anns_field"] == "content_sparse"
+        assert call.kwargs["data"] == ["how do i tune hnsw"]
+        assert call.kwargs["search_params"]["metric_type"] == "BM25"
+        assert call.kwargs["limit"] == 10

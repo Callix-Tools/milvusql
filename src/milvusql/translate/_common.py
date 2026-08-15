@@ -15,11 +15,13 @@ Nothing here performs I/O, same invariant the rest of the package keeps.
 
 from __future__ import annotations
 
+import itertools
 import json
 import typing as t
 from dataclasses import dataclass, field
 
 from sqlglot import exp
+from sqlglot_milvus.expressions import METRIC_TYPES, BM25Score
 
 from milvusql.dbapi import errors
 
@@ -105,6 +107,20 @@ def resolve_value(node: exp.Expression, parameters: dict[str, t.Any]) -> t.Any: 
     raise errors.NotSupportedError(msg)
 
 
+def ann_metric(node: exp.Expression) -> str | None:
+    """The Milvus ``metric_type`` a scoring expression asks for, or
+    ``None`` when the expression is not a search at all. The four
+    distance operators come from the grammar's own table;
+    ``BM25_SCORE(sparse_field, :q)`` is the full-text ranking -- Milvus
+    runs it as a ``search`` against the BM25-generated sparse field
+    with the *query text* as the data, ``metric_type='BM25'``. Both
+    node families carry the column in ``this`` and the query value in
+    ``expression``, so every consumer reads them identically."""
+    if isinstance(node, BM25Score):
+        return "BM25"
+    return METRIC_TYPES.get(type(node))
+
+
 COMPARISON_OPS: dict[type[exp.Expression], str] = {
     exp.EQ: "==",
     exp.NEQ: "!=",
@@ -120,18 +136,71 @@ def render_filter_value(value: t.Any) -> str:  # noqa: ANN401
     ``json.dumps`` for strings gives correct escaping (quotes,
     backslashes, control characters) for free -- Milvus's own string
     literal syntax is JSON-compatible double-quoting, confirmed against
-    the docs and against a real Milvus Lite instance below."""
+    the docs and against a real Milvus Lite instance below. Lists render
+    as ``[...]`` -- the DSL's own spelling, needed by
+    ``array_contains_any(tags, ["a", "b"])`` and friends."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
         return json.dumps(value)
     if isinstance(value, (int, float)):
         return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(render_filter_value(v) for v in value) + "]"
     msg = f"unsupported filter value type: {type(value).__name__}"
     raise errors.NotSupportedError(msg)
 
 
-def render_filter(  # noqa: PLR0911, PLR0912 -- one return per AST node case, clearer flat than nested
+#: Filter-DSL functions Milvus evaluates server-side, by their SQL
+#: spelling. Only these pass through -- an arbitrary unknown function
+#: would be sent verbatim and fail server-side with a parser error far
+#: less actionable than a translate-time rejection here.
+_FILTER_FUNCTIONS = {
+    "ARRAY_CONTAINS": "array_contains",
+    "ARRAY_CONTAINS_ALL": "array_contains_all",
+    "ARRAY_CONTAINS_ANY": "array_contains_any",
+    "ARRAY_LENGTH": "array_length",
+    "JSON_CONTAINS": "json_contains",
+    "JSON_CONTAINS_ALL": "json_contains_all",
+    "JSON_CONTAINS_ANY": "json_contains_any",
+    "TEXT_MATCH": "TEXT_MATCH",
+    "PHRASE_MATCH": "PHRASE_MATCH",
+}
+
+
+def _render_filter_argument(
+    node: exp.Expression, parameters: dict[str, t.Any]
+) -> str:
+    """A filter function's argument: a column (or JSON path) renders as
+    a reference, anything else as a resolved literal value."""
+    if isinstance(node, (exp.Column, exp.Bracket)):
+        return render_filter(node, parameters)
+    return render_filter_value(resolve_value(node, parameters))
+
+
+def render_predicate(
+    node: exp.Expression, parameters: dict[str, t.Any]
+) -> str:
+    """A node in *boolean position* (a WHERE tree, an AND/OR/NOT
+    operand) -> filter text Milvus accepts as a predicate.
+
+    The one thing this adds over :func:`render_filter` is the bare
+    boolean column: Django compiles ``.filter(active=True)`` to just
+    ``"active"`` (confirmed directly against its compiler output), and
+    Milvus's filter parser rejects a bare field reference as a
+    predicate outright -- "predicate is not a boolean expression:
+    active, data type: Bool", confirmed against a real server -- so it
+    becomes the explicit ``active == true`` here. Only boolean
+    positions get this treatment: a column on either side of ``=`` is
+    a value, and wrapping it would be wrong."""
+    if isinstance(node, exp.Paren):
+        return f"({render_predicate(node.this, parameters)})"
+    if isinstance(node, (exp.Column, exp.Bracket)):
+        return f"{render_filter(node, parameters)} == true"
+    return render_filter(node, parameters)
+
+
+def render_filter(  # noqa: PLR0911, PLR0912, PLR0915 -- one return per AST node case, clearer flat than nested
     node: exp.Expression, parameters: dict[str, t.Any]
 ) -> str:
     """MilvusQL's WHERE tree -> Milvus's boolean filter-expression text.
@@ -147,25 +216,45 @@ def render_filter(  # noqa: PLR0911, PLR0912 -- one return per AST node case, cl
     inline here, via :func:`render_filter_value`, is the fallback that
     is verified to actually work."""
     if isinstance(node, exp.Where):
-        return render_filter(node.this, parameters)
+        return render_predicate(node.this, parameters)
     if isinstance(node, exp.Paren):
         return f"({render_filter(node.this, parameters)})"
     if isinstance(node, exp.And):
-        left = render_filter(node.this, parameters)
-        right = render_filter(node.expression, parameters)
+        left = render_predicate(node.this, parameters)
+        right = render_predicate(node.expression, parameters)
         return f"({left} and {right})"
     if isinstance(node, exp.Or):
-        left = render_filter(node.this, parameters)
-        right = render_filter(node.expression, parameters)
+        left = render_predicate(node.this, parameters)
+        right = render_predicate(node.expression, parameters)
         return f"({left} or {right})"
     if isinstance(node, exp.Not):
-        return f"not ({render_filter(node.this, parameters)})"
+        return f"not ({render_predicate(node.this, parameters)})"
     op = COMPARISON_OPS.get(type(node))
     if op is not None:
         left = render_filter(node.this, parameters)
         right = render_filter(node.expression, parameters)
         return f"{left} {op} {right}"
     if isinstance(node, exp.In):
+        if (
+            node.args.get("query") is not None
+            or node.args.get("unnest") is not None
+        ):
+            # `IN (SELECT ...)` carries the subquery in `query`, not in
+            # `expressions` -- falling through to the empty-list branch
+            # below rendered it as the constant `false`, which made
+            # `DELETE ... WHERE id NOT IN (SELECT ...)` delete every
+            # row (`not (false)`), confirmed by direct execution. A
+            # SELECT never reaches here (the relational engine plans
+            # its subqueries as reads); DELETE/UPDATE and search
+            # filters have no second read to answer it with, so the
+            # honest response is a named rejection.
+            msg = (
+                "IN (SELECT ...) cannot be pushed into a Milvus "
+                "filter: it is supported in SELECT (planned as its own "
+                "read), not in DELETE/UPDATE or search filters. "
+                "Materialize the subquery's values first."
+            )
+            raise errors.NotSupportedError(msg)
         # Milvus's filter DSL has its own native `field in [...]`
         # syntax (confirmed directly against Milvus Lite) -- no
         # transpiling needed, just render the column and each
@@ -223,6 +312,54 @@ def render_filter(  # noqa: PLR0911, PLR0912 -- one return per AST node case, cl
             raise errors.NotSupportedError(msg)
         column = render_filter(node.this, parameters)
         return f"{column} is null"
+    if isinstance(node, exp.Bracket):
+        # `meta['brand']` / `tags[0]` -- Milvus's own JSON-path and
+        # array-element spelling is the same bracket syntax (confirmed
+        # directly against Milvus Lite: `meta["n"]["k"] == 5` works),
+        # so this renders structurally rather than passing text through.
+        base = render_filter(node.this, parameters)
+        keys = "".join(
+            f"[{render_filter_value(resolve_value(key, parameters))}]"
+            for key in node.expressions
+        )
+        return f"{base}{keys}"
+    if isinstance(node, exp.MatchAgainst):
+        # `MATCH(content) AGAINST (:q)` -- MilvusQL's full-text match
+        # spelling -> Milvus's own `TEXT_MATCH(field, "words")` filter
+        # function. `this` holds the query value, `expressions` the
+        # single column, per the sqlglot-milvus grammar.
+        if len(node.expressions) != 1:
+            msg = "MATCH ... AGAINST expects exactly one column"
+            raise errors.NotSupportedError(msg)
+        column = render_filter(node.expressions[0], parameters)
+        value = render_filter_value(resolve_value(node.this, parameters))
+        return f"TEXT_MATCH({column}, {value})"
+    if isinstance(node, exp.ArrayContains):
+        # `ARRAY_CONTAINS(tags, :v)` parses into a dedicated node rather
+        # than a generic function call; same server-side DSL either way.
+        column = _render_filter_argument(node.this, parameters)
+        value = _render_filter_argument(node.expression, parameters)
+        return f"array_contains({column}, {value})"
+    if isinstance(node, exp.ArraySize):
+        # `ARRAY_LENGTH(tags)` also parses into a dedicated node
+        # (`ArraySize`), not an `Anonymous` call -- confirmed against a
+        # real CI failure where only the Anonymous roster below was
+        # consulted and the spelling fell through to the rejection.
+        column = _render_filter_argument(node.this, parameters)
+        return f"array_length({column})"
+    if isinstance(node, exp.Anonymous):
+        rendered_name = _FILTER_FUNCTIONS.get(str(node.this).upper())
+        if rendered_name is None:
+            msg = (
+                f"unsupported filter function: {node.this}. Supported: "
+                + ", ".join(sorted(_FILTER_FUNCTIONS))
+            )
+            raise errors.NotSupportedError(msg)
+        arguments = ", ".join(
+            _render_filter_argument(argument, parameters)
+            for argument in node.expressions
+        )
+        return f"{rendered_name}({arguments})"
     if isinstance(node, exp.Column):
         return node.this.name
     if isinstance(
@@ -245,15 +382,150 @@ def description(output_names: list[str]) -> list[tuple]:
     ]
 
 
+# -----------------------------------------------------------------------
+# Reading past Milvus's per-call row ceiling
+# -----------------------------------------------------------------------
+
+#: The complaint raised when pagination cannot proceed because the
+#: server did not honor primary-key-ordered iterator reads. Milvus Lite
+#: is the known case (its ``query`` ignores the ``iterator`` flag and
+#: returns rows in arbitrary order -- confirmed directly; ``pymilvus``'s
+#: own ``query_iterator`` silently loses rows against it for the same
+#: reason, which is worse). A real Milvus server orders iterator reads
+#: by primary key, so this only fires where continuing *would* lose
+#: rows silently.
+_UNORDERED_PAGE_MSG = (
+    "cannot read past Milvus's per-call row ceiling "
+    f"({DEFAULT_QUERY_LIMIT}): this server does not return "
+    "primary-key-ordered pages for iterator reads (Milvus Lite does "
+    "not), so paging through the remaining rows would silently skip "
+    "some. Narrow the WHERE filter, or run against a full Milvus server."
+)
+
+Rows = list[dict[str, t.Any]]
+
+
+def unbounded_query_call(
+    kwargs: dict[str, t.Any],
+    complete: t.Callable[[Rows], Call | None] | None,
+    finish: t.Callable[[Rows], RowsAndDescription],
+) -> Call:
+    """A ``query`` read with no row ceiling: one RPC when the result
+    fits in Milvus's own per-call maximum (:data:`DEFAULT_QUERY_LIMIT`,
+    the overwhelmingly common case -- byte-identical to the single call
+    made before this existed), and a primary-key-cursor page loop past
+    it -- the same ``iterator`` protocol ``pymilvus``'s own
+    ``QueryIterator`` speaks, but built from plain ``query`` ``Call``\\ s
+    so the sync and async cursors drive it identically (D1/D12;
+    ``AsyncMilvusClient`` has no ``query_iterator`` at all).
+
+    The page loop needs the primary key -- its name is not known at
+    translate time, so the first read hitting the ceiling chains into a
+    ``describe_collection`` and restarts page-by-page with the key in
+    ``output_fields``. Every page is checked to actually be
+    primary-key-ordered; a server that ignores the ``iterator`` flag
+    (Milvus Lite) fails that check and raises rather than silently
+    losing rows -- the same honesty rule every ceiling guard here has
+    always kept.
+
+    ``complete`` (optional) turns the full row list into the next
+    :class:`Call` of a longer chain (a later scan of a join, an
+    ``UPDATE``'s write-back); returning ``None`` -- or omitting it --
+    ends the chain, and ``finish`` then turns the rows into the
+    DBAPI-shaped result.
+
+    No snapshot spans the pages: rows written between two pages may or
+    may not appear, exactly as with ``pymilvus``'s own iterator."""
+    collection = kwargs["collection_name"]
+    base_filter = kwargs.get("filter", "")
+
+    def paged(describe_raw: dict[str, t.Any]) -> Call:
+        primary_key = next(
+            field["name"]
+            for field in describe_raw["fields"]
+            if field.get("is_primary")
+        )
+        fields = kwargs.get("output_fields") or ["*"]
+        page_fields = (
+            fields
+            if "*" in fields or primary_key in fields
+            else [*fields, primary_key]
+        )
+        accumulated: Rows = []
+
+        def page(after: t.Any) -> Call:  # noqa: ANN401 -- a pk value is int or str
+            page_kwargs = {
+                **kwargs,
+                "output_fields": page_fields,
+                "limit": DEFAULT_QUERY_LIMIT,
+                # The string spelling is what the wire wants: pymilvus
+                # feeds this straight into a gRPC KeyValuePair, which
+                # takes text, not a bool (its own QueryIterator passes
+                # exactly "True").
+                "iterator": "True",
+            }
+            if after is not None:
+                cursor = f"{primary_key} > {render_filter_value(after)}"
+                page_kwargs["filter"] = (
+                    f"({base_filter}) and ({cursor})"
+                    if base_filter
+                    else cursor
+                )
+
+            def then(raw: t.Any) -> Call | None:  # noqa: ANN401
+                rows = list(raw)
+                keys = [row[primary_key] for row in rows]
+                if any(b <= a for a, b in itertools.pairwise(keys)):
+                    raise errors.NotSupportedError(_UNORDERED_PAGE_MSG)
+                accumulated.extend(rows)
+                if len(rows) >= DEFAULT_QUERY_LIMIT:
+                    return page(keys[-1])
+                return complete(accumulated) if complete else None
+
+            def postprocess(_raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
+                return finish(accumulated)
+
+            return Call("query", page_kwargs, postprocess, then=then)
+
+        return page(None)
+
+    def first_then(raw: t.Any) -> Call | None:  # noqa: ANN401
+        if len(raw) >= DEFAULT_QUERY_LIMIT:
+            # The result may extend past the ceiling. The rows in hand
+            # are discarded and re-read page-by-page: continuing from
+            # them would need their primary keys, which this read had no
+            # reason to fetch.
+            return Call(
+                "describe_collection",
+                {"collection_name": collection},
+                then=paged,
+            )
+        return complete(list(raw)) if complete else None
+
+    def first_postprocess(raw: t.Any) -> RowsAndDescription:  # noqa: ANN401
+        return finish(list(raw))
+
+    return Call(
+        "query",
+        {**kwargs, "limit": DEFAULT_QUERY_LIMIT},
+        first_postprocess,
+        then=first_then,
+    )
+
+
 __all__ = [
     "COMPARISON_OPS",
     "DEFAULT_QUERY_LIMIT",
     "Call",
     "Postprocess",
+    "Rows",
     "RowsAndDescription",
+    "ann_metric",
     "description",
     "filter_text",
     "render_filter",
     "render_filter_value",
+    "render_predicate",
     "resolve_value",
+    "unbounded_query_call",
 ]

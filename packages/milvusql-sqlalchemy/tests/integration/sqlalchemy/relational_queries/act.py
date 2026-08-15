@@ -152,9 +152,7 @@ def test_an_in_subquery_over_the_other_collection(two_tables):
             select(items.c.id)
             .where(
                 items.c.cat_id.in_(
-                    select(categories.c.id).where(
-                        categories.c.title == "book"
-                    )
+                    select(categories.c.id).where(categories.c.title == "book")
                 )
             )
             .order_by(items.c.id)

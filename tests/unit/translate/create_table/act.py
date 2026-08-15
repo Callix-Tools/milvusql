@@ -93,3 +93,47 @@ def test_ddl_postprocess_returns_no_rows(build_call_helper):
         "CREATE TABLE items (id BIGINT PRIMARY KEY, embedding VECTOR(8))"
     )
     assert call.postprocess(object()) == ([], None, -1, None)
+
+
+class TestExtendedTypes:
+    def test_array_columns_carry_element_type_and_capacity(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, "
+            "tags ARRAY<VARCHAR(32)>(50), nums ARRAY<BIGINT>, v VECTOR(4))"
+        )
+        fields = {f.name: f for f in call.kwargs["schema"].fields}
+        assert fields["tags"].dtype == DataType.ARRAY
+        assert fields["tags"].params["max_capacity"] == 50
+        assert fields["tags"].params["max_length"] == 32
+        assert fields["tags"].element_type == DataType.VARCHAR
+        # No explicit capacity falls back to Milvus's own maximum.
+        assert fields["nums"].params["max_capacity"] == 4096
+        assert fields["nums"].element_type == DataType.INT64
+
+    def test_the_dimensioned_vector_spellings_map_to_their_field_types(
+        self, build_call_helper
+    ):
+        call = build_call_helper(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, bv BINARYVEC(128), "
+            "f16 FLOAT16VEC(64), bf BFLOAT16VEC(64), i8 INT8VEC(32))"
+        )
+        fields = {f.name: f for f in call.kwargs["schema"].fields}
+        assert fields["bv"].dtype == DataType.BINARY_VECTOR
+        assert fields["f16"].dtype == DataType.FLOAT16_VECTOR
+        assert fields["bf"].dtype == DataType.BFLOAT16_VECTOR
+        assert fields["i8"].dtype == DataType.INT8_VECTOR
+        assert fields["bv"].params["dim"] == 128
+
+    def test_any_vector_type_satisfies_the_one_vector_rule(
+        self, build_call_helper
+    ):
+        """A table whose only vector is a BINARYVEC (or any of the new
+        spellings) is a valid Milvus collection -- the
+        at-least-one-vector check accepts the whole family, not just
+        VECTOR/SPARSEVEC."""
+        call = build_call_helper(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, bv BINARYVEC(8))"
+        )
+        assert call.method == "create_collection"

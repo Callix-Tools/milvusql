@@ -1,7 +1,6 @@
-"""Error-path coverage for ``DROP`` dispatch: only ``DROP TABLE`` is
-wired up (mirroring ``CREATE TABLE``/``CREATE INDEX``'s own kind check)
--- other ``DROP`` kinds are an honest "not supported", not silently
-treated as a table drop."""
+"""Error-path coverage for ``DROP`` dispatch: table, index and
+database drops are wired up -- any other ``DROP`` kind is an honest
+"not supported", not silently treated as a table drop."""
 
 from __future__ import annotations
 
@@ -12,11 +11,16 @@ import milvusql
 pytestmark = [pytest.mark.unit, pytest.mark.translate]
 
 
-def test_drop_index_raises_not_supported_error(build_call_helper):
-    with pytest.raises(milvusql.NotSupportedError, match="INDEX"):
-        build_call_helper("DROP INDEX idx_emb ON items")
+def test_drop_index_without_a_table_raises_programming_error(
+    build_call_helper,
+):
+    """Milvus scopes index names to a collection, so a bare
+    ``DROP INDEX idx`` (which the grammar itself accepts) is
+    unanswerable -- the message says what to add."""
+    with pytest.raises(milvusql.ProgrammingError, match="ON"):
+        build_call_helper("DROP INDEX idx_emb")
 
 
-def test_drop_database_raises_not_supported_error(build_call_helper):
-    with pytest.raises(milvusql.NotSupportedError, match="DATABASE"):
-        build_call_helper("DROP DATABASE mydb")
+def test_an_unwired_drop_kind_raises_not_supported_error(build_call_helper):
+    with pytest.raises(milvusql.NotSupportedError, match="DROP"):
+        build_call_helper("DROP VIEW v")

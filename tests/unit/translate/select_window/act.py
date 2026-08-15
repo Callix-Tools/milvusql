@@ -27,7 +27,9 @@ class TestPlan:
             "SELECT id, ROW_NUMBER() OVER (ORDER BY price) AS r FROM items"
         )
         assert call.method == "query"
-        assert call.then is None
+        # `then` pages past the row ceiling when a result demands it; a
+        # result under the ceiling ends the chain immediately.
+        assert call.then([{"id": 1, "price": 2.0}]) is None
         assert sorted(call.kwargs["output_fields"]) == ["id", "price"]
 
     def test_the_partition_and_order_columns_are_fetched(

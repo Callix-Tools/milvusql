@@ -63,7 +63,11 @@ def _create_and_load(engine):
         "idx_orm_items_embedding",
         _Item.embedding,
         milvusql_using="HNSW",
-        milvusql_with={"metric_type": "COSINE", "M": 16, "ef_construction": 200},
+        milvusql_with={
+            "metric_type": "COSINE",
+            "M": 16,
+            "ef_construction": 200,
+        },
     ).create(engine)
     with engine.connect() as conn:
         dbapi_connection = conn.connection.dbapi_connection
