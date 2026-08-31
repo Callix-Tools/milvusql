@@ -20,8 +20,8 @@
 
 | milvusql | pymilvus | Milvus server | Status |
 |---|---|---|---|
-| 1.x | `>=2.6.17,<3` | 2.6.x | Tested — CI runs standalone via testcontainers |
-| 1.x | `>=2.6.17,<3` | Milvus Lite | Tested — reads past 16384 rows raise `NotSupportedError` rather than truncate |
+| 1.x | `>=2.6,<3` | 2.6.x | Tested — CI runs standalone via testcontainers |
+| 1.x | `>=2.6,<3` | Milvus Lite | Tested — reads past 16384 rows raise `NotSupportedError` rather than truncate |
 | 1.x | `3.0.x` | 3.0.x | **Not supported** |
 
 Milvus 3.0 moves work into the engine that this library currently does in the
