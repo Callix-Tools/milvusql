@@ -21,7 +21,7 @@ Milvus latest release checked: v2.6.23 (2026-08-28); v3.0.0 (2026-07-29).
 | 3 | Cross-collection ID-set/equi-join behind a replaceable interface | todo | — | 2026-09-04 |
 | 4 | Native `TEXT` on 3.0; generated-`SPARSEVEC` as legacy 2.6 path with deprecation warning | todo | — | 2026-09-04 |
 | 5 | Cursor pagination on an iterator abstraction (`SearchIteratorV2Info`/`QueryIteratorCursor`), PK-cursor as 2.6 legacy | todo | — | 2026-09-04 |
-| 6 | `ROW_NUMBER() OVER (PARTITION BY … ORDER BY <vector>)` + `rn <= K` → Grouping Search | in_progress | this run | 2026-09-04 |
+| 6 | `ROW_NUMBER() OVER (PARTITION BY … ORDER BY <vector>)` + `rn <= K` → Grouping Search | in_progress | [#13](https://github.com/Callix-Tools/milvusql/pull/13) | 2026-09-04 |
 | 7 | PostgreSQL-native alternatives alongside the MySQL-style DDL/full-text surface | todo | — | 2026-09-04 |
 | 8 | Docs integration page ("Milvus from SQLAlchemy / from Django") | todo | — | 2026-09-04 |
 | 9 | Exact `GROUP BY … COUNT(*)` must not silently map to approximate search aggregation | todo | — | 2026-09-04 |
@@ -82,8 +82,17 @@ Milvus latest release checked: v2.6.23 (2026-08-28); v3.0.0 (2026-07-29).
   mapped onto number-of-groups, `rn` materialised from per-group hit order,
   and the inner `WHERE` pushed into the search filter — over this run's
   size budget, and the recogniser is the primitive it will consume.
-- **Diff size:** ~180 added lines across 3 source/doc files + 2 new test
-  files. Baseline was green before the change (287 unit tests, ruff + ty
-  clean); after: 302 unit tests, ruff + ty clean.
-- **Not run:** integration tests (need a Milvus container; this change is
-  translate-layer only and has no server-side behaviour to exercise).
+- **Opened:** PR [#13](https://github.com/Callix-Tools/milvusql/pull/13)
+  (draft). CI green on `c174390` — lint, test (3.12), test (3.13);
+  `mergeable_state: clean`.
+- **Diff size:** 522 added / 3 removed across 7 files. Of that, ~207 lines
+  are source (`_common.py` +169, `ast_to_pymilvus.py` +38), ~202 are the
+  new tests, and the rest is README + this file. The source half sits
+  inside the per-run budget; counting the journal and tests it does not,
+  which is worth watching — a future run should not read this as licence
+  to grow the *code* half.
+- **Verified before pushing:** baseline green first (287 unit tests, ruff +
+  ty + bandit clean), then 302 core unit / 86 sqlalchemy / 57 django after.
+- **Not run locally:** integration tests (need a Milvus container). CI ran
+  them and they passed; this change is translate-layer only and has no
+  server-side behaviour to exercise.
