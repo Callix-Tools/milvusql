@@ -121,6 +121,173 @@ def ann_metric(node: exp.Expression) -> str | None:
     return METRIC_TYPES.get(type(node))
 
 
+# -----------------------------------------------------------------------
+# Top-k-per-group: the Grouping Search shape
+# -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GroupingSearch:
+    """The parameters a ``ROW_NUMBER() OVER (PARTITION BY <field> ORDER
+    BY <vector> <=> :q)`` + ``rn <= K`` statement asks for, read off the
+    AST.
+
+    This is Milvus's *Grouping Search* -- ``search(..., group_by_field=
+    <group_by_field>, group_size=<group_size>)``, which returns the best
+    ``group_size`` entities per distinct value of ``group_by_field``.
+    SQL spells the same thing as a ranking window function filtered on
+    the rank, so that shape is the one to recognise rather than a facet
+    query or a client-side scan: computing it client-side means reading
+    every vector in the collection, which is the one thing an ANN index
+    exists to avoid.
+
+    Recognising the shape is separate from compiling it: this carries
+    the parameters, and nothing here performs I/O or builds a
+    :class:`Call`."""
+
+    #: Collection the inner ``SELECT`` reads.
+    table_name: str
+    #: Field ``PARTITION BY`` names -- Milvus's ``group_by_field``.
+    group_by_field: str
+    #: Rows per group, the ``K`` of ``rn <= K`` -- ``group_size``.
+    group_size: int
+    #: Vector field the ``OVER (... ORDER BY ...)`` scores against.
+    anns_field: str
+    #: ``metric_type`` the distance operator asks for.
+    metric_type: str
+    #: The distance node itself, so a caller can resolve the query
+    #: vector through the usual bind path.
+    distance: exp.Expression
+    #: Alias the window function was given (``AS rn``).
+    rank_alias: str
+
+
+#: Ranking window functions whose ``rn <= K`` filter is exactly "the
+#: best K per group". ``RANK``/``DENSE_RANK`` are deliberately absent:
+#: they keep every row of a tie, so ``rn <= K`` can return more than K
+#: rows per group and Milvus's ``group_size`` cannot express that.
+_ROW_NUMBER = exp.RowNumber
+
+
+def _rank_limit(where: exp.Where | None, alias: str) -> int | None:
+    """``K`` from a ``WHERE rn <= K`` (or ``rn < K + 1``) that filters
+    on nothing but the ranking alias, else ``None``."""
+    if where is None:
+        return None
+    predicate = where.this
+    if not isinstance(predicate, (exp.LTE, exp.LT)):
+        return None
+    column = predicate.this
+    if not isinstance(column, exp.Column) or column.name != alias:
+        return None
+    bound = predicate.expression
+    if not isinstance(bound, exp.Literal) or not bound.is_int:
+        return None
+    limit = int(bound.this)
+    # `rn < K` keeps K - 1 rows per group.
+    if isinstance(predicate, exp.LT):
+        limit -= 1
+    return limit if limit > 0 else None
+
+
+def _windowed_projection(
+    inner: exp.Select,
+) -> tuple[exp.Window, str] | None:
+    """The single ranking window function in ``inner``'s SELECT list
+    and the alias it was given, or ``None`` when there is not exactly
+    one aliased window there."""
+    found: tuple[exp.Window, str] | None = None
+    for projection in inner.expressions:
+        window = projection.find(exp.Window)
+        if window is None:
+            continue
+        if found is not None or not isinstance(projection, exp.Alias):
+            # Two windows, or one that was never aliased -- the outer
+            # query has no single rank column to filter on.
+            return None
+        found = (window, projection.alias)
+    return found
+
+
+def grouping_search(  # noqa: PLR0911 -- one guard per shape mismatch, clearer flat than nested
+    ast: exp.Select,
+) -> GroupingSearch | None:
+    """Read a top-k-per-group statement off ``ast``, or ``None`` when it
+    is not that shape.
+
+    The shape, exactly::
+
+        SELECT ... FROM (
+          SELECT ...,
+                 ROW_NUMBER() OVER (PARTITION BY <field>
+                                    ORDER BY <vector> <=> :q) AS rn
+          FROM <collection>
+        ) t WHERE rn <= K
+
+    Anything else -- ``RANK``/``DENSE_RANK`` (ties overflow ``K``), more
+    than one partition or order key, a scalar ``ORDER BY`` inside the
+    ``OVER``, an inner ``WHERE``/``LIMIT``, an outer predicate on
+    anything but the rank -- returns ``None`` and keeps whatever path
+    already handled it. Being conservative here is the point: a shape
+    this function claims is one it must describe *exactly*, since the
+    whole reason to recognise it is that guessing produces wrong rows
+    rather than an error."""
+    from_node = ast.args.get("from_")
+    if from_node is None or not isinstance(from_node.this, exp.Subquery):
+        return None
+    inner = from_node.this.this
+    if not isinstance(inner, exp.Select):
+        return None
+    inner_from = inner.args.get("from_")
+    if not isinstance(inner_from, exp.From) or not isinstance(
+        inner_from.this, exp.Table
+    ):
+        return None
+    # An inner WHERE would have to be pushed into the search's own
+    # `filter`, and an inner LIMIT/GROUP BY/JOIN changes which rows are
+    # ranked at all. Neither is read here -- see the docstring.
+    if any(
+        inner.args.get(clause) is not None
+        for clause in ("where", "limit", "group", "having", "distinct")
+    ) or inner.args.get("joins"):
+        return None
+    windowed = _windowed_projection(inner)
+    if windowed is None:
+        return None
+    window, alias = windowed
+    if not isinstance(window.this, _ROW_NUMBER):
+        return None
+    group_size = _rank_limit(ast.args.get("where"), alias)
+    if group_size is None:
+        return None
+    partition_by = window.args.get("partition_by") or []
+    order = window.args.get("order")
+    if len(partition_by) != 1 or order is None or len(order.expressions) != 1:
+        return None
+    group_column = partition_by[0]
+    if not isinstance(group_column, exp.Column):
+        return None
+    distance = order.expressions[0].this
+    metric_type = ann_metric(distance)
+    if metric_type is None:
+        # A scalar `ORDER BY price` inside the OVER: a real window
+        # ranking, but not a vector search, so Grouping Search has
+        # nothing to do with it.
+        return None
+    vector_column = distance.this
+    if not isinstance(vector_column, exp.Column):
+        return None
+    return GroupingSearch(
+        table_name=inner_from.this.name,
+        group_by_field=group_column.name,
+        group_size=group_size,
+        anns_field=vector_column.name,
+        metric_type=metric_type,
+        distance=distance,
+        rank_alias=alias,
+    )
+
+
 COMPARISON_OPS: dict[type[exp.Expression], str] = {
     exp.EQ: "==",
     exp.NEQ: "!=",
@@ -517,12 +684,14 @@ __all__ = [
     "COMPARISON_OPS",
     "DEFAULT_QUERY_LIMIT",
     "Call",
+    "GroupingSearch",
     "Postprocess",
     "Rows",
     "RowsAndDescription",
     "ann_metric",
     "description",
     "filter_text",
+    "grouping_search",
     "render_filter",
     "render_filter_value",
     "render_predicate",

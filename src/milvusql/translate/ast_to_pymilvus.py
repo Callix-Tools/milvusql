@@ -53,6 +53,7 @@ from milvusql.translate._common import (
     ann_metric,
     description,
     filter_text,
+    grouping_search,
     resolve_value,
     unbounded_query_call,
 )
@@ -845,6 +846,20 @@ def _flatten_trivial_subquery(ast: exp.Select) -> exp.Select:
         or inner.args.get("order")
         or inner.args.get("limit")
         or inner.args.get("distinct")
+        # A window function or subquery in the inner SELECT list is a
+        # *computed* column, not a relabelled one: flattening drops the
+        # projection that defines it and leaves the outer query
+        # referencing a name no collection has. `SELECT rn FROM (SELECT
+        # ROW_NUMBER() OVER (...) AS rn FROM items) t WHERE rn <= 3`
+        # flattened to `SELECT rn FROM items WHERE rn <= 3` -- the
+        # window (and, inside its OVER, the whole vector search) was
+        # silently discarded and Milvus was asked for a field literally
+        # named `rn`. Anything computed stays wrapped, so the relational
+        # engine evaluates it where it can be seen.
+        or any(
+            projection.find(exp.Window, exp.Select) is not None
+            for projection in inner.expressions
+        )
     ):
         return ast
     flattened = ast.copy()
@@ -1125,6 +1140,29 @@ def _build_select(  # noqa: PLR0911, PLR0912 -- one return per SELECT shape, cle
     hybrid = ast.args.get(HYBRID_ARG)
     if hybrid:
         return _build_hybrid_search(hybrid, ast, parameters)
+
+    grouped = grouping_search(ast)
+    if grouped is not None:
+        # Top-k-per-group. Milvus expresses this natively as a Grouping
+        # Search (`group_by_field` + `group_size`), and delegating it is
+        # tracked separately; what must not happen meanwhile is the
+        # relational engine's answer to the same statement, which is to
+        # read every row *and every vector* of the collection and score
+        # them client-side -- precisely what the ANN index exists to
+        # avoid. Rejecting it names the mapping instead of guessing at
+        # it, the same rule the rest of this translator keeps.
+        msg = (
+            f"top-k-per-group (ROW_NUMBER() OVER (PARTITION BY "
+            f"{grouped.group_by_field} ORDER BY {grouped.anns_field} "
+            f"<=> ...) with {grouped.rank_alias} <= {grouped.group_size}) "
+            "is Milvus's Grouping Search (group_by_field="
+            f"{grouped.group_by_field!r}, group_size={grouped.group_size}, "
+            f"metric_type={grouped.metric_type!r}), which this version "
+            "does not send yet. Evaluating it client-side would read "
+            "every vector in the collection, so it is refused rather "
+            "than answered slowly and approximately."
+        )
+        raise errors.NotSupportedError(msg)
 
     if needs_relational_engine(ast):
         # A JOIN, a GROUP BY or a subquery: more than one collection

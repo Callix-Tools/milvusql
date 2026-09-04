@@ -198,9 +198,26 @@ What reaches Milvus, and what does not:
 | | Scalar `ORDER BY`, `DISTINCT`, `LIMIT`/`OFFSET` |
 
 Window functions are the one worth calling out against a vector database:
-`ROW_NUMBER() OVER (PARTITION BY category ORDER BY distance)` over a search's
-hits is *top-k per group*, which Milvus cannot express and an ANN index
-cannot answer directly.
+`ROW_NUMBER() OVER (PARTITION BY category ORDER BY distance)` filtered on
+`rn <= K` is *top-k per group*, and Milvus **does** express that natively — as
+a [Grouping Search](https://milvus.io/docs/grouping-search.md)
+(`search(..., group_by_field='category', group_size=K)`), not as a facet query
+and not as a client-side scan. Sending it is the project's first target for
+server-side delegation; until it lands, that exact shape is **rejected by
+name** rather than answered:
+
+```
+NotSupportedError: top-k-per-group (ROW_NUMBER() OVER (PARTITION BY category
+ORDER BY embedding <=> ...) with rn <= 3) is Milvus's Grouping Search
+(group_by_field='category', group_size=3, metric_type='COSINE'), which this
+version does not send yet.
+```
+
+The alternative would be to evaluate it over the fetched rows, which means
+reading every vector in the collection — the one thing an ANN index exists to
+avoid. Ranking windows that are *not* that shape (`RANK`/`DENSE_RANK`, whose
+ties can overflow `K`; a scalar `ORDER BY` inside the `OVER`) are unaffected
+and still evaluate client-side.
 
 `SELECT *` works across a join too, but it means what it says: each side is
 asked for `output_fields=["*"]`, so every field of every collection comes
@@ -260,6 +277,10 @@ Not supported, and rejected explicitly rather than mistranslated:
 - **Correlated subqueries beyond `EXISTS` equality** — Django's
   `Subquery(...)` annotations (a correlated value per outer row) and
   non-equi `EXISTS` correlations. The error names the construct.
+- **Top-k per group** — `ROW_NUMBER() OVER (PARTITION BY f ORDER BY <vector>
+  <=> :q)` with `rn <= K`. Milvus's Grouping Search is the right answer and
+  sending it is [tracked separately](#join-group-by-and-subqueries); the error
+  names the `group_by_field`/`group_size`/`metric_type` it would send.
 - **`WITH RECURSIVE`** (re-reads until a fixpoint), **`INTERSECT ALL` /
   `EXCEPT ALL`** (duplicate-count semantics a semi/anti join cannot
   express), **window frame clauses** (`ROWS`/`RANGE BETWEEN`), **`LAG`/
