@@ -257,6 +257,23 @@ survives `NOT EXISTS`).
 
 Not supported, and rejected explicitly rather than mistranslated:
 
+- **An aggregate over a search** — `SELECT COUNT(*) FROM items ORDER BY
+  embedding <=> :q LIMIT 10`. A `query` aggregate is *exact*: `count(*)` is
+  the true total and `SUM`/`AVG`/`MIN`/`MAX` reduce over every matching row.
+  An ANN `search` returns an *approximate* top-k — the k nearest the index
+  found, not the k nearest that exist. Milvus has no single call that is both,
+  so the two are spelled as two steps, and the search's hits are what the
+  aggregate reduces over:
+
+  ```sql
+  SELECT COUNT(*) FROM (
+      SELECT id FROM items ORDER BY embedding <=> :q LIMIT 10
+  ) AS hits
+  ```
+
+  A grouped aggregate says the same thing without the subquery:
+  `SELECT category, COUNT(*) FROM items GROUP BY category ORDER BY embedding
+  <=> :q LIMIT 10` searches first, then groups its hits.
 - **Correlated subqueries beyond `EXISTS` equality** — Django's
   `Subquery(...)` annotations (a correlated value per outer row) and
   non-equi `EXISTS` correlations. The error names the construct.

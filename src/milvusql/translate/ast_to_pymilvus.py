@@ -910,6 +910,49 @@ def _is_aggregate_select(ast: exp.Select) -> bool:
     return all(type(_unwrap_alias(e)) in _AGG_FUNCS for e in ast.expressions)
 
 
+def _reject_aggregate_over_search(ast: exp.Select) -> None:
+    """An aggregate whose ``ORDER BY`` is a vector distance (or a BM25
+    score) asks for two different things at once, and Milvus answers
+    them with two different, non-interchangeable calls.
+
+    ``query`` aggregation is *exact*: ``count(*)`` over a filter is the
+    true total, and the reduced ``SUM``/``AVG``/``MIN``/``MAX`` below
+    run over every matching row. An ANN ``search`` returns an
+    *approximate* top-k -- the k nearest the index found, which is not
+    guaranteed to be the k nearest that exist. Reducing over those hits
+    is a different number than reducing over the collection, and no
+    version of Milvus computes it in one call.
+
+    Until this change the search was simply dropped: ``SELECT COUNT(*)
+    FROM items ORDER BY embedding <=> :q LIMIT 10`` compiled to
+    ``query(collection_name='items', output_fields=['count(*)'])`` --
+    the whole collection's count returned for a question asked about
+    ten rows, with no error and no way to tell from the result. That is
+    the mistranslation this project rejects everywhere else, so it is
+    rejected here too.
+
+    The shape that *does* work spells the two steps out, and is what
+    the message points at: the search runs as a search, and the
+    aggregate reduces its hits.
+
+    A plain scalar ``ORDER BY`` on an aggregate is left alone -- it
+    orders one row by a column that is not in the SELECT list, which
+    changes nothing and is not a search."""
+    order = ast.args.get("order")
+    if order is None or ann_metric(order.expressions[0].this) is None:
+        return
+    msg = (
+        "an aggregate over a search is not supported: a query "
+        "aggregate is exact over every matching row, while ordering "
+        "by a vector distance or BM25_SCORE asks for an approximate "
+        "top-k, and Milvus has no single call that does both. Put "
+        "the search in a subquery to reduce over its hits instead: "
+        "SELECT COUNT(*) FROM (SELECT id FROM t "
+        "ORDER BY embedding <=> :q LIMIT 10) AS hits"
+    )
+    raise errors.NotSupportedError(msg)
+
+
 def _count_star_rows(count: int, output_names: list[str]) -> Postprocess:
     def postprocess(raw: list[dict[str, t.Any]]) -> RowsAndDescription:
         total = raw[0]["count(*)"] if raw else 0
@@ -963,6 +1006,7 @@ def _reduce_aggregate_rows(
 
 
 def _build_aggregate(ast: exp.Select, parameters: dict[str, t.Any]) -> Call:
+    _reject_aggregate_over_search(ast)
     table_name = _table_name(ast)
     filter_expr = filter_text(ast.args.get("where"), parameters)
     output_names = _select_output_names(ast)
