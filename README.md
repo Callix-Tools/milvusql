@@ -266,6 +266,14 @@ Not supported, and rejected explicitly rather than mistranslated:
   `LEAD`/`NTILE`**, **`JOIN ... USING` past two sources**, and **`SELECT *`
   inside a subquery that joins** — the last two because two collections can
   own the same column name, and nothing at translate time says which.
+- **Computed `SELECT`-list expressions** (`SELECT id, price * 2`,
+  `SELECT UPPER(category)`) on any path — `output_fields` is a list of
+  stored field names, not an expression language, so there is nothing to
+  compile them to. A **distance score in the projection**
+  (`SELECT id, embedding <=> :q`) is rejected with a pointer to the
+  spelling that works: the scoring expression belongs in `ORDER BY`, and
+  the score comes back as the `distance` column —
+  `SELECT id, distance FROM items ORDER BY embedding <=> :q LIMIT 5`.
 
 Anything that *doesn't* need this path — a filter `SELECT`, a vector search, a
 hybrid search, a bare `COUNT(*)` — is still exactly one RPC and never builds a

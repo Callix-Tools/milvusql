@@ -707,11 +707,71 @@ def _select_field_names(ast: exp.Select) -> list[str]:
     literally named ``t_id`` returns nothing for it -- silently
     (Milvus's ``query``/``search`` just omit an unknown output field,
     they don't error), which used to make every ORM load return rows
-    of ``None``s."""
+    of ``None``s.
+
+    Every element is checked against :func:`_reject_computed_projection`
+    first -- ``.name`` is empty for anything that is not a column, so an
+    unchecked expression would go out as ``output_fields=[..., '']``."""
     return [
-        column.this.name if isinstance(column, exp.Alias) else column.name
+        _projection_field_name(column.this)
+        if isinstance(column, exp.Alias)
+        else _projection_field_name(column)
         for column in ast.expressions
     ]
+
+
+#: Projection nodes that name something Milvus can actually return:
+#: a stored field, every stored field, or a constant that needs no
+#: server-side evaluation at all.
+_PROJECTABLE = (exp.Column, exp.Star, exp.Literal, exp.Boolean, exp.Null)
+
+#: The working spelling a rejected distance projection is pointed at.
+#: Held apart from the message it goes into so the f-string that builds
+#: that message carries no SQL keywords -- `ruff`'s S608 reads an
+#: interpolated `SELECT ... FROM` as query construction, which this is
+#: the opposite of.
+_DISTANCE_PROJECTION_HINT = (
+    "SELECT id, distance FROM t ORDER BY <vector column> <=> :q LIMIT k"
+)
+
+
+def _projection_field_name(node: exp.Expression) -> str:
+    """The ``output_fields`` entry for one SELECT-list element, or
+    :class:`NotSupportedError` when Milvus cannot produce it.
+
+    ``query``/``search`` return *stored field values*: ``output_fields``
+    is a list of field names, not an expression language (confirmed
+    against pymilvus 2.6 -- an unknown name is dropped from the response
+    silently rather than erroring). A computed element therefore has no
+    faithful translation. Rejecting it follows what the filter path
+    already does for the same reason (``unsupported filter expression``
+    in ``_common.render_filter``); leaving it unchecked sent Milvus an
+    empty field name and returned a column of ``None``s under the
+    expression's own label, which reads as "this row has no distance"
+    rather than as "this driver cannot compute one"."""
+    if isinstance(node, _PROJECTABLE):
+        return node.name
+    metric = ann_metric(node)
+    if metric is not None:
+        # The single most likely spelling to arrive here, and the one
+        # with a real answer: a search already returns its score, so the
+        # ordering belongs in ORDER BY and the score is read back as the
+        # `distance` pseudo-column.
+        msg = (
+            f"unsupported SELECT expression: {node.sql(dialect='milvus')} -- "
+            "a distance score is produced by the search itself, not by a "
+            "projection. Move the scoring expression into ORDER BY and "
+            "select `distance` to read the score back: "
+            + _DISTANCE_PROJECTION_HINT
+        )
+        raise errors.NotSupportedError(msg)
+    msg = (
+        f"unsupported SELECT expression: {node.sql(dialect='milvus')} -- "
+        "Milvus returns stored field values and computes nothing in a "
+        "projection. Select the columns it reads and compute the "
+        "expression over the returned rows."
+    )
+    raise errors.NotSupportedError(msg)
 
 
 def _select_output_names(ast: exp.Select) -> list[str]:
