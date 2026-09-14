@@ -17,7 +17,7 @@ Repository HEAD assessed:  e3a2a7e (main)
 | # | Commitment | Status | Where it stands |
 |---|---|---|---|
 | 1 | Progressive-migration 2.6→3.0 documented as a README compatibility table | `done` | `README.md` "Compatibility", landed in `e3a2a7e` |
-| 2 | Server-capability layer instead of a hardcoded "always client-side" | `in_progress` | `src/milvusql/capabilities.py` + `Connection.capabilities()`; call sites still constant |
+| 2 | Server-capability layer instead of a hardcoded "always client-side" | `in_progress` | PR [#18](https://github.com/Callix-Tools/milvusql/pull/18): `src/milvusql/capabilities.py` + `Connection.capabilities()`; call sites still constant |
 | 3 | Cross-collection ID-set/equi-join behind a replaceable interface | `todo` | Resolution is inline in `translate/relational.py`; no protocol/ABC yet |
 | 4 | Native `TEXT` on 3.0, generated-`SPARSEVEC` as a deprecated 2.6 path | `todo` | Flag `native_text_field` exists; the dialect branch and the deprecation warning do not |
 | 5 | Cursor pagination around an iterator abstraction, PK-cursor as legacy | `todo` | PK-cursor page loop in `translate/_common.py`; flags `search_iterator_cursor`/`query_iterator_cursor` exist, nothing switches on them |
@@ -46,7 +46,8 @@ Closed unmerged, so their work is not in `main`: #11, #12, #13 (item 6), #14 (it
   each "do X where the server supports it"), and it is the only unattempted item
   that can land as a self-contained, testable unit. Splitting the wiring out keeps
   this diff additive: no existing behaviour changes.
-- **Result:** `src/milvusql/capabilities.py`, `Connection.capabilities()` and
+- **Result:** PR [#18](https://github.com/Callix-Tools/milvusql/pull/18) —
+  `src/milvusql/capabilities.py`, `Connection.capabilities()` and
   `AsyncConnection.capabilities()`, 38 unit tests. Core suite 287 → 325 passed;
   the two sub-packages unchanged at 86 and 57. `ruff`, `ty` and `bandit` clean.
 - **Diff size:** ~430 lines, 6 files (of which two are one-line touches).
