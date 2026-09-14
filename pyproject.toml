@@ -81,6 +81,7 @@ markers = [
     "unit: pure-logic test, no external process (Milvus, a real DB) started",
     "integration: exercises a real Milvus server (via testcontainers)",
     "dbapi: the root milvusql package's sync/async PEP 249 surface (connection, cursor)",
+    "capabilities: milvusql.capabilities' server/client capability table",
     "errors: milvusql.dbapi.errors exception translation",
     "translate: milvusql.translate.ast_to_pymilvus's AST -> pymilvus dispatch table",
 ]
