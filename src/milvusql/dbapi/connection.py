@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import typing as t
 
+import grpc
 from pymilvus import MilvusClient
+from pymilvus.exceptions import MilvusException
 
+from milvusql.capabilities import ServerCapabilities, capabilities_for
 from milvusql.dbapi import errors
 from milvusql.dbapi.cursor import Cursor
 
@@ -39,6 +42,37 @@ class Connection:
         #: itself still has to be idempotent and cheap on a hit,
         #: confirmed directly (~1s cold, ~2ms once already loaded).
         self._loaded_collections: set[str] = set()
+        #: Filled by the first `capabilities()` call. The pairing
+        #: cannot change under one connection -- the client is this
+        #: process's installed pymilvus and the server is whatever is
+        #: on the other end of this channel -- so the probe RPC is paid
+        #: for once, not per query that wants to consult it.
+        self._capabilities: ServerCapabilities | None = None
+
+    def capabilities(self) -> ServerCapabilities:
+        """What this server and client can be asked to do between them
+        (see :mod:`milvusql.capabilities`).
+
+        Costs one ``get_server_version`` RPC the first time and nothing
+        after. A method rather than a property precisely because that
+        first call is I/O: a property that quietly opens a connection
+        and blocks is the wrong shape for something a caller may reach
+        for while holding a lock.
+        """
+        if self._capabilities is None:
+            try:
+                reported = self._client.get_server_version()
+            except (MilvusException, grpc.RpcError) as exc:
+                raise errors.translate(exc) from exc
+            # `get_server_version()` is typed `str | dict` -- the dict
+            # is its `detail=True` shape, which this does not ask for.
+            # Anything but the string is treated as "unknown" rather
+            # than coerced: a capability table built from a shape we
+            # did not expect is the one thing it must never be.
+            self._capabilities = capabilities_for(
+                reported if isinstance(reported, str) else None
+            )
+        return self._capabilities
 
     def cursor(self) -> Cursor:
         if self.closed:

@@ -25,6 +25,7 @@ from milvusql._shared import (
     note_load_state,
     parse_cached,
 )
+from milvusql.capabilities import ServerCapabilities, capabilities_for
 from milvusql.dbapi import errors
 from milvusql.translate.ast_to_pymilvus import (
     Call,
@@ -215,6 +216,25 @@ class AsyncConnection:
         #: See `dbapi.connection.Connection._loaded_collections` (sync
         #: mirror): connection-scoped auto-LOAD cache, D2 revised.
         self._loaded_collections: set[str] = set()
+        #: See `dbapi.connection.Connection._capabilities` (sync
+        #: mirror): probed once, then reused.
+        self._capabilities: ServerCapabilities | None = None
+
+    async def capabilities(self) -> ServerCapabilities:
+        """Async mirror of
+        :meth:`milvusql.dbapi.connection.Connection.capabilities` -- a
+        coroutine here because the probe is an RPC, which is the same
+        reason the sync side made it a method and not a property."""
+        if self._capabilities is None:
+            try:
+                reported = await self._client.get_server_version()
+            except (MilvusException, grpc.RpcError) as exc:
+                raise errors.translate(exc) from exc
+            # See the sync `capabilities()` for the isinstance guard.
+            self._capabilities = capabilities_for(
+                reported if isinstance(reported, str) else None
+            )
+        return self._capabilities
 
     def cursor(self) -> AsyncCursor:
         if self.closed:
